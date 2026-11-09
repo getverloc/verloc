@@ -429,8 +429,8 @@ func (e *AlertEngine) evalRule(r *AlertRule, now time.Time, keyCooldown func() i
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if last, seen := e.cooldown[r.ID]; seen && now.Sub(last) < time.Duration(r.CooldownSec)*time.Second {
+		e.mu.Unlock()
 		return
 	}
 	e.cooldown[r.ID] = now
@@ -447,6 +447,7 @@ func (e *AlertEngine) evalRule(r *AlertRule, now time.Time, keyCooldown func() i
 		Message:   alertMessage(r, value),
 	}
 	e.pushRecent(ev)
+	e.mu.Unlock()
 	if e.store != nil {
 		if err := e.store.InsertAlert(ev); err != nil {
 			log.Printf("[alerts] persist: %v", err)

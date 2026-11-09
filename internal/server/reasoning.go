@@ -2,10 +2,13 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"log"
+	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // decodeChunkMap decodes one JSON object with UseNumber so integers above
@@ -27,14 +30,26 @@ const (
 	maxReasoningBytes   = 512 * 1024
 )
 
-// reasoningCache remembers reasoning_content from a thinking-mode response,
-// keyed by the tool_call ids in that turn, so a later request that dropped
-// the field can still replay it. DeepSeek (and OpenCode Zen in front of it)
-// 400s tool-call follow-ups that omit reasoning_content.
+// Replay is private to an authenticated principal, public model, actual route,
+// and the complete history ending in an exact assistant tool-call turn.
+type reasoningScope struct {
+	clientID, model, provider, upstream string
+}
+
+type reasoningKey struct {
+	scope   reasoningScope
+	history [sha256.Size]byte
+}
+
+type reasoningContext struct {
+	key   reasoningKey
+	valid bool
+}
+
 type reasoningCache struct {
 	mu    sync.Mutex
-	m     map[string]string
-	order []string
+	m     map[reasoningKey]string
+	order []reasoningKey
 	max   int
 }
 
@@ -42,95 +57,141 @@ func newReasoningCache(max int) *reasoningCache {
 	if max <= 0 {
 		max = maxReasoningEntries
 	}
-	return &reasoningCache{m: make(map[string]string, max), max: max}
+	return &reasoningCache{m: make(map[reasoningKey]string, max), max: max}
 }
 
-func (c *reasoningCache) put(id, text string) {
-	if c == nil || id == "" || text == "" {
+func (c *reasoningCache) put(key reasoningKey, text string) {
+	if c == nil || key.scope.clientID == "" || text == "" {
 		return
 	}
 	if len(text) > maxReasoningBytes {
-		text = text[:maxReasoningBytes]
+		// Do not retain an oversized decoded response's backing string.
+		text = strings.Clone(reasoningPrefix(text, maxReasoningBytes))
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.m[id]; !ok {
+	if _, ok := c.m[key]; !ok {
 		if len(c.order) >= c.max {
 			old := c.order[0]
 			c.order = c.order[1:]
 			delete(c.m, old)
 		}
-		c.order = append(c.order, id)
+		c.order = append(c.order, key)
 	}
-	c.m[id] = text
+	c.m[key] = text
 }
 
-func (c *reasoningCache) get(id string) string {
-	if c == nil || id == "" {
+func (c *reasoningCache) get(key reasoningKey) string {
+	if c == nil || key.scope.clientID == "" {
 		return ""
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.m[id]
+	return c.m[key]
 }
 
-func (c *reasoningCache) putMany(ids []string, text string) {
-	for _, id := range ids {
-		c.put(id, text)
+// Nil, omitted and empty assistant content are protocol-equivalent. Function
+// names/arguments and every preceding user/tool message remain fingerprinted.
+func reasoningHistoryNext(previous [sha256.Size]byte, message map[string]any) [sha256.Size]byte {
+	canonical := make(map[string]any, len(message))
+	for k, v := range message {
+		if k != "reasoning" && k != "reasoning_content" {
+			canonical[k] = v
+		}
 	}
+	if stringField(message, "role") == "assistant" {
+		for key, value := range canonical {
+			if value == nil {
+				delete(canonical, key)
+			}
+		}
+		if content := canonical["content"]; content == nil {
+			delete(canonical, "content")
+		} else if text, ok := content.(string); ok && text == "" {
+			delete(canonical, "content")
+		}
+		if calls, ok := message["tool_calls"].([]any); ok {
+			normalized := make([]any, 0, len(calls))
+			for _, call := range calls {
+				tc, ok := call.(map[string]any)
+				if !ok {
+					normalized = append(normalized, call)
+					continue
+				}
+				copy := make(map[string]any, len(tc))
+				for k, v := range tc {
+					if k != "index" {
+						copy[k] = v
+					}
+				}
+				if stringField(copy, "type") == "" {
+					copy["type"] = "function"
+				}
+				normalized = append(normalized, copy)
+			}
+			canonical["tool_calls"] = normalized
+		}
+	}
+	h := sha256.New()
+	_, _ = h.Write(previous[:])
+	_ = json.NewEncoder(h).Encode(canonical)
+	var digest [sha256.Size]byte
+	copy(digest[:], h.Sum(nil))
+	return digest
 }
 
-// ensureReasoningReplay makes thinking-mode tool-call history acceptable to
-// DeepSeek-style upstreams:
-//  1. copy `reasoning` → `reasoning_content` when the latter is missing
-//  2. fill from the replay cache using tool_call ids
-//  3. if the assistant message has tool_calls and still no reasoning, set ""
-func ensureReasoningReplay(raw []byte, cache *reasoningCache) []byte {
-	if len(raw) == 0 {
-		return raw
+func reasoningPrefix(text string, limit int) string {
+	if len(text) <= limit {
+		return text
 	}
-	// Guard: replay can only copy a `reasoning` field or fill a message
-	// carrying tool_calls. With neither present, nothing can change.
-	if !bytes.Contains(raw, []byte(`"reasoning"`)) && !bytes.Contains(raw, []byte(`"tool_calls"`)) {
-		return raw
+	end := limit
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
 	}
+	return text[:end]
+}
+
+// ensureReasoningReplay also fingerprints the request history for response
+// capture. It is only called for backends that preserve reasoning.
+func ensureReasoningReplay(raw []byte, cache *reasoningCache, scope reasoningScope) ([]byte, reasoningContext) {
+	ctx := reasoningContext{key: reasoningKey{scope: scope}}
 	parsed, ok := decodeChunkMap(raw)
 	if !ok {
-		return raw
+		return raw, ctx
 	}
 	msgs, ok := parsed["messages"].([]any)
 	if !ok {
-		return raw
+		return raw, ctx
 	}
+	ctx.valid = scope.clientID != ""
 	var nCopy, nCache, nEmpty int
 	changed := false
 	for _, m := range msgs {
 		mm, ok := m.(map[string]any)
 		if !ok {
+			ctx.valid = false
 			continue
 		}
-		role, _ := mm["role"].(string)
-		if role != "assistant" {
+		ctx.key.history = reasoningHistoryNext(ctx.key.history, mm)
+		if stringField(mm, "role") != "assistant" {
 			continue
 		}
-		cur := stringField(mm, "reasoning_content")
-		if cur == "" {
-			if alt := stringField(mm, "reasoning"); alt != "" {
-				mm["reasoning_content"] = alt
-				cur = alt
-				nCopy++
-				changed = true
-			}
+		// An explicitly supplied field, including "", is authoritative.
+		if _, supplied := mm["reasoning_content"]; supplied {
+			continue
 		}
-		if cur != "" || !hasToolCalls(mm) {
+		if alt, supplied := mm["reasoning"].(string); supplied {
+			mm["reasoning_content"] = alt
+			nCopy++
+			changed = true
+			continue
+		}
+		if !hasToolCalls(mm) {
 			continue
 		}
 		filled := ""
-		for _, id := range toolCallIDs(mm) {
-			if got := cache.get(id); got != "" {
-				filled = got
-				break
-			}
+		if ctx.valid {
+			filled = cache.get(ctx.key)
 		}
 		if filled != "" {
 			mm["reasoning_content"] = filled
@@ -142,16 +203,14 @@ func ensureReasoningReplay(raw []byte, cache *reasoningCache) []byte {
 		changed = true
 	}
 	if !changed {
-		return raw
+		return raw, ctx
 	}
 	out, err := json.Marshal(parsed)
 	if err != nil {
-		return raw
+		return raw, ctx
 	}
-	if nCopy+nCache+nEmpty > 0 {
-		log.Printf("[reasoning] replay copy=%d cache=%d empty=%d", nCopy, nCache, nEmpty)
-	}
-	return out
+	log.Printf("[reasoning] replay copy=%d cache=%d empty=%d", nCopy, nCache, nEmpty)
+	return out, ctx
 }
 
 func stringField(mm map[string]any, key string) string {
@@ -164,31 +223,24 @@ func hasToolCalls(mm map[string]any) bool {
 	return ok && len(tcs) > 0
 }
 
-func toolCallIDs(mm map[string]any) []string {
-	tcs, ok := mm["tool_calls"].([]any)
-	if !ok {
-		return nil
-	}
-	var ids []string
-	for _, tc := range tcs {
-		tcm, ok := tc.(map[string]any)
-		if !ok {
-			continue
-		}
-		id, _ := tcm["id"].(string)
-		if id != "" {
-			ids = append(ids, id)
-		}
-	}
-	return ids
+// Both reasoning and tool payload capture are bounded while ingesting. A turn
+// whose payload cannot be captured exactly is not eligible for cache storage.
+type sseReasoningAcc struct {
+	choices        map[int]*reasoningChoice
+	reasoningBytes int
+	payloadBytes   int
 }
 
-// sseReasoningAcc collects reasoning + tool_call ids from an upstream SSE
-// (or JSON) completion so the next turn can replay them.
-type sseReasoningAcc struct {
-	buf  strings.Builder
-	ids  []string
-	seen map[string]bool
+type reasoningChoice struct {
+	buf       []byte
+	truncated bool
+	content   strings.Builder
+	calls     map[int]*reasoningToolCall
+	invalid   bool
+}
+
+type reasoningToolCall struct {
+	id, kind, name, arguments strings.Builder
 }
 
 func (a *sseReasoningAcc) ingest(payload []byte) {
@@ -209,47 +261,146 @@ func (a *sseReasoningAcc) ingestMap(chunk map[string]any) {
 		return
 	}
 	choices, _ := chunk["choices"].([]any)
-	for _, c := range choices {
+	for position, c := range choices {
 		cm, ok := c.(map[string]any)
 		if !ok {
 			continue
 		}
-		a.ingestObj(cm["delta"])
-		a.ingestObj(cm["message"])
+		index := reasoningIndex(cm, position)
+		if a.choices == nil {
+			a.choices = make(map[int]*reasoningChoice)
+		}
+		choice := a.choices[index]
+		if choice == nil {
+			if len(a.choices) >= maxReasoningEntries {
+				continue
+			}
+			choice = &reasoningChoice{}
+			a.choices[index] = choice
+		}
+		a.ingestObj(choice, cm["delta"])
+		a.ingestObj(choice, cm["message"])
 	}
 }
 
-func (a *sseReasoningAcc) ingestObj(v any) {
+func reasoningIndex(obj map[string]any, fallback int) int {
+	if number, ok := obj["index"].(json.Number); ok {
+		if value, err := number.Int64(); err == nil && value >= 0 && value < maxReasoningEntries {
+			return int(value)
+		}
+	}
+	return fallback
+}
+
+func (a *sseReasoningAcc) ingestObj(choice *reasoningChoice, v any) {
 	mm, ok := v.(map[string]any)
 	if !ok {
 		return
 	}
-	if s := stringField(mm, "reasoning_content"); s != "" {
-		a.buf.WriteString(s)
-	} else if s := stringField(mm, "reasoning"); s != "" {
-		a.buf.WriteString(s)
+	text := stringField(mm, "reasoning_content")
+	if text == "" {
+		text = stringField(mm, "reasoning")
 	}
-	for _, id := range toolCallIDs(mm) {
-		if a.seen == nil {
-			a.seen = map[string]bool{}
+	if choice.truncated {
+		text = ""
+	} else if remaining := maxReasoningBytes - a.reasoningBytes; len(text) > remaining {
+		text = reasoningPrefix(text, remaining)
+		choice.truncated = true
+	}
+	if len(text) > 0 {
+		// Cap allocation growth as well as the visible buffer length.
+		if needed := len(choice.buf) + len(text); needed > cap(choice.buf) {
+			size := min(maxReasoningBytes, max(needed, 2*cap(choice.buf)))
+			buf := make([]byte, len(choice.buf), size)
+			copy(buf, choice.buf)
+			choice.buf = buf
 		}
-		if a.seen[id] {
+		choice.buf = append(choice.buf, text...)
+		a.reasoningBytes += len(text)
+	}
+	if content, present := mm["content"]; present && content != nil {
+		if text, ok := content.(string); ok {
+			a.capturePayload(choice, &choice.content, text)
+		} else {
+			choice.invalid = true
+		}
+	}
+	calls, _ := mm["tool_calls"].([]any)
+	for position, value := range calls {
+		tc, ok := value.(map[string]any)
+		if !ok {
+			choice.invalid = true
 			continue
 		}
-		a.seen[id] = true
-		a.ids = append(a.ids, id)
+		if choice.calls == nil {
+			choice.calls = make(map[int]*reasoningToolCall)
+		}
+		index := reasoningIndex(tc, position)
+		call := choice.calls[index]
+		if call == nil {
+			if len(choice.calls) >= maxReasoningEntries {
+				choice.invalid = true
+				continue
+			}
+			call = &reasoningToolCall{}
+			choice.calls[index] = call
+		}
+		a.capturePayload(choice, &call.id, stringField(tc, "id"))
+		a.capturePayload(choice, &call.kind, stringField(tc, "type"))
+		if function, ok := tc["function"].(map[string]any); ok {
+			a.capturePayload(choice, &call.name, stringField(function, "name"))
+			a.capturePayload(choice, &call.arguments, stringField(function, "arguments"))
+		}
 	}
 }
 
-func (a *sseReasoningAcc) store(cache *reasoningCache) {
-	if a == nil {
+func (a *sseReasoningAcc) capturePayload(choice *reasoningChoice, dst *strings.Builder, text string) {
+	if choice.invalid {
 		return
 	}
-	text := a.buf.String()
-	if text == "" || len(a.ids) == 0 {
+	if len(text) > maxReasoningBytes-a.payloadBytes {
+		choice.invalid = true
 		return
 	}
-	cache.putMany(a.ids, text)
+	dst.WriteString(text)
+	a.payloadBytes += len(text)
+}
+
+func (a *sseReasoningAcc) store(cache *reasoningCache, ctx reasoningContext) {
+	if a == nil || !ctx.valid {
+		return
+	}
+	for _, choice := range a.choices {
+		if choice.invalid || len(choice.buf) == 0 {
+			continue
+		}
+		indices := make([]int, 0, len(choice.calls))
+		for index := range choice.calls {
+			indices = append(indices, index)
+		}
+		sort.Ints(indices)
+		calls := make([]any, 0, len(indices))
+		for _, index := range indices {
+			call := choice.calls[index]
+			if call.id.Len() == 0 || call.name.Len() == 0 {
+				choice.invalid = true
+				break
+			}
+			kind := call.kind.String()
+			if kind == "" {
+				kind = "function"
+			}
+			calls = append(calls, map[string]any{"id": call.id.String(), "type": kind,
+				"function": map[string]any{"name": call.name.String(), "arguments": call.arguments.String()}})
+		}
+		if choice.invalid || len(calls) == 0 {
+			continue
+		}
+		message := map[string]any{"role": "assistant", "content": choice.content.String(), "tool_calls": calls}
+		key := ctx.key
+		key.history = reasoningHistoryNext(key.history, message)
+		cache.put(key, string(choice.buf))
+	}
 }
 
 // aliasReasoningInChunk copies delta/message.reasoning onto reasoning_content
@@ -298,12 +449,46 @@ func aliasReasoningMap(chunk map[string]any) bool {
 	return changed
 }
 
-func rememberFromResponse(body []byte, cache *reasoningCache) []byte {
-	acc := &sseReasoningAcc{}
-	acc.ingest(body)
-	acc.store(cache)
-	if rewritten, ok := aliasReasoningInChunk(body); ok {
-		return rewritten
+func rememberFromResponse(body []byte, cache *reasoningCache, ctx reasoningContext) []byte {
+	chunk, ok := decodeChunkMap(body)
+	if !ok {
+		return body
+	}
+	if ctx.valid {
+		choices, _ := chunk["choices"].([]any)
+		for _, value := range choices {
+			choice, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			message, ok := choice["message"].(map[string]any)
+			if !ok || !hasToolCalls(message) {
+				continue
+			}
+			text := stringField(message, "reasoning_content")
+			if text == "" {
+				text = stringField(message, "reasoning")
+			}
+			if text == "" {
+				continue
+			}
+			if _, present := message["role"]; !present {
+				copy := make(map[string]any, len(message)+1)
+				for k, v := range message {
+					copy[k] = v
+				}
+				copy["role"] = "assistant"
+				message = copy
+			}
+			key := ctx.key
+			key.history = reasoningHistoryNext(key.history, message)
+			cache.put(key, text)
+		}
+	}
+	if aliasReasoningMap(chunk) {
+		if rewritten, err := json.Marshal(chunk); err == nil {
+			return rewritten
+		}
 	}
 	return body
 }

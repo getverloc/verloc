@@ -424,11 +424,11 @@ var gzipSkipPaths = map[string]bool{
 // library: no dependency, no CGO.
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if gzipSkipPaths[r.URL.Path] || !acceptsGzip(r) {
+		if gzipSkipPaths[r.URL.Path] {
 			next.ServeHTTP(w, r)
 			return
 		}
-		gw := &gzipResponseWriter{ResponseWriter: w}
+		gw := &gzipResponseWriter{ResponseWriter: w, acceptsGzip: acceptsGzip(r)}
 		defer gw.finish()
 		next.ServeHTTP(gw, r)
 	})
@@ -436,11 +436,12 @@ func gzipMiddleware(next http.Handler) http.Handler {
 
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	gz      *gzip.Writer
-	decided bool
-	active  bool
-	status  int
-	sent    bool
+	acceptsGzip bool
+	gz          *gzip.Writer
+	decided     bool
+	active      bool
+	status      int
+	sent        bool
 }
 
 // WriteHeader is captured, not forwarded: the compress-or-not decision needs
@@ -459,12 +460,14 @@ func (g *gzipResponseWriter) decide() {
 		g.status = http.StatusOK
 	}
 	h := g.Header()
-	if g.status == http.StatusOK && h.Get("Content-Encoding") == "" && compressibleType(h.Get("Content-Type")) {
-		h.Set("Content-Encoding", "gzip")
-		h.Add("Vary", "Accept-Encoding")
-		h.Del("Content-Length")
-		g.gz = gzip.NewWriter(g.ResponseWriter)
-		g.active = true
+	if h.Get("Content-Encoding") == "" && compressibleType(h.Get("Content-Type")) {
+		varyAcceptEncoding(h)
+		if g.status == http.StatusOK && g.acceptsGzip {
+			h.Set("Content-Encoding", "gzip")
+			h.Del("Content-Length")
+			g.gz = gzip.NewWriter(g.ResponseWriter)
+			g.active = true
+		}
 	}
 	g.ResponseWriter.WriteHeader(g.status)
 	g.sent = true

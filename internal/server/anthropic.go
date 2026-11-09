@@ -2,9 +2,12 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -68,9 +71,43 @@ type anthropicContentBlock struct {
 }
 
 type anthropicImageSource struct {
-	Type      string `json:"type"` // base64
+	Type      string `json:"type"` // base64 or url
 	MediaType string `json:"media_type"`
 	Data      string `json:"data"`
+	URL       string `json:"url"`
+}
+
+// anthropicImagePart validates client-supplied image references without fetching
+// URLs. Tool-result images use the same conversion as ordinary user images.
+func anthropicImagePart(source *anthropicImageSource) (map[string]any, error) {
+	if source == nil {
+		return nil, errors.New("image source is required")
+	}
+	var imageURL string
+	switch source.Type {
+	case "url":
+		parsed, err := url.Parse(source.URL)
+		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") || strings.TrimSpace(source.URL) != source.URL {
+			return nil, errors.New("image URL must be an absolute HTTP or HTTPS URL")
+		}
+		imageURL = source.URL
+	case "base64":
+		switch source.MediaType {
+		case "image/jpeg", "image/png", "image/gif", "image/webp":
+		default:
+			return nil, errors.New("unsupported image media_type")
+		}
+		if source.Data == "" {
+			return nil, errors.New("image base64 data is required")
+		}
+		if size, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding.Strict(), strings.NewReader(source.Data))); err != nil || size == 0 {
+			return nil, errors.New("invalid image base64 data")
+		}
+		imageURL = "data:" + source.MediaType + ";base64," + source.Data
+	default:
+		return nil, errors.New("unsupported image source type")
+	}
+	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL}}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -174,14 +211,17 @@ func anthropicSystem(raw json.RawMessage) (string, bool) {
 // anthropicMessageToOpenAI converts one Anthropic message into zero or more
 // OpenAI messages:
 //   - user text/image blocks → one user message (string or part array)
-//   - user tool_result blocks → one OpenAI tool message each, then one user
-//     message for any trailing text
+//   - user tool_result blocks → one OpenAI tool message each; image-bearing
+//     results also retain their ordered content in a labeled user image group
 //   - assistant text → one assistant message
 //   - assistant tool_use blocks → tool_calls on the assistant message
 //
 // Inbound thinking blocks (with signature) and cache_control markers are
 // dropped: backends cannot verify them and reject unknown fields.
 func anthropicMessageToOpenAI(m anthropicMsg) ([]any, error) {
+	if m.Role != "user" && m.Role != "assistant" {
+		return nil, errors.New("message role must be user or assistant")
+	}
 	// Plain string content is the common fast path.
 	var s string
 	if json.Unmarshal(m.Content, &s) == nil {
@@ -223,6 +263,8 @@ func anthropicMessageToOpenAI(m anthropicMsg) ([]any, error) {
 						"arguments": string(args),
 					},
 				})
+			case "image":
+				return nil, errors.New("image blocks are only supported in user messages")
 			case "thinking":
 				// Dropped: signatures are Anthropic-side and cannot be
 				// replayed against a different upstream.
@@ -250,15 +292,15 @@ func anthropicMessageToOpenAI(m anthropicMsg) ([]any, error) {
 			userText.WriteString(b.Text)
 			userParts = append(userParts, map[string]any{"type": "text", "text": b.Text})
 		case "image":
-			if b.Source != nil && b.Source.Type == "base64" && b.Source.Data != "" {
-				userParts = append(userParts, map[string]any{
-					"type": "image_url",
-					"image_url": map[string]any{
-						"url": "data:" + b.Source.MediaType + ";base64," + b.Source.Data,
-					},
-				})
+			part, err := anthropicImagePart(b.Source)
+			if err != nil {
+				return nil, err
 			}
+			userParts = append(userParts, part)
 		case "tool_result":
+			if b.ToolUseID == "" {
+				return nil, errors.New("tool_result tool_use_id is required")
+			}
 			content := ""
 			switch {
 			case len(b.Content) == 0 || string(b.Content) == "null":
@@ -268,14 +310,36 @@ func anthropicMessageToOpenAI(m anthropicMsg) ([]any, error) {
 					content = cs
 				} else {
 					var cb []anthropicContentBlock
-					if json.Unmarshal(b.Content, &cb) == nil {
-						var sb strings.Builder
-						for _, part := range cb {
-							if part.Type == "text" {
-								sb.WriteString(part.Text)
+					if err := json.Unmarshal(b.Content, &cb); err != nil {
+						return nil, errors.New("tool_result content must be a string or an array of text and image blocks")
+					}
+					var sb strings.Builder
+					var parts []any
+					hasImage := false
+					for _, part := range cb {
+						switch part.Type {
+						case "text":
+							sb.WriteString(part.Text)
+							parts = append(parts, map[string]any{"type": "text", "text": part.Text})
+						case "image":
+							image, err := anthropicImagePart(part.Source)
+							if err != nil {
+								return nil, err
 							}
+							hasImage = true
+							parts = append(parts, image)
+						default:
+							return nil, errors.New("tool_result content only supports text and image blocks")
 						}
-						content = sb.String()
+					}
+					content = sb.String()
+					if hasImage {
+						// OpenAI tool messages cannot carry images. Repeat the text
+						// alongside the images to preserve their original ordering,
+						// with explicit boundaries tying each group to its call ID.
+						userParts = append(userParts, map[string]any{"type": "text", "text": "Tool result for tool_call_id " + b.ToolUseID + ":"})
+						userParts = append(userParts, parts...)
+						userParts = append(userParts, map[string]any{"type": "text", "text": "End tool result for tool_call_id " + b.ToolUseID + "."})
 					}
 				}
 			}

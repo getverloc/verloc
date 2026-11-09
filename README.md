@@ -175,6 +175,8 @@ provider prices.
 | `POST /v1/chat/completions` | Application API key | Chat Completions, including streaming |
 | `POST /v1/responses` | Application API key | Responses passthrough to a compatible upstream |
 | `POST /v1/systemone` | Application API key | Native Jev/Clef typed-question evaluation; no streaming |
+| `POST /v1/messages` | Application API key | Anthropic Messages translated to Chat Completions, including streaming |
+| `POST /v1/messages/count_tokens` | Application API key | Local, approximate token count; no upstream inference |
 | `GET /v1/models` | None (key optional) | Enabled models; a presented key scopes the list to its access, anonymous callers see all enabled models |
 | `GET /v1/pricing` | Application API key | Scoped pricing catalog in USD per million tokens |
 | `GET /healthz` | None | Process liveness; does not test upstreams or storage |
@@ -182,6 +184,18 @@ provider prices.
 | `GET /metrics` | Owner session | Live **JSON**, not Prometheus exposition |
 | `/dash/` | Owner login within the app | Embedded operations dashboard |
 | `/dash/api/*` | Owner session | Dashboard and management APIs; writes require CSRF protection |
+
+Anthropic messages support base64 and URL images without gateway-side URL fetching.
+Image-bearing tool results retain their call association in subsequent user content;
+malformed or unsupported image sources return a client error rather than disappearing.
+Token counting uses a character-based estimate, not a provider tokenizer. It enforces
+model access, per-key RPM/concurrency, global admission, and bounded body reads, but
+does not consume upstream TPM or incur upstream usage.
+
+For providers retaining reasoning, replay is isolated by application-key identity,
+public model, provider/upstream route, and conversation/tool-turn content. Reused
+tool-call IDs alone cannot select another turn's reasoning. Stream accumulation
+is bounded to 512 KiB per choice.
 
 Authentication endpoints under `/dash/api/auth/` are reachable before login for setup/session/login. Application API keys never grant administrative access. Responses requests are not translated to Chat Completions: the selected upstream must support `/responses`. Other OpenAI APIs, including embeddings, images, and audio, are not implemented.
 
@@ -196,10 +210,16 @@ The same binary serves all nine screens; there is no separate analytics service.
 | **Analytics** | Client/model/provider comparisons and full ledgers, status breakdown, latency distribution, p50/p95/p99 latency and TTFT, cache usage, cost history, and data-coverage notes |
 | **Alerts** | Configured thresholds/scopes/windows/cooldowns and a bounded recent history of persisted/live triggers |
 | **Providers** | Connection management, discovery/testing, credentials, provider health, cooldowns, and expandable process-session diagnostics |
-| **Models** | Public model IDs, upstream mappings, pricing, ordered fallback routes, and bulk enable/disable/delete |
+| **Models** | Model metadata and capabilities, upstream mappings, pricing, ordered fallback routes, and bulk enable/disable/delete |
 | **API Keys** | Application key lifecycle, model access, expiry, RPM/TPM limits, and concurrency limits |
 | **Settings** | Owner password, global admission/retry/body/stream limits, alert rules, server-side backups, database paths, connection details, and recent management audit events |
 | **Docs** | In-app gateway API reference: endpoints, schemas, errors, routing, and configuration |
+
+**Allow private / LAN upstream** is an explicit provider-editor and guided-add
+option for intentionally local endpoints; it is off by default and saved with
+the provider. Existing-provider probes honor that saved permission. Upstream
+discovery has a 15-second overall deadline; connectivity tests have 30 seconds,
+including DNS and response bodies. Connectivity tests send a real upstream request.
 
 ### Automatic model metadata
 
@@ -224,6 +244,23 @@ means free. Catalog prices are suggestions across providers: review them before
 applying. When no cached-input discount is supplied, newly saved models use the
 input rate instead of treating cached tokens as free.
 
+The legacy seed generator also distinguishes missing prices from explicit zero:
+free canonical rates are not replaced by paid fallbacks, and partial pricing
+remains unknown rather than becoming free.
+
+Model metadata also supports `reasoning`, `attachment`, `temperature`, and a
+`modalities` object with `input`/`output` arrays. Owner model upserts
+(`PUT /dash/api/admin/models/{id}` or `POST /dash/api/admin/onboard`) persist these
+fields in SQLite and live-apply them to `/v1/models`. Explicit managed values
+override embedded capability defaults, including an explicit `false`. Omitted
+capability fields retain saved overrides on later model edits; capabilities
+without a managed value or embedded default remain omitted rather than being
+reported as unsupported. The model editor exposes descriptions, ownership, tags,
+explicit supported/not-supported capability choices, and input/output modality
+lists. Untouched missing fields retain inheritance or unknown status; clearing an
+edited modality list saves an explicit empty list. Saved capability overrides
+cannot be reset to unknown in the editor.
+
 ### Accounting and privacy
 
 - Normal analytics stores **metadata**, not prompts, completions, or request/response bodies. Metadata includes model/provider/client identity, timestamps, status, timings, tokens, known cost, client IP/user agent, and attempt summaries. Protect the database accordingly. Payloads are still sent to your chosen upstreams; their policies apply.
@@ -246,11 +283,11 @@ Default paths below are relative to the directory containing the `-config` file.
 | `verloc-data/master.key` | External encryption key for upstream credentials | Back up **separately and securely**; loss prevents credential recovery |
 | `verloc.db` | Request history, snapshots, alerts, and upstream credential events | Back up to retain analytics |
 | `verloc-data/setup.token` | Private first-run owner-setup token | Treat as a secret; not a login or password-reset mechanism |
-| Optional bootstrap JSON | Listener, database/key/token paths, secure-cookie mode | Preserve deployment options; contains no provider keys in a new installation |
+| Optional bootstrap JSON | Listener, database/key/token paths, secure-cookie mode, host allowlist, trusted proxies | Preserve deployment options; contains no provider keys in a new installation |
 
 SQLite also creates `-wal`/`-shm` files while running. Do not move an active database in isolation or back it up with a naive file copy. Use the backup commands below.
 
-Changes made in the dashboard are transactional, saved in `control.db`, and live-applied. The server does not write `config.json`. Changing bootstrap listener/paths/cookie options requires a restart; editing legacy provider/model entries in JSON does not override an already-imported management database.
+Changes made in the dashboard are transactional, saved in `control.db`, and live-applied. The server does not write `config.json`. Changing bootstrap listener/paths/cookies/host or trusted-proxy policies requires a restart; editing legacy provider/model entries in JSON does not override an already-imported management database.
 
 ### Existing `config.json` installations
 
@@ -263,7 +300,7 @@ To produce a secret-free bootstrap from an imported installation, stop the norma
 ./verloc -config bootstrap.json
 ```
 
-The export requires a new destination file and records absolute storage paths. It does not remove the old secret-bearing file. Archive it securely or remove it after verifying the migration; do not deploy it over the live databases.
+The export requires a new destination file and records absolute storage paths plus the bootstrap-only `allowed_hosts` and `trusted_proxies` policies. It does not remove the old secret-bearing file. Archive it securely or remove it after verifying the migration; do not deploy it over the live databases.
 
 ## Production deployment
 
@@ -414,11 +451,19 @@ Keep the previous binary for recovery, but do not assume older binaries can read
 | `make build` | Build the dashboard, then the CGO-free binary |
 | `./scripts/build.sh` | Build with version/commit/build-time metadata |
 | `go test ./... -count=1` | Run Go tests |
+| `go test -race ./... -count=1` | Run Go tests with race detection |
+| `node --test scripts/sync-model-details.test.mjs` | Check catalog pricing with synthetic inputs; no private catalog files needed |
+| `npm --prefix dashboard run lint` | Run dashboard lint |
+| `npm --prefix dashboard run build` | Type-check and rebuild embedded dashboard assets |
 | `go vet ./...` | Run Go static checks |
 | `npm --prefix dashboard run dev` | Start Vite for UI development; use embedded same-origin mode for deployment checks |
 | `node scripts/sync-model-details.mjs` | Regenerate the embedded catalog from local catalog sources; not needed for dashboard-managed models |
 
 `internal/server/static/` is committed so a Go-only build can use the existing dashboard: `CGO_ENABLED=0 go build -o verloc ./cmd/verloc`. After frontend changes, rebuild assets and the binary; an old binary cannot pick up new assets from disk.
+
+CI uses Node 24 with the locked dashboard dependencies, runs the catalog
+regressions and frontend lint/type-check/build, then vets/tests Go and builds
+the CGO-free binary with the freshly generated assets.
 
 ```text
 config.example.json      Minimal key-less nvidia bootstrap example

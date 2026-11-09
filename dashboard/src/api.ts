@@ -190,6 +190,7 @@ export interface AdminProvider {
   request_timeout_seconds: number;
   no_auth: boolean;
   synthesize_cli_headers: boolean;
+  allow_private_upstreams: boolean;
   strip_reasoning_content: boolean | null;
   max_tokens: number;
   keys: AdminKey[];
@@ -209,6 +210,10 @@ export interface AdminModel {
   context_window: number;
   max_tokens: number;
   tags?: string[];
+  attachment?: boolean;
+  reasoning?: boolean;
+  temperature?: boolean;
+  modalities?: { input?: string[]; output?: string[]; [key: string]: unknown };
   pricing_input: number;
   pricing_output: number;
   pricing_cache: number;
@@ -305,6 +310,7 @@ export interface ProbeConn {
   auth_header_format?: string;
   no_auth?: boolean;
   synthesize_cli_headers?: boolean;
+  allow_private_upstreams?: boolean;
 }
 
 export interface TestResult {

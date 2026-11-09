@@ -9,6 +9,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: catalog generator regressions
+        run: node --test scripts/sync-model-details.test.mjs
+      - name: dashboard dependencies (locked)
+        working-directory: dashboard
+        run: npm ci
+      - name: dashboard lint
+        working-directory: dashboard
+        run: npm run lint
+      - name: dashboard type-check and embed build
+        working-directory: dashboard
+        run: npm run build
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'

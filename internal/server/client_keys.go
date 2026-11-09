@@ -70,10 +70,11 @@ type clientUsage struct {
 }
 
 type clientKeyRecord struct {
-	view     ClientKeyView
-	hash     [32]byte
-	identity *ClientIdentity
-	usage    *clientUsage
+	view                ClientKeyView
+	hash                [32]byte
+	identity            *ClientIdentity
+	usage               *clientUsage
+	revocationPersisted bool
 }
 
 type clientKeyRequest struct {
@@ -113,7 +114,7 @@ func (s *Security) loadClientKeys() error {
 			view.AllowedModels = []string{"*"}
 			migrated = append(migrated, view.ID)
 		}
-		record := &clientKeyRecord{view: view, usage: &clientUsage{}}
+		record := &clientKeyRecord{view: view, usage: &clientUsage{}, revocationPersisted: view.RevokedAt != 0}
 		copy(record.hash[:], hash)
 		record.identity = &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: record.hash}
 		s.clients[view.ID] = record
@@ -267,6 +268,8 @@ func (s *Security) handleClientKeyCreate(w http.ResponseWriter, r *http.Request)
 	}
 	view := ClientKeyView{ID: "ck_" + id, Name: req.Name, Prefix: prefix, AllowedModels: req.AllowedModels, ExpiresAt: req.ExpiresAt, RPM: req.RPM, TPM: req.TPM, MaxConcurrent: req.MaxConcurrent, CreatedAt: time.Now().UnixMilli()}
 	allowed, _ := json.Marshal(view.AllowedModels)
+	s.clientWriteMu.Lock()
+	defer s.clientWriteMu.Unlock()
 	// Durability before exposure: commit the new secret to SQLite first, then take
 	// s.mu only to publish it into the in-memory maps. The mutex is never held
 	// across I/O, so an owner click cannot stall inference traffic.
@@ -307,10 +310,10 @@ func (s *Security) handleClientKeyEdit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// Peek at the existing record under a short lock to derive the new policy and
-	// reject an already-revoked/missing key, then release s.mu for the DB write.
-	// The final publish re-reads under the lock, because the record may have been
-	// revoked/replaced between this peek and publication.
+	// Serialize the snapshot, commit and publication without blocking inference
+	// on database I/O under s.mu.
+	s.clientWriteMu.Lock()
+	defer s.clientWriteMu.Unlock()
 	id := r.PathValue("id")
 	s.mu.Lock()
 	old := s.clients[id]
@@ -346,23 +349,8 @@ func (s *Security) handleClientKeyEdit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "client key update failed")
 		return
 	}
-	// Publish under s.mu. Re-read so a concurrent revoke wins: publishing the old
-	// snapshot would clobber the in-memory revocation (fail-closed invariant). The
-	// usage pointer is carried from the *current* record so the live quota window
-	// is never refilled by a policy edit.
 	s.mu.Lock()
-	current := s.clients[id]
-	if current == nil {
-		s.mu.Unlock()
-		writeErr(w, 404, "client key not found")
-		return
-	}
-	if current.view.RevokedAt != 0 {
-		s.mu.Unlock()
-		writeErr(w, 409, "client key is revoked")
-		return
-	}
-	record := &clientKeyRecord{view: view, hash: current.hash, usage: current.usage, identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: current.hash}}
+	record := &clientKeyRecord{view: view, hash: old.hash, usage: old.usage, identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: old.hash}}
 	s.clients[view.ID], s.keys[record.hash] = record, record
 	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"client": view})
@@ -377,9 +365,8 @@ func (s *Security) handleClientKeyRotate(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 500, "client key rotation failed")
 		return
 	}
-	// Peek under a short lock to reject missing/revoked keys and capture the
-	// stable ID/hash, then release s.mu for the DB write. Unlike revoke, rotation
-	// introduces a new secret, so the commit must land before publication.
+	s.clientWriteMu.Lock()
+	defer s.clientWriteMu.Unlock()
 	id := r.PathValue("id")
 	s.mu.Lock()
 	old := s.clients[id]
@@ -413,22 +400,9 @@ func (s *Security) handleClientKeyRotate(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 500, "client key rotation failed")
 		return
 	}
-	// Publish under s.mu. Re-read so a concurrent revoke/rotate is not clobbered;
-	// usage is carried from the current record to preserve the live quota window.
 	s.mu.Lock()
-	current := s.clients[id]
-	if current == nil {
-		s.mu.Unlock()
-		writeErr(w, 404, "client key not found")
-		return
-	}
-	if current.view.RevokedAt != 0 {
-		s.mu.Unlock()
-		writeErr(w, 409, "client key is revoked")
-		return
-	}
-	record := &clientKeyRecord{view: view, hash: hash, usage: current.usage, identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: hash}}
-	delete(s.keys, current.hash)
+	record := &clientKeyRecord{view: view, hash: hash, usage: old.usage, identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: hash}}
+	delete(s.keys, old.hash)
 	s.keys[hash], s.clients[view.ID] = record, record
 	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"key": key, "client": view})
@@ -438,6 +412,8 @@ func (s *Security) handleClientKeyRevoke(w http.ResponseWriter, r *http.Request)
 	if !s.CheckAdmin(w, r) {
 		return
 	}
+	s.clientWriteMu.Lock()
+	defer s.clientWriteMu.Unlock()
 	// Revocation must take effect immediately: publish the in-memory revocation
 	// (drop the hash from s.keys, stamp RevokedAt) BEFORE the DB write, so inference
 	// traffic is denied the moment the owner clicks. If the DB write then fails the
@@ -451,13 +427,16 @@ func (s *Security) handleClientKeyRevoke(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 404, "client key not found")
 		return
 	}
-	if record.view.RevokedAt != 0 {
+	if record.revocationPersisted {
 		s.mu.Unlock()
 		writeJSON(w, 200, map[string]bool{"ok": true})
 		return
 	}
-	revoked := time.Now().UnixMilli()
-	record.view.RevokedAt = revoked
+	revoked := record.view.RevokedAt
+	if revoked == 0 {
+		revoked = time.Now().UnixMilli()
+		record.view.RevokedAt = revoked
+	}
 	delete(s.keys, record.hash)
 	s.mu.Unlock()
 	tx, err := s.control.db.BeginTx(r.Context(), nil)
@@ -477,6 +456,9 @@ func (s *Security) handleClientKeyRevoke(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 500, "client key revocation failed")
 		return
 	}
+	s.mu.Lock()
+	record.revocationPersisted = true
+	s.mu.Unlock()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -501,6 +483,17 @@ type ClientLease struct {
 // lock. Usage belongs to the stable database ID, not the rotatable secret or
 // policy snapshot; editing a policy cannot refill its current window.
 func (s *Security) AcquireClient(r *http.Request, model string, tokenReservation uint64) (*ClientLease, *PolicyError) {
+	return s.acquireClient(r, model, tokenReservation, true)
+}
+
+// AcquireClientPreBody reserves one request and concurrency slot using current
+// authentication and policy, without checking a model or consuming token quota.
+// Callers check lease.Identity.AllowsModel after parsing and defer Finish(0, true).
+func (s *Security) AcquireClientPreBody(r *http.Request) (*ClientLease, *PolicyError) {
+	return s.acquireClient(r, "", 0, false)
+}
+
+func (s *Security) acquireClient(r *http.Request, model string, tokenReservation uint64, inference bool) (*ClientLease, *PolicyError) {
 	identity := ClientIdentityFromRequest(r)
 	if identity == nil {
 		return nil, &PolicyError{Status: 401, Message: "valid client API key required"}
@@ -512,12 +505,12 @@ func (s *Security) AcquireClient(r *http.Request, model string, tokenReservation
 	if record == nil || record.view.ID != identity.ID || record.view.RevokedAt != 0 || (record.view.ExpiresAt != 0 && record.view.ExpiresAt <= now.UnixMilli()) {
 		return nil, &PolicyError{Status: 401, Message: "valid client API key required"}
 	}
-	if !record.identity.AllowsModel(model) {
+	if inference && !record.identity.AllowsModel(model) {
 		return nil, &PolicyError{Status: 403, Message: "model is not allowed for this client key"}
 	}
 	// The proxy prepares conservative input/output bounds from the authenticated
 	// policy snapshot. Enabling/changing TPM mid-request requires fresh preparation.
-	if record.view.TPM > 0 && identity.TPM != record.view.TPM {
+	if inference && record.view.TPM > 0 && identity.TPM != record.view.TPM {
 		return nil, &PolicyError{Status: http.StatusConflict, Message: "client token policy changed; retry the request"}
 	}
 	usage := record.usage
@@ -533,7 +526,7 @@ func (s *Security) AcquireClient(r *http.Request, model string, tokenReservation
 	if record.view.RPM > 0 && usage.requests >= uint64(record.view.RPM) {
 		return nil, &PolicyError{Status: 429, Message: "client request rate limit reached", RetryAfter: retryAfter}
 	}
-	if record.view.TPM > 0 && (tokenReservation > uint64(record.view.TPM) || usage.tokens > uint64(record.view.TPM)-tokenReservation) {
+	if inference && record.view.TPM > 0 && (tokenReservation > uint64(record.view.TPM) || usage.tokens > uint64(record.view.TPM)-tokenReservation) {
 		return nil, &PolicyError{Status: 429, Message: "client token rate limit reached", RetryAfter: retryAfter}
 	}
 	usage.requests = saturatingTokenAdd(usage.requests, 1)

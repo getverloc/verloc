@@ -100,20 +100,21 @@ func (s *Server) applyLive(newCfg *Config) error {
 // ---- providers ----
 
 type adminProviderView struct {
-	Name                 string         `json:"name"`
-	BaseURL              string         `json:"base_url"`
-	APIFormat            string         `json:"api_format"`
-	AuthHeader           string         `json:"auth_header"`
-	AuthHeaderFormat     string         `json:"auth_header_format"`
-	CooldownSeconds      int            `json:"cooldown_seconds"`
-	RequestTimeout       int            `json:"request_timeout_seconds"`
-	NoAuth               bool           `json:"no_auth"`
-	SynthesizeCLIHeaders bool           `json:"synthesize_cli_headers"`
-	StripReasoning       *bool          `json:"strip_reasoning_content"`
-	MaxTokens            int            `json:"max_tokens"`
-	Keys                 []adminKeyView `json:"keys"`
-	Disabled             bool           `json:"disabled"`
-	ModelCount           int            `json:"model_count"`
+	Name                  string         `json:"name"`
+	BaseURL               string         `json:"base_url"`
+	APIFormat             string         `json:"api_format"`
+	AuthHeader            string         `json:"auth_header"`
+	AuthHeaderFormat      string         `json:"auth_header_format"`
+	CooldownSeconds       int            `json:"cooldown_seconds"`
+	RequestTimeout        int            `json:"request_timeout_seconds"`
+	NoAuth                bool           `json:"no_auth"`
+	SynthesizeCLIHeaders  bool           `json:"synthesize_cli_headers"`
+	AllowPrivateUpstreams bool           `json:"allow_private_upstreams"`
+	StripReasoning        *bool          `json:"strip_reasoning_content"`
+	MaxTokens             int            `json:"max_tokens"`
+	Keys                  []adminKeyView `json:"keys"`
+	Disabled              bool           `json:"disabled"`
+	ModelCount            int            `json:"model_count"`
 }
 
 type adminKeyView struct {
@@ -177,7 +178,8 @@ func (s *Server) providerView(name string, p *ProviderConfig, cfg *Config) admin
 		Name: name, BaseURL: p.BaseURL, APIFormat: p.APIFormat, AuthHeader: p.AuthHeader, AuthHeaderFormat: p.AuthHeaderFormat,
 		CooldownSeconds: p.CooldownSeconds, RequestTimeout: p.RequestTimeout,
 		NoAuth: p.NoAuth, SynthesizeCLIHeaders: p.SynthesizeCLIHeaders,
-		StripReasoning: p.StripReasoningContent, MaxTokens: p.MaxTokens,
+		AllowPrivateUpstreams: p.AllowPrivateUpstreams,
+		StripReasoning:        p.StripReasoningContent, MaxTokens: p.MaxTokens,
 		Keys: keys, ModelCount: nModels, Disabled: p.Disabled,
 	}
 }
@@ -303,41 +305,49 @@ func (s *Server) handleAdminProviderKeyDelete(w http.ResponseWriter, r *http.Req
 // ---- models ----
 
 type adminModelView struct {
-	ID            string        `json:"id"`
-	Backend       string        `json:"backend"`
-	Upstream      string        `json:"upstream"`
-	Name          string        `json:"name"`
-	Description   string        `json:"description,omitempty"`
-	OwnedBy       string        `json:"owned_by,omitempty"`
-	ContextWindow int           `json:"context_window"`
-	MaxTokens     int           `json:"max_tokens"`
-	Tags          []string      `json:"tags,omitempty"`
-	PricingInput  float64       `json:"pricing_input"`
-	PricingOutput float64       `json:"pricing_output"`
-	PricingCache  float64       `json:"pricing_cache"`
-	PricingKnown  bool          `json:"pricing_known"`
-	HasMeta       bool          `json:"has_meta"`
-	Embedded      bool          `json:"embedded"`
-	Disabled      bool          `json:"disabled"`
-	Routes        []RouteTarget `json:"routes"`
+	ID            string         `json:"id"`
+	Backend       string         `json:"backend"`
+	Upstream      string         `json:"upstream"`
+	Name          string         `json:"name"`
+	Description   string         `json:"description,omitempty"`
+	OwnedBy       string         `json:"owned_by,omitempty"`
+	ContextWindow int            `json:"context_window"`
+	MaxTokens     int            `json:"max_tokens"`
+	Tags          []string       `json:"tags,omitempty"`
+	Attachment    *bool          `json:"attachment,omitempty"`
+	Reasoning     *bool          `json:"reasoning,omitempty"`
+	Temperature   *bool          `json:"temperature,omitempty"`
+	Modalities    map[string]any `json:"modalities,omitempty"`
+	PricingInput  float64        `json:"pricing_input"`
+	PricingOutput float64        `json:"pricing_output"`
+	PricingCache  float64        `json:"pricing_cache"`
+	PricingKnown  bool           `json:"pricing_known"`
+	HasMeta       bool           `json:"has_meta"`
+	Embedded      bool           `json:"embedded"`
+	Disabled      bool           `json:"disabled"`
+	Routes        []RouteTarget  `json:"routes"`
 }
 
 type modelUpsertReq struct {
-	ID            string        `json:"id"`
-	Backend       string        `json:"backend"`
-	Upstream      string        `json:"upstream"`
-	Name          string        `json:"name"`
-	Description   string        `json:"description"`
-	OwnedBy       string        `json:"owned_by"`
-	ContextWindow int           `json:"context_window"`
-	MaxTokens     int           `json:"max_tokens"`
-	Tags          []string      `json:"tags"`
-	PricingInput  *float64      `json:"pricing_input"`
-	PricingOutput *float64      `json:"pricing_output"`
-	PricingCache  *float64      `json:"pricing_cache"`
-	Disabled      bool          `json:"disabled"`
-	Routes        []RouteTarget `json:"routes"`
-	Overwrite     bool          `json:"overwrite"`
+	ID            string         `json:"id"`
+	Backend       string         `json:"backend"`
+	Upstream      string         `json:"upstream"`
+	Name          string         `json:"name"`
+	Description   string         `json:"description"`
+	OwnedBy       string         `json:"owned_by"`
+	ContextWindow int            `json:"context_window"`
+	MaxTokens     int            `json:"max_tokens"`
+	Tags          []string       `json:"tags"`
+	Attachment    *bool          `json:"attachment,omitempty"`
+	Reasoning     *bool          `json:"reasoning,omitempty"`
+	Temperature   *bool          `json:"temperature,omitempty"`
+	Modalities    map[string]any `json:"modalities,omitempty"`
+	PricingInput  *float64       `json:"pricing_input"`
+	PricingOutput *float64       `json:"pricing_output"`
+	PricingCache  *float64       `json:"pricing_cache"`
+	Disabled      bool           `json:"disabled"`
+	Routes        []RouteTarget  `json:"routes"`
+	Overwrite     bool           `json:"overwrite"`
 }
 
 func (s *Server) handleAdminModelsList(w http.ResponseWriter, r *http.Request) {
@@ -374,6 +384,10 @@ func (s *Server) modelView(id string, cfg *Config) adminModelView {
 		v.ContextWindow = meta.ContextWindow
 		v.MaxTokens = meta.MaxTokens
 		v.Tags = meta.Tags
+		v.Attachment = meta.Attachment
+		v.Reasoning = meta.Reasoning
+		v.Temperature = meta.Temperature
+		v.Modalities = meta.Modalities
 		v.PricingInput = meta.PricingInput
 		v.PricingOutput = meta.PricingOutput
 		v.PricingCache = meta.PricingCache
@@ -407,6 +421,18 @@ func (s *Server) modelView(id string, cfg *Config) adminModelView {
 		}
 		if len(v.Tags) == 0 {
 			v.Tags = m.Tags
+		}
+		if v.Attachment == nil {
+			v.Attachment = m.Attachment
+		}
+		if v.Reasoning == nil {
+			v.Reasoning = m.Reasoning
+		}
+		if v.Temperature == nil {
+			v.Temperature = m.Temperature
+		}
+		if v.Modalities == nil {
+			v.Modalities = m.Modalities
 		}
 	}
 	if v.Name == "" {

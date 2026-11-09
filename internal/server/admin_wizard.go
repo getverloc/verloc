@@ -39,6 +39,7 @@ type probeConn struct {
 // second.
 func probeClient(timeoutSec int, allowPrivate bool) *http.Client {
 	c := newClient(timeoutSec)
+	c.Timeout = time.Duration(timeoutSec) * time.Second
 	if allowPrivate {
 		return c
 	}
@@ -102,6 +103,9 @@ type probeReq struct {
 // refusal. A literal IP is checked directly; a hostname is resolved, because
 // "localhost" and internal DNS names must not slip through.
 func guardProbeHost(ctx context.Context, baseURL string, allowPrivate bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return fmt.Errorf("base_url is not a valid URL")
@@ -123,6 +127,9 @@ func guardProbeHost(ctx context.Context, baseURL string, allowPrivate bool) erro
 		return check(addr.Unmap())
 	}
 	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err != nil || len(ips) == 0 {
 		// Resolution failure must NOT block: a transient resolver blip or an
 		// air-gapped host would otherwise make the admin API unusable, and the
@@ -138,7 +145,7 @@ func guardProbeHost(ctx context.Context, baseURL string, allowPrivate bool) erro
 	return nil
 }
 
-func (s *Server) resolveProbeConn(req probeReq) (probeConn, error) {
+func (s *Server) resolveProbeConn(ctx context.Context, req probeReq) (probeConn, error) {
 	allowPrivate := req.AllowPrivate
 	c := probeConn{
 		apiFormat:  strings.TrimSpace(req.APIFormat),
@@ -196,7 +203,7 @@ func (s *Server) resolveProbeConn(req probeReq) (probeConn, error) {
 	if c.accountID != "" {
 		guardURL = strings.ReplaceAll(c.baseURL, "%ACCOUNT%", c.accountID)
 	}
-	if err := guardProbeHost(context.Background(), guardURL, allowPrivate); err != nil {
+	if err := guardProbeHost(ctx, guardURL, allowPrivate); err != nil {
 		return c, err
 	}
 	if c.apiFormat != "" && c.apiFormat != "openai" && c.apiFormat != "systemone" {
@@ -247,7 +254,9 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 	if !decodeAdminJSON(w, r, &req) {
 		return
 	}
-	conn, err := s.resolveProbeConn(req)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	conn, err := s.resolveProbeConn(ctx, req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -266,7 +275,7 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 		if cloudflare {
 			modelsURL = strings.ReplaceAll(strings.TrimSuffix(conn.baseURL, "/v1")+path, "%ACCOUNT%", conn.accountID)
 		}
-		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, modelsURL, nil)
+		upReq, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "bad upstream request")
 			return
@@ -325,7 +334,11 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 	for _, m := range models {
 		ids = append(ids, m.ID)
 	}
-	hints := s.hints.hintsFor(r.Context(), s.runtime().cfg, ids)
+	hints := s.hints.hintsFor(ctx, s.runtime().cfg, ids)
+	if ctx.Err() != nil {
+		writeErr(w, http.StatusBadGateway, "upstream unreachable")
+		return
+	}
 	for i := range models {
 		models[i].Hint = mergeDiscoveredModelHint(models[i].Hint, hints[models[i].ID])
 	}
@@ -432,7 +445,9 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "upstream is required")
 		return
 	}
-	conn, err := s.resolveProbeConn(req.probeReq)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	conn, err := s.resolveProbeConn(ctx, req.probeReq)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -469,7 +484,7 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	}
 	client := probeClient(30, conn.allowPrivate)
 	defer client.CloseIdleConnections()
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, strings.ReplaceAll(targetURL, "%ACCOUNT%", conn.accountID), bytes.NewReader(payload))
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.ReplaceAll(targetURL, "%ACCOUNT%", conn.accountID), bytes.NewReader(payload))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad upstream request")
 		return
@@ -478,6 +493,11 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	upReq.Header.Set("Content-Type", "application/json")
 	start := time.Now()
 	resp, err := client.Do(upReq)
+	var body []byte
+	if err == nil {
+		defer resp.Body.Close()
+		body, err = io.ReadAll(io.LimitReader(resp.Body, 1<<18))
+	}
 	if err != nil {
 		log.Printf("[admin] test upstream=%s err=%v", upstream, err)
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -487,8 +507,6 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<18))
 	latMs := time.Since(start).Milliseconds()
 	if resp.StatusCode != http.StatusOK {
 		msg := errorMessage(body)

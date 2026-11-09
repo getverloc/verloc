@@ -9,17 +9,64 @@ import (
 	"io/fs"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 )
 
-// acceptsGzip reports whether the client advertised gzip support.
+// acceptsGzip selects gzip unless it is excluded or identity is explicitly preferred.
 func acceptsGzip(r *http.Request) bool {
-	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		if strings.TrimSpace(strings.Split(part, ";")[0]) == "gzip" {
-			return true
+	gzipQ, wildcardQ, identityQ := -1.0, -1.0, -1.0
+	for _, header := range r.Header.Values("Accept-Encoding") {
+		for header != "" {
+			var part string
+			part, header, _ = strings.Cut(header, ",")
+			coding, params, _ := strings.Cut(part, ";")
+			coding = strings.TrimSpace(coding)
+			if !strings.EqualFold(coding, "gzip") && !strings.EqualFold(coding, "identity") && coding != "*" {
+				continue
+			}
+			quality := 1.0
+			for params != "" {
+				var param string
+				param, params, _ = strings.Cut(params, ";")
+				name, value, ok := strings.Cut(param, "=")
+				if strings.EqualFold(strings.TrimSpace(name), "q") {
+					q, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+					if !ok || err != nil || !(q >= 0 && q <= 1) {
+						quality = 0
+					} else {
+						quality = q
+					}
+				}
+			}
+			switch {
+			case strings.EqualFold(coding, "gzip"):
+				gzipQ = quality
+			case strings.EqualFold(coding, "identity"):
+				identityQ = quality
+			case coding == "*":
+				wildcardQ = quality
+			}
 		}
 	}
-	return false
+	if gzipQ < 0 {
+		gzipQ = wildcardQ
+	}
+	return gzipQ > 0 && (identityQ < 0 || gzipQ >= identityQ)
+}
+
+func varyAcceptEncoding(h http.Header) {
+	for _, value := range h.Values("Vary") {
+		for value != "" {
+			var field string
+			field, value, _ = strings.Cut(value, ",")
+			field = strings.TrimSpace(field)
+			if field == "*" || strings.EqualFold(field, "Accept-Encoding") {
+				return
+			}
+		}
+	}
+	h.Add("Vary", "Accept-Encoding")
 }
 
 // compressibleType reports whether a Content-Type is worth gzipping.
@@ -154,11 +201,13 @@ func serveDashFile(w http.ResponseWriter, r *http.Request, p string) {
 	}
 	body := a.data
 	etag := a.etag
+	if a.gz != nil {
+		varyAcceptEncoding(h)
+	}
 	if a.gz != nil && acceptsGzip(r) {
 		body = a.gz
 		etag = a.etag[:len(a.etag)-1] + `-gz"`
 		h.Set("Content-Encoding", "gzip")
-		h.Set("Vary", "Accept-Encoding")
 	}
 	h.Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {

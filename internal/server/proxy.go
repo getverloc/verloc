@@ -669,13 +669,17 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 			continue // Never convert typed evaluation into chat during failover.
 		}
 		var modified []byte
+		var replay reasoningContext
 		if endpoint == "/systemone" {
 			modified = remapSystemOneBody(raw, upstreamModel)
 		} else {
 			modified = remapBody(raw, upstreamModel, b.name == "mistral", b.name)
 			modified = stripReasoningContent(modified, b.stripReasoning)
 			if !b.stripReasoning {
-				modified = ensureReasoningReplay(modified, s.reasonCache)
+				modified, replay = ensureReasoningReplay(modified, s.reasonCache, reasoningScope{
+					clientID: rec.ClientKeyID, model: rec.Model, provider: b.name,
+					upstream: upstreamURL + "\x00" + upstreamModel,
+				})
 			}
 			modified = capMaxTokens(modified, b.maxTokens)
 		}
@@ -796,7 +800,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				cancel()
 				_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 				if err == nil {
-					acc.store(s.reasonCache)
+					acc.store(s.reasonCache, replay)
 				} else {
 					outcome := "interrupted"
 					if idle.timedOut.Load() {
@@ -882,7 +886,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				} else {
 					rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = usageOf(body)
 					if endpoint != "/systemone" && !b.stripReasoning {
-						body = rememberFromResponse(body, s.reasonCache)
+						body = rememberFromResponse(body, s.reasonCache, replay)
 					}
 				}
 				copyResponseHeaders(w, resp, false)

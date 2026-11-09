@@ -33,7 +33,7 @@ const PATHS = {
 // `input_cache_read_tiers\t`, `tags\t`. The next lines belong to the most
 // recent group until a new group header or a known top-level key is seen.
 // Tier entries are `N\t{ cost: "0.0000003", min: 0, max: 512000 }` lines.
-function parseModelDetails(text) {
+export function parseModelDetails(text) {
   const blocks = text.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
   const out = {};
   for (const block of blocks) {
@@ -152,7 +152,7 @@ function parseTierValue(s) {
 function castScalar(s) {
   if (s === 'true') return true;
   if (s === 'false') return false;
-  if (s === '' || s == null) return 0;
+  if (s === '' || s == null) return undefined;
   if (/^-?\d+$/.test(s)) return Number(s);
   if (/^-?\d+\.\d+$/.test(s)) return Number(s);
   return s;
@@ -162,12 +162,23 @@ function castScalar(s) {
 // blocks are already $/1M (e.g. 0.32664) and use cache_hit instead of
 // input_cache_read. Treat anything >= $0.001/token as already per-1M —
 // a real per-token rate that large would be $1,000/1M.
-function mdPricingToPer1M(p = {}) {
-  const input = Number(p.input) || 0;
-  const output = Number(p.output) || 0;
-  const cache = Number(p.input_cache_read || p.cache_hit) || 0;
+function price(value) {
+  if ((typeof value !== 'number' && typeof value !== 'string') ||
+      (typeof value === 'string' && value.trim() === '')) return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+export function mdPricingToPer1M(p = {}) {
+  const input = price(p.input);
+  const output = price(p.output);
+  const cache = price(p.input_cache_read) ?? price(p.cache_hit);
   const mul = (input >= 0.001 || output >= 0.001) ? 1 : 1e6;
-  return { input: input * mul, output: output * mul, cache_read: cache * mul };
+  return {
+    input: input === undefined ? undefined : input * mul,
+    output: output === undefined ? undefined : output * mul,
+    cache_read: cache === undefined ? undefined : cache * mul,
+  };
 }
 
 // JSON.parse keeps the last duplicate key. Flag collisions in the raw
@@ -204,7 +215,7 @@ function warnDuplicateModelKeys(text) {
 }
 
 // ---------- parse opencode.jsonc (verloc provider) ----------
-function parseOpencodeVerloc(text) {
+export function parseOpencodeVerloc(text) {
   warnDuplicateModelKeys(text);
   let s = text.replace(/^\uFEFF/, '');
   s = s.replace(/\/\*[\s\S]*?\*\//g, '');
@@ -222,9 +233,9 @@ function parseOpencodeVerloc(text) {
       context_window: m.limit?.context || 0,
       max_tokens: m.limit?.output || 0,
       pricing_per_1m: {
-        input: Number(c.input) || 0,
-        output: Number(c.output) || 0,
-        cache_read: Number(c.cache_read) || 0,
+        input: price(c.input),
+        output: price(c.output),
+        cache_read: price(c.cache_read),
       },
       // extra metadata opencode has that model-details.md usually doesn't:
       attachment: m.attachment,
@@ -241,7 +252,7 @@ function parseOpencodeVerloc(text) {
 }
 
 // ---------- verloc config: get list of verloc model ids + their upstreams ----------
-function parseVerlocModelMap(text) {
+export function parseVerlocModelMap(text) {
   const data = JSON.parse(text);
   const mm = data.model_map || {};
   const entries = [];
@@ -267,8 +278,7 @@ function normalizeName(n) {
   return String(n || '').toLowerCase().replace(/\s*\([^)]+\)\s*$/, '').trim();
 }
 
-function main() {
-  const md = parseModelDetails(fs.readFileSync(PATHS.md, 'utf8'));
+export function mergeModelDetails(md, oc, verlocEntries) {
   const mdByName = new Map();
   for (const e of Object.values(md)) {
     if (e.name) mdByName.set(normalizeName(e.name), e);
@@ -288,8 +298,6 @@ function main() {
       if (stripped !== e.id && !mdById.has(stripped)) mdById.set(stripped, e);
     }
   }
-  const oc = parseOpencodeVerloc(fs.readFileSync(PATHS.oc, 'utf8'));
-  const verlocEntries = parseVerlocModelMap(fs.readFileSync(PATHS.verloc, 'utf8'));
 
   const out = [];
   const stats = { total: 0, withMdMeta: 0, withOcPricing: 0, fullMerge: 0 };
@@ -313,30 +321,30 @@ function main() {
     if (ocEntry) stats.withOcPricing++;
     if (mdEntry && ocEntry) stats.fullMerge++;
 
-    // Pricing: prefer opencode ($/1M, complete). If opencode has no pricing
-    // (all zeros — common for free-tier models that lack a `cost` block),
-    // fall back to model-details. Canonical md prices are $/token and need
-    // ×1e6; hyper-style entries are already $/1M (0.33, 3.27, …).
-    let pricing = null;
-    if (ocEntry) {
-      pricing = { ...ocEntry.pricing_per_1m };
-      if (pricing.input === 0 && pricing.output === 0 && mdEntry) {
-        pricing = mdPricingToPer1M(mdEntry.pricing);
-      }
-    } else if (mdEntry) {
-      pricing = mdPricingToPer1M(mdEntry.pricing);
-    } else {
-      pricing = { input: 0, output: 0, cache_read: 0 };
-    }
-
-    // OpenRouter-compatible pricing (per-token, strings). This is what
-    // /v1/models surfaces so OpenAI/OpenRouter-style clients (e.g. hermes)
-    // can read it without unit confusion.
-    const or_pricing = {
-      prompt:            (pricing.input     / 1e6).toFixed(10).replace(/\.?0+$/, '') || '0',
-      completion:        (pricing.output    / 1e6).toFixed(10).replace(/\.?0+$/, '') || '0',
+    // Opencode rates are canonical, including explicit zero. Only missing
+    // fields fall back to model-details; missing cache uses the input rate.
+    const ocPricing = ocEntry?.pricing_per_1m || {};
+    const mdPricing = mdPricingToPer1M(mdEntry?.pricing);
+    const input = ocPricing.input ?? mdPricing.input;
+    const output = ocPricing.output ?? mdPricing.output;
+    const pricing = {
+      input,
+      output,
+      cache_read: ocPricing.cache_read ?? mdPricing.cache_read ?? input,
     };
-    if (pricing.cache_read) or_pricing.input_cache_read = (pricing.cache_read / 1e6).toFixed(10).replace(/\.?0+$/, '') || '0';
+    const pricingKnown = input !== undefined && output !== undefined;
+
+    // The legacy seed loader infers known pricing from ANY nonempty token
+    // string. Keep partial numeric rates, but expose token strings only once
+    // both input and output are known so it cannot turn unknown into free.
+    const or_pricing = {};
+    if (pricingKnown) {
+      or_pricing.prompt = String(input / 1e6);
+      or_pricing.completion = String(output / 1e6);
+      if (pricing.cache_read !== undefined) {
+        or_pricing.input_cache_read = String(pricing.cache_read / 1e6);
+      }
+    }
 
     // Build the OpenAI-style response object.
     const entry = {
@@ -354,6 +362,7 @@ function main() {
       // OpenRouter-style per-token string pricing. Served as `pricing` in
       // /v1/models so OpenAI/OpenRouter-compatible agents can read it.
       pricing: or_pricing,
+      pricing_known: pricingKnown,
       // Per-1M-token numeric pricing. Served as `pricing` in /v1/pricing
       // (the dedicated endpoint the dashboard reads from).
       pricing_per_million: {
@@ -385,20 +394,32 @@ function main() {
     out.push(entry);
   }
 
+  return { models: out, stats };
+}
+
+function main() {
+  const md = parseModelDetails(fs.readFileSync(PATHS.md, 'utf8'));
+  const oc = parseOpencodeVerloc(fs.readFileSync(PATHS.oc, 'utf8'));
+  const verlocEntries = parseVerlocModelMap(fs.readFileSync(PATHS.verloc, 'utf8'));
+  const { models: out, stats } = mergeModelDetails(md, oc, verlocEntries);
+
   fs.writeFileSync(PATHS.out, JSON.stringify(out, null, 2) + '\n');
   console.log(`wrote ${out.length} verloc models -> ${path.relative(root, PATHS.out)}`);
   console.log(`  with rich metadata from model-details.md: ${stats.withMdMeta}/${stats.total}`);
   console.log(`  with pricing from opencode.jsonc:          ${stats.withOcPricing}/${stats.total}`);
   console.log(`  fully merged:                              ${stats.fullMerge}/${stats.total}`);
 
-  // Sanity: every entry should have non-zero context_window and at least input+output > 0
-  // (some poolside models legitimately have $0 pricing).
   const zeroCtx = out.filter(e => !e.context_window);
-  const zeroPrice = out.filter(e => e.pricing.input === 0 && e.pricing.output === 0);
+  const unknownPrice = out.filter(e => !e.pricing_known);
+  const zeroPrice = out.filter(e => e.pricing_known &&
+    e.pricing_per_million.input === 0 && e.pricing_per_million.output === 0);
   if (zeroCtx.length) console.warn(`WARN: ${zeroCtx.length} models have no context_window:`, zeroCtx.map(e => e.id));
-  if (zeroPrice.length) console.warn(`NOTE: ${zeroPrice.length} models have $0 pricing (likely free tier):`, zeroPrice.map(e => e.id));
+  if (unknownPrice.length) console.warn(`WARN: ${unknownPrice.length} models have unknown pricing:`, unknownPrice.map(e => e.id));
+  if (zeroPrice.length) console.warn(`NOTE: ${zeroPrice.length} models have explicit $0 pricing:`, zeroPrice.map(e => e.id));
   const insane = out.filter(e => e.pricing_per_million.input > 1000 || e.pricing_per_million.output > 1000);
   if (insane.length) console.warn(`WARN: ${insane.length} models have implausible $/1M rates:`, insane.map(e => `${e.id}=${e.pricing_per_million.input}/${e.pricing_per_million.output}`));
 }
 
-main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
+}

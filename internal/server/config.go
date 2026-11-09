@@ -180,17 +180,21 @@ func (l GatewayLimits) Validate() error {
 // ModelMeta is dashboard-editable catalog metadata. Pricing fields are USD
 // per 1M tokens (same unit as /v1/pricing and the analytics dashboard).
 type ModelMeta struct {
-	Name          string   `json:"name,omitempty"`
-	Description   string   `json:"description,omitempty"`
-	OwnedBy       string   `json:"owned_by,omitempty"`
-	Upstream      string   `json:"upstream,omitempty"`
-	ContextWindow int      `json:"context_window,omitempty"`
-	MaxTokens     int      `json:"max_tokens,omitempty"`
-	Tags          []string `json:"tags,omitempty"`
-	PricingInput  float64  `json:"pricing_input"`
-	PricingOutput float64  `json:"pricing_output"`
-	PricingCache  float64  `json:"pricing_cache"`
-	PricingKnown  *bool    `json:"pricing_known,omitempty"`
+	Name          string         `json:"name,omitempty"`
+	Description   string         `json:"description,omitempty"`
+	OwnedBy       string         `json:"owned_by,omitempty"`
+	Upstream      string         `json:"upstream,omitempty"`
+	ContextWindow int            `json:"context_window,omitempty"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
+	Tags          []string       `json:"tags,omitempty"`
+	Attachment    *bool          `json:"attachment,omitempty"`
+	Reasoning     *bool          `json:"reasoning,omitempty"`
+	Temperature   *bool          `json:"temperature,omitempty"`
+	Modalities    map[string]any `json:"modalities,omitempty"`
+	PricingInput  float64        `json:"pricing_input"`
+	PricingOutput float64        `json:"pricing_output"`
+	PricingCache  float64        `json:"pricing_cache"`
+	PricingKnown  *bool          `json:"pricing_known,omitempty"`
 }
 
 // DashboardConfig controls the embedded analytics dashboard + persistence.

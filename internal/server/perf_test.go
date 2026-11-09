@@ -156,7 +156,7 @@ func BenchmarkEnsureReasoningReplay(b *testing.B) {
 	cache := newReasoningCache(maxReasoningEntries)
 	b.SetBytes(int64(len(perfBody)))
 	for b.Loop() {
-		_ = ensureReasoningReplay(perfBody, cache)
+		_, _ = ensureReasoningReplay(perfBody, cache, reasoningScope{clientID: "bench", model: "test", provider: "primary", upstream: "up"})
 	}
 }
 
@@ -184,7 +184,7 @@ func BenchmarkRequestTransformChain(b *testing.B) {
 		for b.Loop() {
 			m := remapBody(perfBody, "up", false, "opencode")
 			m = stripReasoningContent(m, false)
-			m = ensureReasoningReplay(m, cache)
+			m, _ = ensureReasoningReplay(m, cache, reasoningScope{clientID: "bench", model: "test", provider: "opencode", upstream: "up"})
 			_ = capMaxTokens(m, 32768)
 		}
 	})

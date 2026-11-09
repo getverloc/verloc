@@ -56,16 +56,17 @@ type loginAttempts struct {
 // Security owns the sole owner's sessions and the independent inference-key namespace.
 // The control database contains only password/token hashes, never usable credentials.
 type Security struct {
-	control      *ControlStore
-	options      SecurityOptions
-	authMu       sync.Mutex
-	loginMu      sync.Mutex
-	logins       map[string]loginAttempts
-	loginSweepAt time.Time
-	loginSlots   chan struct{}
-	mu           sync.Mutex
-	keys         map[[32]byte]*clientKeyRecord
-	clients      map[string]*clientKeyRecord
+	control       *ControlStore
+	options       SecurityOptions
+	authMu        sync.Mutex
+	loginMu       sync.Mutex
+	logins        map[string]loginAttempts
+	loginSweepAt  time.Time
+	loginSlots    chan struct{}
+	clientWriteMu sync.Mutex
+	mu            sync.Mutex
+	keys          map[[32]byte]*clientKeyRecord
+	clients       map[string]*clientKeyRecord
 
 	allowedHosts   []string
 	trustedProxies []netip.Prefix

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -600,5 +601,55 @@ func TestControlStorePreservesExplicitUnknownPricing(t *testing.T) {
 	}
 	if reloaded.ModelMeta[id].PricingKnown == nil || *reloaded.ModelMeta[id].PricingKnown {
 		t.Fatal("save/reload lost explicit unknown pricing")
+	}
+}
+
+func TestControlStoreBootstrapPoliciesRemainSeedOnly(t *testing.T) {
+	store, _, _ := controlTestStore(t)
+	seed := controlTestConfig()
+	seed.SecureCookies = true
+	seed.AllowedHosts = []string{"gateway.example", "admin.example:8443"}
+	seed.TrustedProxies = []string{"127.0.0.1", "10.20.0.0/16"}
+	cfg, err := store.LoadOrImportConfig(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPolicies := func(got *Config) {
+		t.Helper()
+		if !got.SecureCookies || !reflect.DeepEqual(got.AllowedHosts, seed.AllowedHosts) || !reflect.DeepEqual(got.TrustedProxies, seed.TrustedProxies) {
+			t.Fatalf("bootstrap policies lost: secure=%v hosts=%v proxies=%v", got.SecureCookies, got.AllowedHosts, got.TrustedProxies)
+		}
+	}
+	assertPolicies(cfg)
+	cfg.AllowedHosts[0] = "changed.example"
+	cfg.TrustedProxies[0] = "192.0.2.1"
+	if seed.AllowedHosts[0] != "gateway.example" || seed.TrustedProxies[0] != "127.0.0.1" {
+		t.Fatal("loaded bootstrap slices alias the seed")
+	}
+	cfg, err = store.LoadOrImportConfig(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned, err := cloneConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPolicies(cloned)
+	cloned.Dashboard.RecentRequests = 7000
+	if err := store.SaveConfig(cloned); err != nil {
+		t.Fatal(err)
+	}
+	assertPolicies(cloned)
+	reloaded, err := store.LoadOrImportConfig(cloned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPolicies(reloaded)
+	withoutPolicies, err := store.LoadOrImportConfig(&Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutPolicies.SecureCookies || len(withoutPolicies.AllowedHosts) != 0 || len(withoutPolicies.TrustedProxies) != 0 {
+		t.Fatal("bootstrap policies became database-managed settings")
 	}
 }

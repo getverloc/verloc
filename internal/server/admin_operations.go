@@ -193,7 +193,23 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 	if !finitePricePtr(req.PricingInput) || !finitePricePtr(req.PricingOutput) || !finitePricePtr(req.PricingCache) {
 		return fmt.Errorf("model %q pricing must be a finite number", req.ID)
 	}
-	cfg.ModelMeta[req.ID] = &ModelMeta{Name: req.Name, Description: req.Description, OwnedBy: req.OwnedBy, Upstream: req.Upstream, ContextWindow: req.ContextWindow, MaxTokens: req.MaxTokens, Tags: req.Tags, PricingInput: price(req.PricingInput), PricingOutput: price(req.PricingOutput), PricingCache: price(cachePrice), PricingKnown: &pricingKnown}
+	meta := &ModelMeta{Name: req.Name, Description: req.Description, OwnedBy: req.OwnedBy, Upstream: req.Upstream, ContextWindow: req.ContextWindow, MaxTokens: req.MaxTokens, Tags: req.Tags, Attachment: req.Attachment, Reasoning: req.Reasoning, Temperature: req.Temperature, Modalities: req.Modalities, PricingInput: price(req.PricingInput), PricingOutput: price(req.PricingOutput), PricingCache: price(cachePrice), PricingKnown: &pricingKnown}
+	// Ordinary model edits omit capabilities; retain persisted overrides.
+	if previous := cfg.ModelMeta[req.ID]; previous != nil {
+		if meta.Attachment == nil {
+			meta.Attachment = previous.Attachment
+		}
+		if meta.Reasoning == nil {
+			meta.Reasoning = previous.Reasoning
+		}
+		if meta.Temperature == nil {
+			meta.Temperature = previous.Temperature
+		}
+		if meta.Modalities == nil {
+			meta.Modalities = previous.Modalities
+		}
+	}
+	cfg.ModelMeta[req.ID] = meta
 	cfg.DisabledModels[req.ID] = req.Disabled
 	cfg.ModelRoutes[req.ID] = append([]RouteTarget(nil), req.Routes...)
 	return nil

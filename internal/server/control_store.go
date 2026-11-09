@@ -429,7 +429,7 @@ func prepareControlConfig(cfg *Config, importCatalog bool) (*Config, error) {
 				continue
 			}
 			known := true
-			out.ModelMeta[m.ID] = &ModelMeta{Name: m.Name, Description: m.Description, OwnedBy: m.OwnedBy, Upstream: m.Upstream, ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Tags: append([]string(nil), m.Tags...), PricingInput: m.PricingPerMillion.Input, PricingOutput: m.PricingPerMillion.Output, PricingCache: m.PricingPerMillion.CacheRead, PricingKnown: &known}
+			out.ModelMeta[m.ID] = &ModelMeta{Name: m.Name, Description: m.Description, OwnedBy: m.OwnedBy, Upstream: m.Upstream, ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Tags: append([]string(nil), m.Tags...), Attachment: m.Attachment, Reasoning: m.Reasoning, Temperature: m.Temperature, Modalities: m.Modalities, PricingInput: m.PricingPerMillion.Input, PricingOutput: m.PricingPerMillion.Output, PricingCache: m.PricingPerMillion.CacheRead, PricingKnown: &known}
 		}
 	}
 	return out, nil
@@ -645,6 +645,8 @@ func (s *ControlStore) loadConfig(tx *sql.Tx, seed *Config) (*Config, error) {
 	out := &Config{Providers: map[string]*ProviderConfig{}, ModelMap: map[string]string{}, ModelMeta: map[string]*ModelMeta{}, DisabledModels: map[string]bool{}, ModelRoutes: map[string][]RouteTarget{}, Dashboard: &DashboardConfig{}}
 	if seed != nil {
 		out.Listen, out.ManagementDB, out.MasterKeyFile, out.SetupTokenFile, out.SecureCookies = seed.Listen, seed.ManagementDB, seed.MasterKeyFile, seed.SetupTokenFile, seed.SecureCookies
+		out.AllowedHosts = append([]string(nil), seed.AllowedHosts...)
+		out.TrustedProxies = append([]string(nil), seed.TrustedProxies...)
 		if seed.Dashboard != nil {
 			out.Dashboard.DBPath = seed.Dashboard.DBPath
 		}

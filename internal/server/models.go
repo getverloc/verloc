@@ -162,27 +162,55 @@ func (c *modelCatalog) SyncFromConfig(cfg *Config) {
 	if cfg == nil {
 		return
 	}
+	// Append ids that are not in the embedded seed first, then overlay. Appending
+	// can reallocate c.all, which invalidates every *modelInfo obtained from
+	// c.byID before it; overlaying after the final re-index keeps the writes on
+	// the live slice (map iteration order would otherwise decide which embedded
+	// overlays survive).
+	var appended []modelInfo
 	for id, meta := range cfg.ModelMeta {
 		if meta == nil {
 			continue
 		}
-		m := metaToModelInfo(id, meta, cfg.ModelMap[id])
-		if old, ok := c.byID[id]; ok {
-			// Runtime pricing/limits must not erase immutable catalog capabilities.
-			m.Attachment, m.Reasoning, m.Temperature = old.Attachment, old.Reasoning, old.Temperature
-			m.Modalities, m.Knowledge, m.Status = old.Modalities, old.Knowledge, old.Status
-			m.Released, m.ReleaseDate = old.Released, old.ReleaseDate
-			*old = m
-		} else {
-			c.all = append(c.all, m)
-		}
 		c.overlay[id] = true
+		if _, ok := c.byID[id]; ok {
+			continue
+		}
+		appended = append(appended, metaToModelInfo(id, meta, cfg.ModelMap[id]))
 	}
-	// Re-index after possible appends (append may reallocate the slice).
+	c.all = append(c.all, appended...)
 	c.byID = map[string]*modelInfo{}
-	c.pricing = map[string]pricingPer1M{}
 	for i := range c.all {
 		c.byID[c.all[i].ID] = &c.all[i]
+	}
+	for id, meta := range cfg.ModelMeta {
+		if meta == nil || !c.overlay[id] {
+			continue
+		}
+		old, ok := c.byID[id]
+		if !ok {
+			continue
+		}
+		m := metaToModelInfo(id, meta, cfg.ModelMap[id])
+		// Unspecified capabilities inherit the seed; explicit false overrides it.
+		if m.Attachment == nil {
+			m.Attachment = old.Attachment
+		}
+		if m.Reasoning == nil {
+			m.Reasoning = old.Reasoning
+		}
+		if m.Temperature == nil {
+			m.Temperature = old.Temperature
+		}
+		if m.Modalities == nil {
+			m.Modalities = old.Modalities
+		}
+		m.Knowledge, m.Status = old.Knowledge, old.Status
+		m.Released, m.ReleaseDate = old.Released, old.ReleaseDate
+		*old = m
+	}
+	c.pricing = map[string]pricingPer1M{}
+	for i := range c.all {
 		if c.all[i].PricingKnown {
 			c.pricing[c.all[i].ID] = c.all[i].PricingPerMillion
 		}
@@ -231,6 +259,10 @@ func metaToModelInfo(id string, meta *ModelMeta, mapVal string) modelInfo {
 		Name:          name,
 		Description:   meta.Description,
 		Tags:          meta.Tags,
+		Attachment:    meta.Attachment,
+		Reasoning:     meta.Reasoning,
+		Temperature:   meta.Temperature,
+		Modalities:    meta.Modalities,
 		PricingKnown:  meta.PricingKnown == nil || *meta.PricingKnown,
 		Pricing: pricingOR{
 			Prompt:         per1MString(meta.PricingInput),

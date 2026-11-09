@@ -1,9 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
+	"time"
 )
 
 // handleAnthropicMessages implements POST /v1/messages: translate the
@@ -21,10 +25,77 @@ func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		writeAnthropicError(w, http.StatusServiceUnavailable, "gateway shutting down")
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "failed to read body")
+	if r.Body == nil {
+		writeAnthropicError(w, http.StatusBadRequest, "request body required")
 		return
+	}
+	var lease *ClientLease
+	if s.security != nil {
+		var policy *PolicyError
+		lease, policy = s.security.AcquireClientPreBody(r)
+		if policy != nil {
+			if policy.RetryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(policy.RetryAfter))
+			}
+			writeAnthropicError(w, policy.Status, policy.Message)
+			return
+		}
+		defer lease.Finish(0, true)
+	}
+	rt := s.runtime()
+	limits := rt.cfg.Limits
+	limits.applyDefaults()
+	if err := s.acquireGateway(r.Context(), limits); err != nil {
+		w.Header().Set("Retry-After", "1")
+		writeAnthropicError(w, http.StatusServiceUnavailable, "gateway capacity unavailable")
+		return
+	}
+	defer s.releaseGateway()
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(time.Duration(limits.QueueTimeoutSeconds) * time.Second))
+	defer func() { _ = controller.SetReadDeadline(time.Time{}) }()
+	bodyReader := http.MaxBytesReader(w, r.Body, limits.MaxBodyBytes)
+	stopCancel := context.AfterFunc(r.Context(), func() {
+		_ = controller.SetReadDeadline(time.Now())
+		_ = bodyReader.Close()
+	})
+	defer stopCancel()
+	defer bodyReader.Close()
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		} else {
+			writeAnthropicError(w, http.StatusBadRequest, "failed to read body")
+		}
+		return
+	}
+	if r.Context().Err() != nil {
+		return
+	}
+	var req anthropicRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid request JSON")
+		return
+	}
+	if req.Model == "" || len(req.Messages) == 0 {
+		writeAnthropicError(w, http.StatusBadRequest, "model and non-empty messages are required")
+		return
+	}
+	if lease != nil && !lease.Identity.AllowsModel(req.Model) {
+		writeAnthropicError(w, http.StatusForbidden, "model is not allowed for this client key")
+		return
+	}
+	if !managementModelAvailable(rt.cfg, req.Model) {
+		writeAnthropicError(w, http.StatusNotFound, "unknown or disabled model")
+		return
+	}
+	for _, message := range req.Messages {
+		if _, err := anthropicMessageToOpenAI(message); err != nil {
+			writeAnthropicError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	out, err := anthropicCountTokens(body)
 	if err != nil {

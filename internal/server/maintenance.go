@@ -219,7 +219,8 @@ func exportBootstrapFile(cfg *Config, path string) error {
 		"listen": cfg.Listen, "management_db": management,
 		"master_key_file": master, "setup_token_file": setup,
 		"secure_cookies": cfg.SecureCookies,
-		"dashboard":      map[string]string{"db_path": analytics},
+		"allowed_hosts":  cfg.AllowedHosts, "trusted_proxies": cfg.TrustedProxies,
+		"dashboard": map[string]string{"db_path": analytics},
 	}, "", "  ")
 	if err != nil {
 		return err

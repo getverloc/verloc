@@ -18,7 +18,10 @@ func TestProviderPersistRejectsPrivateUpstream(t *testing.T) {
 
 // B6/D16: a %ACCOUNT% placeholder must not defeat the probe guard.
 func TestProbeGuardHandlesAccountPlaceholder(t *testing.T) {
-	if err := guardProbeHost(t.Context(), "https://api.cloudflare.com/client/v4/accounts/account/ai/v1", false); err != nil {
+	_, err := (&Server{}).resolveProbeConn(t.Context(), probeReq{
+		BaseURL: "https://203.0.113.10/client/v4/accounts/%ACCOUNT%/ai/v1", NoAuth: true,
+	})
+	if err != nil {
 		t.Fatalf("public placeholder URL refused: %v", err)
 	}
 }

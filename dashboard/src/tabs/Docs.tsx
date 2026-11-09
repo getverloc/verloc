@@ -462,8 +462,8 @@ export default function Docs() {
           ['model', 'string (required)', 'Public verloc model ID, exactly as in /v1/models. Claude-style IDs work only if you add them as models with routes.'],
           ['max_tokens', 'integer (required)', 'Maximum output tokens for this response.'],
           ['system', 'string | blocks', 'System prompt, string or an array of text blocks.'],
-          ['messages', 'array (required)', 'user / assistant turns with string or block-array content: text, tool_use, tool_result, image (base64).'],
-          ['tools', 'array', 'Tool definitions with name, description, input_schema. tool_result content is folded to text.'],
+          ['messages', 'array (required)', 'user / assistant turns with string or block-array content: text, tool_use, tool_result, image (base64 or URL).'],
+          ['tools', 'array', 'Tool definitions with name, description, input_schema. Tool-result images retain call association in following user content; tool-role content stays text.'],
           ['stop_sequences', 'array', 'Maps to OpenAI stop.'],
           ['temperature / top_p', 'number', 'Passed through. top_k is dropped (no chat equivalent).'],
         ]} />
@@ -485,9 +485,17 @@ export default function Docs() {
         <Prose>
           Upstream reasoning (reasoning_content) is surfaced as Anthropic thinking blocks. Inbound
           thinking blocks with signatures and cache_control markers are consumed, not forwarded —
-          backends cannot verify Anthropic signatures. count_tokens is served as a character-based
-          estimate. Claude Code background calls use haiku by default; set ANTHROPIC_MODEL and
-          ANTHROPIC_SMALL_FAST_MODEL, or add claude-named model aliases.
+          backends cannot verify Anthropic signatures. Replay for providers retaining reasoning
+          is isolated by client, model, route and conversation/tool-turn content, with bounded
+          per-choice accumulation. Claude Code background calls use haiku by default; set
+          ANTHROPIC_MODEL and ANTHROPIC_SMALL_FAST_MODEL, or add claude-named model aliases.
+        </Prose>
+        <Prose>
+          count_tokens is a local character-based estimate, not the upstream tokenizer. It checks
+          model access and reserves RPM, client concurrency and global admission before bounded
+          body reading. It does not spend upstream TPM or make a billable inference request.
+          URL images are forwarded without gateway-side fetching; malformed or unsupported
+          sources fail explicitly instead of being dropped.
         </Prose>
         <CodeBlock label="Claude Code setup" code={ANTHROPIC_CLAUDE_CODE} />
       </Section>
@@ -675,12 +683,15 @@ export default function Docs() {
         description="configuration.json bootstraps the gateway once; SQLite is the source of truth afterwards. Most settings are applied live from the dashboard.">
         <Prose>
           The management database holds providers, credentials, models, routes, limits, and alert
-          rules after the first import. Listener address, paths, and cookie options are read at
-          startup and require a restart; everything else applies without one.
+          rules after the first import. Listener address, paths, cookie options, host allowlist
+          and trusted-proxy policy are read at startup and require a restart; managed settings
+          apply without one. Bootstrap export preserves those security policies.
         </Prose>
         <Spec rows={[
           ['listen', 'string', 'Bind address. Requires restart. Default ":8080".'],
           ['secure_cookies', 'boolean', 'Force the Secure flag on the owner session cookie when TLS terminates upstream.'],
+          ['allowed_hosts', 'array', 'Bootstrap-only HTTP Host allowlist; preserved by bootstrap export. Empty means unrestricted.'],
+          ['trusted_proxies', 'array', 'Bootstrap-only trusted proxy addresses/CIDRs for forwarded headers; preserved by bootstrap export.'],
           ['default_provider', 'string', 'Backend used when a model map value has no backend prefix.'],
           ['providers.<name>.base_url', 'string', 'Upstream base URL; may contain %ACCOUNT% for multi-account providers.'],
           ['providers.<name>.api_format', 'string', '"" or "openai" for OpenAI-compatible, "systemone" for native decision APIs.'],
@@ -692,9 +703,10 @@ export default function Docs() {
           ['providers.<name>.strip_reasoning_content', 'boolean', 'Remove reasoning traces from assistant messages. Defaults to true.'],
           ['providers.<name>.synthesize_cli_headers', 'boolean', 'Send standardised CLI identity headers upstream.'],
           ['providers.<name>.no_auth', 'boolean', 'Keyless provider; no Authorization header is sent.'],
+          ['providers.<name>.allow_private_upstreams', 'boolean', 'Explicit permission for intentionally local/LAN endpoints. Default false; exposed in provider editing and guided add.'],
           ['model_map', 'object', 'Public model ID to "backend:upstream" or bare upstream.'],
           ['model_routes', 'object', 'Public model ID to an ordered array of { backend, upstream } fallbacks.'],
-          ['model_meta', 'object', 'Catalog overlay: name, description, context_window, max_tokens, tags, and pricing_input/output/cache.'],
+          ['model_meta', 'object', 'Catalog overlay: name, description, owned_by, limits, tags, prices, attachment/reasoning/temperature booleans and input/output modalities. Explicit false is preserved; absent capabilities remain inherited or unknown.'],
           ['disabled_models', 'object', 'Public IDs paused without deletion.'],
           ['limits', 'object', 'Admission and retry bounds (see section 09).'],
           ['dashboard.*', 'object', 'Analytics database path, recent-request ring size, and alert rules.'],
