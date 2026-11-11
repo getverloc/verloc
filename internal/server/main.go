@@ -314,6 +314,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /responses", s.handleResponses)
 	mux.HandleFunc("POST /v1/systemone", s.handleSystemOne)
 	mux.HandleFunc("POST /systemone", s.handleSystemOne)
+	mux.HandleFunc("POST /v1/embeddings", s.handleEmbeddings)
+	mux.HandleFunc("POST /embeddings", s.handleEmbeddings)
+	mux.HandleFunc("POST /v1/images/generations", s.handleImageGenerations)
+	mux.HandleFunc("POST /images/generations", s.handleImageGenerations)
+	mux.HandleFunc("POST /v1/images/edits", s.handleImageEdits)
+	mux.HandleFunc("POST /images/edits", s.handleImageEdits)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("GET /models", s.handleModels)
 	mux.HandleFunc("GET /v1/pricing", s.handlePricing)
@@ -372,7 +378,8 @@ func (s *Server) Handler() http.Handler {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		maxBody := int64(2 << 20)
-		if p == "/v1/chat/completions" || p == "/chat/completions" || p == "/v1/responses" || p == "/responses" || p == "/v1/systemone" || p == "/systemone" || p == "/v1/messages" || p == "/messages" || p == "/v1/messages/count_tokens" || p == "/messages/count_tokens" {
+		if p == "/v1/chat/completions" || p == "/chat/completions" || p == "/v1/responses" || p == "/responses" || p == "/v1/systemone" || p == "/systemone" || p == "/v1/messages" || p == "/messages" || p == "/v1/messages/count_tokens" || p == "/messages/count_tokens" ||
+			p == "/v1/embeddings" || p == "/embeddings" || p == "/v1/images/generations" || p == "/images/generations" || p == "/v1/images/edits" || p == "/images/edits" {
 			maxBody = s.runtime().cfg.Limits.MaxBodyBytes
 		}
 		if r.Body != nil {
@@ -397,7 +404,8 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			admin.ServeHTTP(w, r)
-		case strings.HasPrefix(p, "/v1/"), p == "/models", p == "/pricing", p == "/chat/completions", p == "/responses", p == "/systemone", p == "/messages", strings.HasPrefix(p, "/messages/count_tokens"):
+		case strings.HasPrefix(p, "/v1/"), p == "/models", p == "/pricing", p == "/chat/completions", p == "/responses", p == "/systemone", p == "/messages", strings.HasPrefix(p, "/messages/count_tokens"),
+			p == "/embeddings", p == "/images/generations", p == "/images/edits":
 			if client == nil {
 				writeErr(w, http.StatusUnauthorized, "gateway API key required")
 				return
@@ -416,6 +424,10 @@ var gzipSkipPaths = map[string]bool{
 	"/v1/chat/completions": true, "/chat/completions": true,
 	"/v1/responses": true, "/responses": true,
 	"/dash/api/live": true,
+	// Base64 image payloads are already dense; compressing them burns CPU
+	// and buffers the whole response for no useful gain.
+	"/v1/images/generations": true, "/images/generations": true,
+	"/v1/images/edits": true, "/images/edits": true,
 }
 
 // gzipMiddleware compresses text responses (dashboard JSON, /v1/models, …)

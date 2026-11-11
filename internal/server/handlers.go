@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -37,6 +38,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			(provider.APIFormat == "systemone" || isCloudflareClef(provider.BaseURL, target.Upstream)) {
 			model.Type = "systemone"
 		}
+		if meta := cfg.ModelMeta[id]; meta != nil {
+			model.ImagePrices = meta.ImagePrices
+			if len(meta.Operations) > 0 {
+				model.Operations = meta.Operations
+			}
+			if meta.PricingImage != nil {
+				// OpenRouter-style per-image price is a decimal string in USD.
+				model.Pricing.Image = strconv.FormatFloat(*meta.PricingImage, 'f', -1, 64)
+			}
+		}
 		data = append(data, model)
 	}
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
@@ -47,16 +58,22 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePricing(w http.ResponseWriter, r *http.Request) {
 	cfg := s.runtime().cfg
 	identity := ClientIdentityFromRequest(r)
-	pricing := make(map[string]pricingPer1M, len(cfg.ModelMap))
+	pricing := make(map[string]*pricingPer1M, len(cfg.ModelMap))
+	images := map[string]any{}
 	for id := range cfg.ModelMap {
 		if !managementModelAvailable(cfg, id) || identity != nil && !identity.AllowsModel(id) {
 			continue
 		}
-		if model := catalog.Lookup(id); model != nil {
-			pricing[id] = model.PricingPerMillion
+		pricing[id] = nil
+		if model := catalog.Lookup(id); model != nil && model.PricingKnown {
+			p := model.PricingPerMillion
+			pricing[id] = &p
+		}
+		if meta := cfg.ModelMeta[id]; meta != nil && (meta.PricingImage != nil || meta.ImagePrices != nil) {
+			images[id] = map[string]any{"per_image": meta.PricingImage, "rates": meta.ImagePrices, "currency": "USD"}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "per": "1M tokens", "currency": "USD", "data": pricing})
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "per": "1M tokens", "currency": "USD", "data": pricing, "images": images})
 }
 
 // Liveness is public and deliberately contains no provider or credential data.

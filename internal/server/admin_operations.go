@@ -147,6 +147,31 @@ func finitePricePtr(v *float64) bool {
 	return v == nil || finitePrice(*v)
 }
 
+// normalizeOperations validates a model operation allowlist. Nil means the
+// field was not supplied (retain the previous value); an empty non-nil slice
+// means every standard operation.
+func normalizeOperations(ops []string) ([]string, error) {
+	if ops == nil {
+		return nil, nil
+	}
+	seen := make(map[string]bool, len(ops))
+	out := make([]string, 0, len(ops))
+	for _, op := range ops {
+		op = strings.TrimSpace(op)
+		switch op {
+		case "chat", "embeddings", "images":
+		default:
+			return nil, fmt.Errorf("operations must be chat, embeddings, or images")
+		}
+		if seen[op] {
+			continue
+		}
+		seen[op] = true
+		out = append(out, op)
+	}
+	return out, nil
+}
+
 func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 	if req.ID == "" || len(req.ID) > 256 || strings.TrimSpace(req.ID) != req.ID || strings.HasPrefix(req.ID, "/") || strings.ContainsAny(req.ID, "?#\r\n\t ") || !safeModelID(req.ID) || req.Backend == "" || strings.TrimSpace(req.Upstream) == "" || strings.ContainsAny(req.Upstream, "\r\n") {
 		return fmt.Errorf("valid id, backend, and upstream are required")
@@ -164,6 +189,31 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 		if price != nil && (math.IsNaN(*price) || math.IsInf(*price, 0) || *price < 0) {
 			return fmt.Errorf("pricing must contain finite, non-negative USD per million token values")
 		}
+	}
+	if req.PricingImage != nil && (!finitePrice(*req.PricingImage) || *req.PricingImage < 0 || *req.PricingImage > 1e9) {
+		return fmt.Errorf("image pricing must be between 0 and 1000000000 USD per image")
+	}
+	operations, err := normalizeOperations(req.Operations)
+	if err != nil {
+		return err
+	}
+	if req.Kind != "" {
+		if req.Kind != "systemone" && operationsForKind(req.Kind) == nil {
+			return fmt.Errorf("unsupported model kind %q", req.Kind)
+		}
+		if req.Kind == "systemone" {
+			p := cfg.Providers[req.Backend]
+			if p.APIFormat != "systemone" && !isCloudflareClef(p.BaseURL, req.Upstream) {
+				return fmt.Errorf("systemone requires a native System One provider")
+			}
+		} else if operations == nil {
+			operations = operationsForKind(req.Kind)
+		} else if len(operations) != 1 || operations[0] != req.Kind {
+			return fmt.Errorf("kind must match the selected operation")
+		}
+	}
+	if err := validateImagePricing(req.ImagePrices); err != nil {
+		return err
 	}
 	seen := map[string]bool{req.Backend + ":" + req.Upstream: true}
 	for _, target := range req.Routes {
@@ -183,7 +233,11 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 		}
 		return *value
 	}
-	pricingKnown := req.PricingInput != nil && req.PricingOutput != nil
+	if operations == nil && cfg.ModelMeta[req.ID] != nil {
+		operations = cfg.ModelMeta[req.ID].Operations
+	}
+	embeddingOnly := len(operations) == 1 && operations[0] == "embeddings"
+	pricingKnown := req.PricingInput != nil && (req.PricingOutput != nil || embeddingOnly)
 	cachePrice := req.PricingCache
 	if cachePrice == nil {
 		// No published discount means cached input is billed at the input rate,
@@ -193,7 +247,15 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 	if !finitePricePtr(req.PricingInput) || !finitePricePtr(req.PricingOutput) || !finitePricePtr(req.PricingCache) {
 		return fmt.Errorf("model %q pricing must be a finite number", req.ID)
 	}
-	meta := &ModelMeta{Name: req.Name, Description: req.Description, OwnedBy: req.OwnedBy, Upstream: req.Upstream, ContextWindow: req.ContextWindow, MaxTokens: req.MaxTokens, Tags: req.Tags, Attachment: req.Attachment, Reasoning: req.Reasoning, Temperature: req.Temperature, Modalities: req.Modalities, PricingInput: price(req.PricingInput), PricingOutput: price(req.PricingOutput), PricingCache: price(cachePrice), PricingKnown: &pricingKnown}
+	meta := &ModelMeta{Name: req.Name, Description: req.Description, OwnedBy: req.OwnedBy, Upstream: req.Upstream, ContextWindow: req.ContextWindow, MaxTokens: req.MaxTokens, Tags: req.Tags, Attachment: req.Attachment, Reasoning: req.Reasoning, Temperature: req.Temperature, Modalities: req.Modalities, Operations: operations, PricingInput: price(req.PricingInput), PricingOutput: price(req.PricingOutput), PricingCache: price(cachePrice), PricingImage: req.PricingImage, ImagePrices: req.ImagePrices, PricingKnown: &pricingKnown}
+	for _, field := range []struct {
+		key   string
+		value *float64
+	}{{"input", req.PricingInput}, {"output", req.PricingOutput}, {"cache_read", cachePrice}} {
+		if field.value != nil {
+			meta.PricingFields = append(meta.PricingFields, field.key)
+		}
+	}
 	// Ordinary model edits omit capabilities; retain persisted overrides.
 	if previous := cfg.ModelMeta[req.ID]; previous != nil {
 		if meta.Attachment == nil {
@@ -207,6 +269,15 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 		}
 		if meta.Modalities == nil {
 			meta.Modalities = previous.Modalities
+		}
+		if meta.Operations == nil {
+			meta.Operations = previous.Operations
+		}
+		if req.PricingImage == nil && !req.ClearImagePrice {
+			meta.PricingImage = previous.PricingImage
+		}
+		if req.ImagePrices == nil {
+			meta.ImagePrices = previous.ImagePrices
 		}
 	}
 	cfg.ModelMeta[req.ID] = meta

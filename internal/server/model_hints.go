@@ -42,9 +42,91 @@ type modelHint struct {
 	ContextWindow int      `json:"context_window,omitempty"`
 	MaxTokens     int      `json:"max_tokens,omitempty"`
 	Source        string   `json:"source,omitempty"`
-	inputKnown    bool
-	outputKnown   bool
-	cacheKnown    bool
+	// Type is the normalized model kind (chat, images, embeddings) or the
+	// provider's raw kind when verloc cannot serve it. Operations is the
+	// matching endpoint allowlist; nil means no reliable evidence.
+	Type         string         `json:"type,omitempty"`
+	Operations   []string       `json:"operations,omitempty"`
+	PricingImage *float64       `json:"pricing_image,omitempty"`
+	ImagePrices  *ImagePricing  `json:"image_prices,omitempty"`
+	Modalities   map[string]any `json:"modalities,omitempty"`
+	Attachment   *bool          `json:"attachment,omitempty"`
+	Reasoning    *bool          `json:"reasoning,omitempty"`
+	Temperature  *bool          `json:"temperature,omitempty"`
+	inputKnown   bool
+	outputKnown  bool
+	cacheKnown   bool
+}
+
+// modelKind normalizes provider vocabulary to the operations verloc serves.
+func modelKind(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "language", "chat", "text", "completion", "text generation", "text-to-text", "text->text":
+		return "chat"
+	case "image", "image_generation", "image-generation", "text->image", "text-to-image", "image generation", "image-to-image", "image editing":
+		return "images"
+	case "embedding", "embeddings", "text->embedding", "text embeddings", "text embedding":
+		return "embeddings"
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
+}
+
+func operationsForKind(kind string) []string {
+	switch kind {
+	case "chat":
+		return []string{"chat"}
+	case "images":
+		return []string{"images"}
+	case "embeddings":
+		return []string{"embeddings"}
+	}
+	return nil
+}
+
+// hintKind prefers explicit provider type/mode evidence, then OpenRouter's
+// modality string, and only then a modality shape that cannot be a chat model.
+func hintKind(m map[string]json.RawMessage) string {
+	for _, key := range []string{"type", "mode"} {
+		if kind := modelKind(strField(m, key)); kind != "" {
+			return kind
+		}
+	}
+	arch := objectField(m, "architecture")
+	if arch != nil {
+		if kind := modelKind(strField(arch, "modality")); operationsForKind(kind) != nil {
+			return kind
+		}
+	}
+	// Cloudflare Workers AI exposes a human task name ("Text Embeddings",
+	// "Text Generation", "Text-to-Image") instead of a type field.
+	if task := objectField(m, "task"); task != nil {
+		if kind := modelKind(strField(task, "name")); kind != "" {
+			return kind
+		}
+	}
+	modalities := objectField(m, "modalities")
+	if modalities == nil && arch != nil {
+		modalities = map[string]json.RawMessage{"input": arch["input_modalities"], "output": arch["output_modalities"]}
+	}
+	var output []string
+	_ = json.Unmarshal(modalities["output"], &output)
+	if len(output) == 1 && output[0] == "image" {
+		return "images"
+	}
+	if slices.Contains(output, "video") || slices.Contains(output, "audio") {
+		return "unsupported"
+	}
+	return ""
+}
+
+// hintPricingKnown accepts an input-only rate for embeddings; chat and image
+// token pricing still requires both sides before a cost is claimed.
+func hintPricingKnown(h *modelHint) bool {
+	if len(h.Operations) == 1 && h.Operations[0] == "embeddings" {
+		return h.inputKnown
+	}
+	return h.inputKnown && h.outputKnown
 }
 
 // Optional JSON numbers preserve partial pricing and explicitly free prices.
@@ -90,7 +172,7 @@ func (h *modelHint) UnmarshalJSON(body []byte) error {
 	if v.Cache != nil {
 		h.PricingCache = *v.Cache
 	}
-	h.PricingKnown = h.inputKnown && h.outputKnown
+	h.PricingKnown = hintPricingKnown(h)
 	return nil
 }
 
@@ -155,6 +237,77 @@ func consensusHints(entries []*catalogEntry) modelHint {
 	h.PricingInput, h.inputKnown = agreedHintField(entries, func(e *modelHint) (float64, bool) { return e.PricingInput, e.inputKnown })
 	h.PricingOutput, h.outputKnown = agreedHintField(entries, func(e *modelHint) (float64, bool) { return e.PricingOutput, e.outputKnown })
 	h.PricingCache, h.cacheKnown = agreedHintField(entries, func(e *modelHint) (float64, bool) { return e.PricingCache, e.cacheKnown })
+	h.Type, _ = agreedHintField(entries, func(e *modelHint) (string, bool) { return e.Type, e.Type != "" })
+	if h.Type == "" {
+		for _, e := range entries {
+			if e.Type != "" {
+				h.Type = "conflicting"
+				break
+			}
+		}
+	}
+	if ops, ok := agreedHintField(entries, func(e *modelHint) (string, bool) {
+		ops := slices.Clone(e.Operations)
+		slices.Sort(ops)
+		return strings.Join(ops, "\x00"), len(ops) > 0
+	}); ok {
+		h.Operations = strings.Split(ops, "\x00")
+	} else {
+		for _, e := range entries {
+			if len(e.Operations) > 0 {
+				h.Type = "conflicting"
+				break
+			}
+		}
+	}
+	if h.Type == "conflicting" {
+		h.Operations = nil
+	}
+	for _, field := range []struct {
+		get func(*modelHint) *bool
+		set **bool
+	}{{func(e *modelHint) *bool { return e.Attachment }, &h.Attachment}, {func(e *modelHint) *bool { return e.Reasoning }, &h.Reasoning}, {func(e *modelHint) *bool { return e.Temperature }, &h.Temperature}} {
+		if v, ok := agreedHintField(entries, func(e *modelHint) (bool, bool) {
+			p := field.get(e)
+			return p != nil && *p, p != nil
+		}); ok {
+			*field.set = &v
+		}
+	}
+	if raw, ok := agreedHintField(entries, func(e *modelHint) (string, bool) {
+		b, _ := json.Marshal(e.Modalities)
+		return string(b), e.Modalities != nil
+	}); ok {
+		_ = json.Unmarshal([]byte(raw), &h.Modalities)
+	}
+	if price, ok := agreedHintField(entries, func(e *modelHint) (float64, bool) {
+		if e.PricingImage == nil {
+			return 0, false
+		}
+		return *e.PricingImage, true
+	}); ok {
+		h.PricingImage = &price
+	}
+	if prices, ok := agreedHintField(entries, func(e *modelHint) (string, bool) {
+		if e.ImagePrices == nil {
+			return "", false
+		}
+		raw, err := json.Marshal(e.ImagePrices)
+		return string(raw), err == nil
+	}); ok {
+		var ip ImagePricing
+		if json.Unmarshal([]byte(prices), &ip) == nil {
+			h.ImagePrices = &ip
+		}
+	} else {
+		// Conflicting conditional rates must not quietly become a flat rate.
+		for _, e := range entries {
+			if e.ImagePrices != nil {
+				h.ImagePrices = &ImagePricing{UnsupportedConditions: true}
+				break
+			}
+		}
+	}
 	for _, e := range entries {
 		if len(e.Tags) == 0 {
 			continue
@@ -165,7 +318,7 @@ func consensusHints(entries []*catalogEntry) modelHint {
 		}
 		h.Tags = e.Tags
 	}
-	h.PricingKnown = h.inputKnown && h.outputKnown
+	h.PricingKnown = hintPricingKnown(&h)
 	return h
 }
 
@@ -237,6 +390,72 @@ func priceField(m map[string]json.RawMessage, scale float64, keys ...string) (fl
 		}
 	}
 	return 0, false
+}
+
+// cloudflareProperties flattens Workers AI's [{property_id,value}] list into
+// the same shape as ordinary catalog fields.
+func cloudflareProperties(m map[string]json.RawMessage) map[string]json.RawMessage {
+	var rows []struct {
+		ID    string          `json:"property_id"`
+		Value json.RawMessage `json:"value"`
+	}
+	if json.Unmarshal(m["properties"], &rows) != nil {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(rows))
+	for _, row := range rows {
+		if row.ID != "" && len(row.Value) > 0 {
+			out[row.ID] = row.Value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// Accept exact documented USD units, not "image steps" or missing prices.
+func cloudflarePrices(raw json.RawMessage, h *modelHint) {
+	var rows []map[string]json.RawMessage
+	if json.Unmarshal(raw, &rows) != nil {
+		return
+	}
+	values := map[string][]float64{}
+	for _, row := range rows {
+		if strings.ToUpper(strField(row, "currency")) != "USD" {
+			continue
+		}
+		n, ok := numberField(row, "price")
+		if !ok {
+			continue
+		}
+		unit := strings.ToLower(strings.TrimSpace(strField(row, "unit")))
+		switch unit {
+		case "per m input tokens", "per million input tokens", "per m output tokens", "per million output tokens", "per image":
+			unit = strings.ReplaceAll(unit, "million", "m")
+			values[unit] = append(values[unit], n)
+		}
+	}
+	for unit, rates := range values {
+		agreed := true
+		for _, rate := range rates {
+			if rate != rates[0] {
+				agreed = false
+			}
+		}
+		if !agreed {
+			continue
+		}
+		n := rates[0]
+		switch unit {
+		case "per m input tokens":
+			h.PricingInput, h.inputKnown = n, true
+		case "per m output tokens":
+			h.PricingOutput, h.outputKnown = n, true
+		case "per image":
+			h.PricingImage = &n
+		}
+	}
 }
 
 func positiveLimit(m map[string]json.RawMessage, keys ...string) int {
@@ -324,7 +543,42 @@ func decodeCatalogObject(m map[string]json.RawMessage, id, source string) (catal
 	if id == "" {
 		return catalogEntry{}, false
 	}
-	h := modelHint{Name: strField(m, "name"), Description: strField(m, "description"), OwnedBy: strField(m, "owned_by"), Tags: hintTags(m), Source: source}
+	kind := hintKind(m)
+	h := modelHint{Name: strField(m, "name"), Description: strField(m, "description"), OwnedBy: strField(m, "owned_by"), Tags: hintTags(m), Source: source, Type: kind, Operations: operationsForKind(kind)}
+	var ops []string
+	if json.Unmarshal(m["operations"], &ops) == nil && len(ops) > 0 {
+		if normalized, err := normalizeOperations(ops); err == nil && (kind == "" || operationsForKind(kind) != nil) {
+			h.Operations = normalized
+			if kind == "" && len(normalized) == 1 {
+				h.Type = normalized[0]
+			} else if kind != "" && !slices.Contains(normalized, kind) {
+				h.Type, h.Operations = "conflicting", nil
+			}
+		}
+	}
+	for _, field := range []struct {
+		name string
+		dest **bool
+	}{{"attachment", &h.Attachment}, {"reasoning", &h.Reasoning}, {"temperature", &h.Temperature}} {
+		var v bool
+		if raw := m[field.name]; len(raw) > 0 && string(raw) != "null" && json.Unmarshal(raw, &v) == nil {
+			*field.dest = &v
+		}
+	}
+	mods := objectField(m, "modalities")
+	if mods == nil {
+		arch := objectField(m, "architecture")
+		mods = map[string]json.RawMessage{"input": arch["input_modalities"], "output": arch["output_modalities"]}
+	}
+	for _, key := range []string{"input", "output"} {
+		var values []string
+		if json.Unmarshal(mods[key], &values) == nil && values != nil {
+			if h.Modalities == nil {
+				h.Modalities = map[string]any{}
+			}
+			h.Modalities[key] = values
+		}
+	}
 	if h.OwnedBy == "" {
 		h.OwnedBy = strField(m, "owner")
 	}
@@ -367,11 +621,80 @@ func decodeCatalogObject(m map[string]json.RawMessage, id, source string) (catal
 	if n, ok := priceField(m, 1, "pricing_cache"); ok {
 		h.PricingCache, h.cacheKnown = n, true
 	}
+	if props := cloudflareProperties(m); props != nil {
+		if h.ContextWindow == 0 {
+			h.ContextWindow = positiveLimit(props, "context_window", "max_input_tokens")
+		}
+		if h.MaxTokens == 0 {
+			h.MaxTokens = positiveLimit(props, "max_output_tokens")
+		}
+		cloudflarePrices(props["price"], &h)
+	}
 	if string(m["pricing_known"]) == "false" {
 		h.inputKnown, h.outputKnown, h.cacheKnown = false, false, false
 	}
-	h.PricingKnown = h.inputKnown && h.outputKnown
+	if n, ok := numberField(prices, "image"); ok {
+		h.PricingImage = &n
+	}
+	h.ImagePrices = imagePriceVariants(prices)
+	if h.ImagePrices == nil {
+		h.ImagePrices = &ImagePricing{}
+	}
+	for _, field := range []struct {
+		name string
+		dest **string
+	}{{"input_text", &h.ImagePrices.TextInput}, {"input_image", &h.ImagePrices.ImageInput}, {"output_text", &h.ImagePrices.TextOutput}, {"output_image", &h.ImagePrices.ImageOutput}} {
+		if n, ok := priceField(prices, 1e6, field.name); ok {
+			v := strconv.FormatFloat(n, 'f', -1, 64)
+			*field.dest = &v
+		}
+	}
+	if len(h.ImagePrices.Variants) == 0 && !h.ImagePrices.UnsupportedConditions && h.ImagePrices.TextInput == nil && h.ImagePrices.ImageInput == nil && h.ImagePrices.TextOutput == nil && h.ImagePrices.ImageOutput == nil {
+		h.ImagePrices = nil
+	}
+	h.PricingKnown = hintPricingKnown(&h)
 	return catalogEntry{ID: id, modelHint: h}, true
+}
+
+// imagePriceVariants keeps only exact size/quality conditions. Catalog rows
+// conditioned on an operation or style cannot be represented honestly and are
+// skipped rather than flattened into a rate that would over- or under-bill.
+func imagePriceVariants(prices map[string]json.RawMessage) *ImagePricing {
+	raw := prices["image_dimension_quality_pricing"]
+	if len(raw) == 0 {
+		return nil
+	}
+	var rows []map[string]json.RawMessage
+	if json.Unmarshal(raw, &rows) != nil {
+		return &ImagePricing{UnsupportedConditions: true}
+	}
+	p := &ImagePricing{}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		unsupported := false
+		for key := range row {
+			if key != "size" && key != "quality" && key != "cost" {
+				unsupported = true
+			}
+		}
+		size, quality := strField(row, "size"), strField(row, "quality")
+		cost, ok := numberField(row, "cost")
+		if unsupported || !ok || (size == "" && quality == "") || len(size) > 32 || len(quality) > 32 || cost > 1e9 {
+			p.UnsupportedConditions = true
+			continue
+		}
+		key := size + "\x00" + quality
+		if seen[key] {
+			p.UnsupportedConditions = true
+			continue
+		}
+		seen[key] = true
+		p.Variants = append(p.Variants, ImagePriceVariant{Size: size, Quality: quality, Price: strconv.FormatFloat(cost, 'f', -1, 64)})
+	}
+	if len(p.Variants) == 0 && !p.UnsupportedConditions {
+		return nil
+	}
+	return p
 }
 
 // hintForDiscoveredModel keeps rich native /models metadata. source labels
@@ -616,6 +939,10 @@ func fetchLiteLLM(ctx context.Context, url string) ([]catalogEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	return decodeLiteLLM(body)
+}
+
+func decodeLiteLLM(body []byte) ([]catalogEntry, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
@@ -626,11 +953,18 @@ func fetchLiteLLM(ctx context.Context, url string) ([]catalogEntry, error) {
 		if json.Unmarshal(row, &m) != nil || m == nil {
 			continue
 		}
-		h := modelHint{Source: "litellm", ContextWindow: positiveLimit(m, "max_input_tokens"), MaxTokens: positiveLimit(m, "max_output_tokens", "max_tokens")}
+		kind := modelKind(strField(m, "mode"))
+		h := modelHint{Source: "litellm", Type: kind, Operations: operationsForKind(kind), ContextWindow: positiveLimit(m, "max_input_tokens"), MaxTokens: positiveLimit(m, "max_output_tokens", "max_tokens")}
 		h.PricingInput, h.inputKnown = priceField(m, 1e6, "input_cost_per_token")
 		h.PricingOutput, h.outputKnown = priceField(m, 1e6, "output_cost_per_token")
 		h.PricingCache, h.cacheKnown = priceField(m, 1e6, "input_cost_per_token_cache_hit")
-		h.PricingKnown = h.inputKnown && h.outputKnown
+		// Input-image charges are not a price per generated image.
+		if kind == "images" {
+			if n, ok := priceField(m, 1, "output_cost_per_image"); ok {
+				h.PricingImage = &n
+			}
+		}
+		h.PricingKnown = hintPricingKnown(&h)
 		out = append(out, catalogEntry{ID: id, modelHint: h})
 	}
 	return out, nil
@@ -655,6 +989,10 @@ func fillModelHint(h, e *modelHint) {
 	if len(h.Tags) == 0 {
 		h.Tags = e.Tags
 	}
+	// Higher-priority kind evidence must not acquire another kind's rates or operations.
+	if h.Type != "" && e.Type != "" && h.Type != e.Type {
+		return
+	}
 	if !h.inputKnown && e.inputKnown {
 		if !h.outputKnown {
 			h.Source = e.Source
@@ -676,11 +1014,35 @@ func fillModelHint(h, e *modelHint) {
 	if h.MaxTokens == 0 {
 		h.MaxTokens = e.MaxTokens
 	}
-	h.PricingKnown = h.inputKnown && h.outputKnown
+	if h.Type == "" {
+		h.Type = e.Type
+	}
+	if len(h.Operations) == 0 && operationsForKind(h.Type) != nil {
+		h.Operations = e.Operations
+	}
+	if h.PricingImage == nil {
+		h.PricingImage = e.PricingImage
+	}
+	if h.ImagePrices == nil {
+		h.ImagePrices = e.ImagePrices
+	}
+	if h.Attachment == nil {
+		h.Attachment = e.Attachment
+	}
+	if h.Reasoning == nil {
+		h.Reasoning = e.Reasoning
+	}
+	if h.Temperature == nil {
+		h.Temperature = e.Temperature
+	}
+	if h.Modalities == nil {
+		h.Modalities = e.Modalities
+	}
+	h.PricingKnown = hintPricingKnown(h)
 }
 
 func nonemptyHint(h *modelHint) *modelHint {
-	if h.Name == "" && h.Description == "" && h.OwnedBy == "" && len(h.Tags) == 0 && !h.inputKnown && !h.outputKnown && !h.cacheKnown && h.ContextWindow == 0 && h.MaxTokens == 0 {
+	if h.Name == "" && h.Description == "" && h.OwnedBy == "" && len(h.Tags) == 0 && !h.inputKnown && !h.outputKnown && !h.cacheKnown && h.ContextWindow == 0 && h.MaxTokens == 0 && h.Type == "" && len(h.Operations) == 0 && h.PricingImage == nil && h.ImagePrices == nil && h.Modalities == nil && h.Attachment == nil && h.Reasoning == nil && h.Temperature == nil {
 		return nil
 	}
 	return h

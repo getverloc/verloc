@@ -318,10 +318,15 @@ type adminModelView struct {
 	Reasoning     *bool          `json:"reasoning,omitempty"`
 	Temperature   *bool          `json:"temperature,omitempty"`
 	Modalities    map[string]any `json:"modalities,omitempty"`
+	Operations    []string       `json:"operations,omitempty"`
+	Kind          string         `json:"kind,omitempty"`
 	PricingInput  float64        `json:"pricing_input"`
 	PricingOutput float64        `json:"pricing_output"`
 	PricingCache  float64        `json:"pricing_cache"`
+	PricingImage  *float64       `json:"pricing_image"`
+	ImagePrices   *ImagePricing  `json:"image_prices,omitempty"`
 	PricingKnown  bool           `json:"pricing_known"`
+	PricingFields []string       `json:"pricing_fields,omitempty"`
 	HasMeta       bool           `json:"has_meta"`
 	Embedded      bool           `json:"embedded"`
 	Disabled      bool           `json:"disabled"`
@@ -329,25 +334,30 @@ type adminModelView struct {
 }
 
 type modelUpsertReq struct {
-	ID            string         `json:"id"`
-	Backend       string         `json:"backend"`
-	Upstream      string         `json:"upstream"`
-	Name          string         `json:"name"`
-	Description   string         `json:"description"`
-	OwnedBy       string         `json:"owned_by"`
-	ContextWindow int            `json:"context_window"`
-	MaxTokens     int            `json:"max_tokens"`
-	Tags          []string       `json:"tags"`
-	Attachment    *bool          `json:"attachment,omitempty"`
-	Reasoning     *bool          `json:"reasoning,omitempty"`
-	Temperature   *bool          `json:"temperature,omitempty"`
-	Modalities    map[string]any `json:"modalities,omitempty"`
-	PricingInput  *float64       `json:"pricing_input"`
-	PricingOutput *float64       `json:"pricing_output"`
-	PricingCache  *float64       `json:"pricing_cache"`
-	Disabled      bool           `json:"disabled"`
-	Routes        []RouteTarget  `json:"routes"`
-	Overwrite     bool           `json:"overwrite"`
+	ID              string         `json:"id"`
+	Backend         string         `json:"backend"`
+	Upstream        string         `json:"upstream"`
+	Name            string         `json:"name"`
+	Description     string         `json:"description"`
+	OwnedBy         string         `json:"owned_by"`
+	ContextWindow   int            `json:"context_window"`
+	MaxTokens       int            `json:"max_tokens"`
+	Tags            []string       `json:"tags"`
+	Attachment      *bool          `json:"attachment,omitempty"`
+	Reasoning       *bool          `json:"reasoning,omitempty"`
+	Temperature     *bool          `json:"temperature,omitempty"`
+	Modalities      map[string]any `json:"modalities,omitempty"`
+	Operations      []string       `json:"operations,omitempty"`
+	Kind            string         `json:"kind,omitempty"`
+	PricingInput    *float64       `json:"pricing_input"`
+	PricingOutput   *float64       `json:"pricing_output"`
+	PricingCache    *float64       `json:"pricing_cache"`
+	PricingImage    *float64       `json:"pricing_image"`
+	ImagePrices     *ImagePricing  `json:"image_prices,omitempty"`
+	Disabled        bool           `json:"disabled"`
+	Routes          []RouteTarget  `json:"routes"`
+	Overwrite       bool           `json:"overwrite"`
+	ClearImagePrice bool           `json:"clear_image_price,omitempty"`
 }
 
 func (s *Server) handleAdminModelsList(w http.ResponseWriter, r *http.Request) {
@@ -388,10 +398,17 @@ func (s *Server) modelView(id string, cfg *Config) adminModelView {
 		v.Reasoning = meta.Reasoning
 		v.Temperature = meta.Temperature
 		v.Modalities = meta.Modalities
+		v.Operations = meta.Operations
+		if len(meta.Operations) == 1 {
+			v.Kind = meta.Operations[0]
+		}
 		v.PricingInput = meta.PricingInput
 		v.PricingOutput = meta.PricingOutput
 		v.PricingCache = meta.PricingCache
+		v.PricingImage = meta.PricingImage
+		v.ImagePrices = meta.ImagePrices
 		v.PricingKnown = meta.PricingKnown == nil || *meta.PricingKnown
+		v.PricingFields = meta.PricingFields
 		if meta.Upstream != "" {
 			v.Upstream = meta.Upstream
 		}
@@ -434,9 +451,15 @@ func (s *Server) modelView(id string, cfg *Config) adminModelView {
 		if v.Modalities == nil {
 			v.Modalities = m.Modalities
 		}
+		if v.Kind == "" {
+			v.Kind = modelKind(m.Type)
+		}
 	}
 	if v.Name == "" {
 		v.Name = id
+	}
+	if p := cfg.Providers[backend]; p != nil && (p.APIFormat == "systemone" || isCloudflareClef(p.BaseURL, upstream)) {
+		v.Kind = "systemone"
 	}
 	return v
 }

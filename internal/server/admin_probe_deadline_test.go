@@ -59,7 +59,7 @@ func TestAdminProbeCancellationDuringDNS(t *testing.T) {
 		t.Run(operation, func(t *testing.T) {
 			started := blockingProbeDNS(t)
 			srv, _ := testAdminServer(t)
-			body := []byte(`{"base_url":"https://probe-cancel.invalid/v1","no_auth":true,"upstream":"widget-v1"}`)
+			body := []byte(`{"base_url":"https://probe-cancel.invalid/v1","no_auth":true,"upstream":"widget-v1","operation":"chat"}`)
 			req := httptest.NewRequest(http.MethodPost, "/dash/api/admin/"+operation, bytes.NewReader(body))
 			authorizeAdminTest(t, srv, req)
 			ctx, cancel := context.WithCancel(req.Context())
@@ -129,6 +129,7 @@ func TestAdminProbeCancellationDuringBody(t *testing.T) {
 			body, _ := json.Marshal(map[string]any{
 				"base_url": up.URL + "/v1", "no_auth": true,
 				"allow_private_upstreams": true, "upstream": "widget-v1",
+				"operation": "chat",
 			})
 			req := httptest.NewRequest(http.MethodPost, "/dash/api/admin/"+operation, bytes.NewReader(body))
 			authorizeAdminTest(t, srv, req)

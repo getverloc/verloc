@@ -95,8 +95,9 @@ func TestAdminTestOKAndNotFound(t *testing.T) {
 	mkBody := func(upstream string) *bytes.Reader {
 		b, _ := json.Marshal(map[string]any{
 			"base_url": up.URL + "/v1", "allow_private_upstreams": true,
-			"api_key":  "good-key",
-			"upstream": upstream,
+			"api_key":   "good-key",
+			"upstream":  upstream,
+			"operation": "chat",
 		})
 		return bytes.NewReader(b)
 	}

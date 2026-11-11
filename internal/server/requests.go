@@ -13,16 +13,18 @@ import (
 )
 
 type RequestSummary struct {
-	Requests     int64   `json:"requests"`
-	Errors       int64   `json:"errors"`
-	TokIn        uint64  `json:"tok_in"`
-	TokOut       uint64  `json:"tok_out"`
-	TokCache     uint64  `json:"tok_cache"`
-	Cost         float64 `json:"cost"`
-	UnknownUsage int64   `json:"unknown_usage"`
-	UnknownCost  int64   `json:"unknown_cost"`
-	AvgLatencyMs float64 `json:"avg_latency_ms"`
-	AvgTTFTMs    float64 `json:"avg_ttft_ms"`
+	Requests      int64   `json:"requests"`
+	Errors        int64   `json:"errors"`
+	TokIn         uint64  `json:"tok_in"`
+	TokOut        uint64  `json:"tok_out"`
+	TokCache      uint64  `json:"tok_cache"`
+	Images        int64   `json:"images"`
+	UnknownImages int64   `json:"unknown_images"`
+	Cost          float64 `json:"cost"`
+	UnknownUsage  int64   `json:"unknown_usage"`
+	UnknownCost   int64   `json:"unknown_cost"`
+	AvgLatencyMs  float64 `json:"avg_latency_ms"`
+	AvgTTFTMs     float64 `json:"avg_ttft_ms"`
 }
 
 type UsageGroup struct {
@@ -38,6 +40,7 @@ type StatusGroup struct {
 type RequestFilter struct {
 	Since, Until                                   int64
 	Model, Backend, ClientKeyID, Status, Q, Cursor string
+	Endpoint                                       string
 	Limit                                          int
 }
 type RequestPage struct {
@@ -74,6 +77,16 @@ func (f RequestFilter) where(rollup bool) (string, []any) {
 		if v.val != "" {
 			terms = append(terms, v.col+"=?")
 			args = append(args, v.val)
+		}
+	}
+	if f.Endpoint != "" {
+		if rollup {
+			if f.Endpoint != "unknown" {
+				terms = append(terms, "0=1")
+			}
+		} else {
+			terms = append(terms, "endpoint=?")
+			args = append(args, f.Endpoint)
 		}
 	}
 	switch f.Status {
@@ -127,10 +140,12 @@ const summarySQL = `COUNT(*),COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0),
  COALESCE(SUM(tok_in),0),COALESCE(SUM(tok_out),0),COALESCE(SUM(tok_cache),0),
  COALESCE(SUM(cost),0),COALESCE(SUM(CASE WHEN usage_known=0 THEN 1 ELSE 0 END),0),
  COALESCE(SUM(CASE WHEN cost_known=0 THEN 1 ELSE 0 END),0),COALESCE(AVG(lat_ms),0),
- COALESCE(AVG(CASE WHEN ttft_ms>0 THEN ttft_ms END),0)`
+ COALESCE(AVG(CASE WHEN ttft_ms>0 THEN ttft_ms END),0),
+ COALESCE(SUM(CASE WHEN images_known=1 THEN images ELSE 0 END),0),
+ COALESCE(SUM(CASE WHEN endpoint IN ('images','images/generations','images/edits') AND images_known=0 THEN 1 ELSE 0 END),0)`
 
 func scanSummary(row interface{ Scan(...any) error }, s *RequestSummary) error {
-	return row.Scan(&s.Requests, &s.Errors, &s.TokIn, &s.TokOut, &s.TokCache, &s.Cost, &s.UnknownUsage, &s.UnknownCost, &s.AvgLatencyMs, &s.AvgTTFTMs)
+	return row.Scan(&s.Requests, &s.Errors, &s.TokIn, &s.TokOut, &s.TokCache, &s.Cost, &s.UnknownUsage, &s.UnknownCost, &s.AvgLatencyMs, &s.AvgTTFTMs, &s.Images, &s.UnknownImages)
 }
 
 // summaryCache memoises the full-scan summary aggregate. The dashboard
@@ -163,7 +178,7 @@ func (s *Store) Requests(ctx context.Context, f RequestFilter) (RequestPage, err
 	// aggregate covers the whole filtered set, so it cannot change while only
 	// the cursor moves. This removes a full scan from every "next page" click.
 	// cacheKey deliberately excludes the cursor and the limit.
-	cacheKey := f.Model + "\x00" + f.Backend + "\x00" + f.ClientKeyID + "\x00" + f.Status + "\x00" + f.Q +
+	cacheKey := f.Endpoint + "\x00" + f.Model + "\x00" + f.Backend + "\x00" + f.ClientKeyID + "\x00" + f.Status + "\x00" + f.Q +
 		"\x00" + strconv.FormatInt(f.Since, 10) + "\x00" + strconv.FormatInt(f.Until, 10)
 	s.summaryMu.Lock()
 	cached, ok := s.summaryCache[cacheKey]
@@ -231,6 +246,12 @@ func (s *Store) Requests(ctx context.Context, f RequestFilter) (RequestPage, err
 
 func requestFilter(values url.Values) (RequestFilter, error) {
 	f := RequestFilter{Model: values.Get("model"), Backend: values.Get("backend"), ClientKeyID: values.Get("client_key_id"), Status: values.Get("status"), Q: values.Get("q"), Cursor: values.Get("cursor"), Limit: 100}
+	f.Endpoint = values.Get("endpoint")
+	switch f.Endpoint {
+	case "", "unknown", "chat", "responses", "systemone", "embeddings", "images", "images/generations", "images/edits":
+	default:
+		return f, errors.New("invalid endpoint")
+	}
 	for _, v := range []struct {
 		k string
 		p *int64

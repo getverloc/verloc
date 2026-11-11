@@ -408,6 +408,17 @@ func prepareControlConfig(cfg *Config, importCatalog bool) (*Config, error) {
 		if _, ok := out.ModelMap[id]; !ok {
 			return nil, fmt.Errorf("metadata references unknown model %q", id)
 		}
+		if meta := out.ModelMeta[id]; meta != nil {
+			if _, err := normalizeOperations(meta.Operations); err != nil {
+				return nil, err
+			}
+			if !finitePricePtr(meta.PricingImage) || meta.PricingImage != nil && (*meta.PricingImage < 0 || *meta.PricingImage > 1e9) {
+				return nil, fmt.Errorf("invalid image price for model %q", id)
+			}
+			if err := validateImagePricing(meta.ImagePrices); err != nil {
+				return nil, err
+			}
+		}
 	}
 	for id := range out.ModelRoutes {
 		if _, ok := out.ModelMap[id]; !ok {

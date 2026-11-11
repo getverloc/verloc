@@ -1,15 +1,17 @@
 import { useMemo } from 'react';
 import { fmtInt, fmtMoney, fmtMs, fmtTokens, type TabProps } from '../api';
 import { rollupSeries } from '../window';
+import { useWindowAnalytics } from '../useWindowAnalytics';
 import { Skeleton } from '../components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { LatencyAreaChart } from '../components/charts/LatencyAreaChart';
 import { ModelRadar } from '../components/charts/ModelRadar';
-import { KpiCard, PanelCard, shortName } from '../components/charts/shared';
+import { InlineError, KpiCard, PanelCard, shortName } from '../components/charts/shared';
 
 export default function Latency({ state, series, range }: TabProps) {
   const roll = useMemo(() => rollupSeries(series), [series]);
   const booting = !state;
+  const { data: detail, error, retry } = useWindowAnalytics(range);
 
   // Top-5 models by window requests. Request / cost / token shares follow the
   // selected window; error counts and session latency enrich from live process
@@ -27,14 +29,16 @@ export default function Latency({ state, series, range }: TabProps) {
         cost: w.cost,
         latencyMs: session?.lat_p95_ms ?? session?.lat_avg_ms ?? 0,
         tokens: w.tokIn + w.tokOut,
+        images: detail?.models.find((m) => m.id === name)?.images ?? 0,
       };
     });
-  }, [roll, state]);
+  }, [roll, state, detail]);
 
   const sessionP95 = state?.latency_ms.p95 ?? 0;
 
   return (
     <div className="space-y-5">
+      {error && <InlineError message={error} onRetry={retry} />}
       <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-4 [&>*]:border-0">
         {booting ? (
           Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-[86px]" />)
@@ -69,7 +73,7 @@ export default function Latency({ state, series, range }: TabProps) {
           <Skeleton className="h-[260px]" />
         ) : (
           <>
-            <ModelRadar models={footprints} />
+            <ModelRadar models={footprints} loading={!detail && !error} />
             {footprints.length > 0 && (
               <div className="mt-5 border-t border-edge-700 pt-4">
                 <Table className="text-[11px] [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wider [&_td]:py-3">
@@ -80,7 +84,8 @@ export default function Latency({ state, series, range }: TabProps) {
                       <TableHead className="text-right">Err (session)</TableHead>
                       <TableHead className="text-right">Known cost</TableHead>
                       <TableHead className="text-right">p95 (session)</TableHead>
-                      <TableHead className="text-right">Tokens</TableHead>
+                       <TableHead className="text-right">Tokens</TableHead>
+                       <TableHead className="text-right">Images (durable)</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -93,14 +98,16 @@ export default function Latency({ state, series, range }: TabProps) {
                         <TableCell className="text-right font-mono text-destructive">{m.errors ? fmtInt(m.errors) : '0'}</TableCell>
                         <TableCell className="text-right font-mono text-chart-4">{fmtMoney(m.cost)}</TableCell>
                         <TableCell className="text-right font-mono">{m.latencyMs ? fmtMs(m.latencyMs) : '—'}</TableCell>
-                        <TableCell className="text-right font-mono">{fmtTokens(m.tokens)}</TableCell>
+                         <TableCell className="text-right font-mono">{fmtTokens(m.tokens)}</TableCell>
+                         <TableCell className="text-right font-mono text-chart-5">{detail ? fmtInt(m.images) : '—'}</TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
                 </Table>
                 <p className="mt-2 text-[11px] text-muted-foreground">
                   Error and p95 values are session counters since this process started; request, cost and
-                  token values follow the selected window. Latency percentiles are histogram-bucket estimates.
+                   token values follow the selected window. Latency percentiles are histogram-bucket estimates.
+                   Image counts use durable history; unknown counts are not reconstructed. TTFT applies only to recorded token streams, never embeddings or non-streaming images.
                 </p>
               </div>
             )}

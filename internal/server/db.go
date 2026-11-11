@@ -218,6 +218,17 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
+	// Virtual projections expose new media metadata without rewriting history;
+	// an absent endpoint remains unknown, never retroactively guessed as chat.
+	for _, column := range []string{
+		`endpoint TEXT GENERATED ALWAYS AS (COALESCE(NULLIF(json_extract(record,'$.endpoint'),''),'unknown')) VIRTUAL`,
+		`images INTEGER GENERATED ALWAYS AS (COALESCE(json_extract(record,'$.images'),0)) VIRTUAL`,
+		`images_known INTEGER GENERATED ALWAYS AS (COALESCE(json_extract(record,'$.images_known'),0)) VIRTUAL`,
+	} {
+		if _, err := s.db.Exec(`ALTER TABLE requests ADD COLUMN ` + column); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
 	// Additive migration for databases created before mirrors_detail existed.
 	// SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate-column error is
 	// the expected already-migrated signal. Default 0 preserves the existing

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import {
   fmtInt, fmtMoney, fmtMs, fmtTokens, HIST_LABELS,
-  type TabProps, type MetricSet, type KeyStat,
+   type TabProps, type MetricSet, type KeyStat, type RangePreset,
 } from '../api';
 import { Badge } from '../components/ui/badge';
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
@@ -13,15 +13,8 @@ import { Skeleton } from '../components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
 import { rollupSeries, type DimRollup } from '../window';
+import { useWindowAnalytics } from '../useWindowAnalytics';
 import { ArrowUpRight, Search, Server } from 'lucide-react';
-
-const PREFIX_TO_BACKEND: Record<string, string> = {
-  nv: 'nvidia', cf: 'cf', vl: 'vercel', ol: 'ollama',
-  cb: 'cerebras', sf: 'stepfun', ps: 'poolside', ml: 'mistral',
-  sl: 'siliconflow', tr: 'tokenrouter', oc: 'opencode', zm: 'zenmux',
-  fi: 'freeinference', or: 'openrouter', gq: 'groq', no: 'novita',
-  wb: 'wandb', hy: 'hyper', gm: 'gmi',
-};
 
 function HealthBar({ pct, tone }: { pct: number; tone: 'ok' | 'warn' | 'bad' }) {
   const fill = tone === 'ok' ? 'bg-primary' : tone === 'warn' ? 'bg-chart-4' : 'bg-destructive';
@@ -36,6 +29,7 @@ export default function Backends({ state, series, range }: TabProps) {
   const [selected, setSelected] = useState<string | null>(null);
   const [q, setQ] = useState('');
   const roll = useMemo(() => rollupSeries(series), [series]);
+  const { data: detail, error: detailError } = useWindowAnalytics(range);
 
   const backends = useMemo(() => {
     if (!state) return [];
@@ -100,6 +94,7 @@ export default function Backends({ state, series, range }: TabProps) {
           </CardAction>
         </CardHeader>
         <CardContent className="p-5">
+          {detailError && <p role="alert" className="mb-4 text-xs text-chart-4">Durable image and cost coverage unavailable: {detailError}</p>}
           {backends.length === 0 && (
             <Empty>
               <EmptyHeader>
@@ -125,7 +120,8 @@ export default function Backends({ state, series, range }: TabProps) {
                   <div className="text-right"><div className="text-[9px] tracking-[0.14em] text-muted-foreground uppercase">Spend</div><div className="mt-2 text-lg text-chart-4 tabular-nums">{fmtMoney(w.cost)}</div></div>
                 </div>
                 <dl className="grid grid-cols-2 gap-x-5 gap-y-4 border-y border-edge-700 py-4 text-xs">
-                  <div><dt className="text-[9px] tracking-widest text-muted-foreground uppercase">Tokens</dt><dd className="mt-1 tabular-nums">{fmtTokens(w.tokIn + w.tokOut)}</dd></div>
+                   <div><dt className="text-[9px] tracking-widest text-muted-foreground uppercase">Tokens</dt><dd className="mt-1 tabular-nums">{fmtTokens(w.tokIn + w.tokOut)}</dd></div>
+                   <div><dt className="text-[9px] tracking-widest text-muted-foreground uppercase">Images / durable window</dt><dd className="mt-1 tabular-nums text-chart-5">{detail ? fmtInt(detail.providers.find((p) => p.id === name)?.images ?? 0) : '—'}</dd></div>
                   <div><dt className="text-[9px] tracking-widest text-muted-foreground uppercase">Cached</dt><dd className="mt-1 tabular-nums">{fmtTokens(w.tokCache)}</dd></div>
                   <div><dt className="text-[9px] tracking-widest text-muted-foreground uppercase">Error rate</dt><dd className={`mt-1 tabular-nums ${errRate > 0 ? 'text-destructive' : ''}`}>{w.requests > 0 ? `${errRate.toFixed(1)}%` : '—'}</dd></div>
                   <div><dt className="text-[9px] tracking-widest text-muted-foreground uppercase">Errors</dt><dd className={`mt-1 tabular-nums ${w.err > 0 ? 'text-destructive' : ''}`}>{fmtInt(w.err)}</dd></div>
@@ -157,8 +153,8 @@ export default function Backends({ state, series, range }: TabProps) {
                 win={roll.backends[selected]}
                 b={state.backends[selected]}
                 keys={state.keys[selected] || []}
-                models={roll.models}
-                rangeLabel={range.label}
+                 rangeLabel={range.label}
+                 range={range}
               />
             )}
           </div>
@@ -168,15 +164,11 @@ export default function Backends({ state, series, range }: TabProps) {
   );
 }
 
-function BackendDetail({ name, win, b, keys, models, rangeLabel }: {
-  name: string; win?: DimRollup; b?: MetricSet; keys: KeyStat[]; models: Record<string, DimRollup>; rangeLabel: string;
+function BackendDetail({ name, win, b, keys, rangeLabel, range }: {
+  name: string; win?: DimRollup; b?: MetricSet; keys: KeyStat[]; rangeLabel: string; range: RangePreset;
 }) {
-  const modelRows = useMemo(() => {
-    return Object.entries(models)
-      .filter(([id]) => PREFIX_TO_BACKEND[id.split('/')[0]] === name)
-      .sort((a, b2) => b2[1].cost - a[1].cost);
-  }, [name, models]);
-
+  const { data, error } = useWindowAnalytics(range, name);
+  const modelRows = data?.models || [];
   const hist = b?.lat_hist || [];
   const histTotal = hist.reduce((s, x) => s + x, 0);
   const w = win || { requests: 0, tokIn: 0, tokOut: 0, tokCache: 0, cost: 0, err: 0 };
@@ -261,30 +253,20 @@ function BackendDetail({ name, win, b, keys, models, rangeLabel }: {
         {HIST_LABELS.map((l, i) => <div key={i} className="flex-1 text-center">{l}</div>)}
       </div>
 
-      <div className="mb-3 text-[10px] tracking-[0.14em] text-muted-foreground uppercase">04 / Models · {rangeLabel} · {modelRows.length}</div>
-      <div className="overflow-x-auto border border-edge-700 bg-edge-950/40">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Model</TableHead><TableHead>Req</TableHead><TableHead>Cost</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {modelRows.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={3} className="text-xs text-muted-foreground">No models served in the {rangeLabel} window.</TableCell>
-              </TableRow>
-            )}
-            {modelRows.map(([id, m]) => (
-              <TableRow key={id}>
-                <TableCell className="max-w-[200px] truncate text-xs">{id}</TableCell>
-                <TableCell className="font-mono">{fmtInt(m.requests)}</TableCell>
-                <TableCell className="text-chart-4 tabular-nums">{fmtMoney(m.cost)}</TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </div>
+      <div className="mb-3 text-[10px] uppercase tracking-widest text-muted-foreground">04 / Models · durable {rangeLabel} window</div>
+      {error && <p role="alert" className="mb-3 text-xs text-chart-4">{error}</p>}
+      <Table>
+        <TableHeader><TableRow><TableHead>Model</TableHead><TableHead>Req</TableHead><TableHead>Known cost</TableHead><TableHead>Images / unknown count</TableHead></TableRow></TableHeader>
+        <TableBody>
+          {!modelRows.length && <TableRow><TableCell colSpan={4} className="text-xs text-muted-foreground">{data ? 'No durable model activity in this window.' : 'Loading durable model attribution…'}</TableCell></TableRow>}
+          {modelRows.map((m) => <TableRow key={m.id}>
+            <TableCell className="max-w-[200px] break-all whitespace-normal text-xs">{m.id}</TableCell><TableCell>{fmtInt(m.requests)}</TableCell>
+            <TableCell className="text-chart-4">{m.unknown_cost && !m.cost ? 'Unknown' : fmtMoney(m.cost)}</TableCell>
+            <TableCell className="text-chart-5">{fmtInt(m.images)} / {fmtInt(m.unknown_images)}</TableCell>
+          </TableRow>)}
+        </TableBody>
+      </Table>
+      <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">Attributed to the provider that actually served the request, including fallback routes; never inferred from model ID prefixes.</p>
 
       <div className="mt-4 flex flex-wrap gap-1">
         <Badge variant="outline">session metrics</Badge>

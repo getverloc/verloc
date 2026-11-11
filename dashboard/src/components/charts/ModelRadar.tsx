@@ -14,6 +14,7 @@ export interface ModelFootprint {
   cost: number;
   latencyMs: number;
   tokens: number;
+  images: number;
 }
 
 const DIMS = [
@@ -22,6 +23,7 @@ const DIMS = [
   { key: 'cost', label: 'Cost' },
   { key: 'latency', label: 'Latency' },
   { key: 'tokens', label: 'Tokens' },
+  { key: 'images', label: 'Known images' },
 ] as const;
 
 export function ModelRadar({ models, loading }: { models: ModelFootprint[]; loading?: boolean }) {
@@ -32,7 +34,8 @@ export function ModelRadar({ models, loading }: { models: ModelFootprint[]; load
       errors: Math.max(...ranked.map((m) => m.errors), 1),
       cost: Math.max(...ranked.map((m) => m.cost), 1),
       latency: Math.max(...ranked.map((m) => m.latencyMs), 1),
-      tokens: Math.max(...ranked.map((m) => m.tokens), 1),
+       tokens: Math.max(...ranked.map((m) => m.tokens), 1),
+       images: Math.max(...ranked.map((m) => m.images), 1),
     };
     const axes = DIMS.map((d) => {
       const row: Record<string, string | number> = { dim: d.label };
@@ -78,12 +81,12 @@ export function ModelRadar({ models, loading }: { models: ModelFootprint[]; load
           <li key={m.name} className="space-y-2 py-3 text-[11px]">
             <div className="flex min-w-0 items-center gap-2"><span className="size-2 shrink-0" style={{ background: PALETTE.models[i % PALETTE.models.length] }} /><span className="min-w-0 truncate text-edge-100" title={m.name}>{shortName(m.name)}</span></div>
             <div className="flex flex-wrap gap-x-3 gap-y-1 pl-4 text-[10px] text-edge-400">
-              <span>{fmtInt(m.requests)} req</span><span>{fmtInt(m.errors)} session err</span><span className="text-chart-4">{fmtMoney(m.cost)}</span><span>{fmtMs(m.latencyMs)} session latency</span><span>{fmtTokens(m.tokens)} tokens</span>
+              <span>{fmtInt(m.requests)} req</span><span>{fmtInt(m.errors)} session err</span><span className="text-chart-4">{fmtMoney(m.cost)}</span><span>{fmtMs(m.latencyMs)} session latency</span><span>{fmtTokens(m.tokens)} reported tokens</span><span className="text-chart-5">{fmtInt(m.images)} known images</span>
             </div>
           </li>
         ))}
       </ul>
-      <p className="border-t border-edge-700 pt-3 text-[10px] leading-relaxed text-edge-400 lg:col-span-2">Axes normalize each metric against the top-model peak, with a minimum baseline of 1 (0–100). Request, cost and token values follow the window; error and latency values are session counters.</p>
+      <p className="border-t border-edge-700 pt-3 text-[10px] leading-relaxed text-edge-400 lg:col-span-2">Axes normalize each metric against the top-model peak, with a minimum baseline of 1 (0–100). Request, cost and reported token values follow snapshots; known images use durable window history. Error and latency values are session counters. Unknown quantities are excluded, not converted into free usage.</p>
     </div>
   );
 }

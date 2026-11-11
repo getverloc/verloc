@@ -301,7 +301,7 @@ func (mt *Metrics) RecordRequest(rec ReqRecord) {
 		tin, tout, cache = 0, 0, 0
 	}
 	var cost float64
-	if rec.UsageKnown && rec.CostKnown {
+	if rec.CostKnown {
 		cost = rec.Cost
 	}
 	mt.record(rec.Model, rec.Backend, rec.Stream, rec.Status, tin, tout, cache, uint64(rec.LatMs*1e6), uint64(rec.TTFTMs*1e6), rec.OK, cost)

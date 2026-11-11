@@ -191,10 +191,19 @@ type ModelMeta struct {
 	Reasoning     *bool          `json:"reasoning,omitempty"`
 	Temperature   *bool          `json:"temperature,omitempty"`
 	Modalities    map[string]any `json:"modalities,omitempty"`
-	PricingInput  float64        `json:"pricing_input"`
-	PricingOutput float64        `json:"pricing_output"`
-	PricingCache  float64        `json:"pricing_cache"`
-	PricingKnown  *bool          `json:"pricing_known,omitempty"`
+	// Operations restricts which inference endpoints may use this model.
+	// Empty means every standard operation (chat, embeddings, images), which
+	// keeps existing model records unchanged.
+	Operations    []string `json:"operations,omitempty"`
+	PricingInput  float64  `json:"pricing_input"`
+	PricingOutput float64  `json:"pricing_output"`
+	PricingCache  float64  `json:"pricing_cache"`
+	// Nil is unknown; an explicit zero is free. ImagePrices adds conditional
+	// rates and opt-in provider-reported USD cost without changing chat prices.
+	PricingImage  *float64      `json:"pricing_image,omitempty"`
+	ImagePrices   *ImagePricing `json:"image_prices,omitempty"`
+	PricingKnown  *bool         `json:"pricing_known,omitempty"`
+	PricingFields []string      `json:"pricing_fields,omitempty"`
 }
 
 // DashboardConfig controls the embedded analytics dashboard + persistence.

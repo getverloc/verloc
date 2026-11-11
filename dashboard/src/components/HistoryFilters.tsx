@@ -6,10 +6,10 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 
-export interface HistoryFilter { model: string; backend: string; client_key_id: string; status: string; q: string; since: string; until: string }
+export interface HistoryFilter { endpoint: string; model: string; backend: string; client_key_id: string; status: string; q: string; since: string; until: string }
 function readHistoryFilters(): HistoryFilter {
   const params = new URLSearchParams(location.search);
-  const filters = { model: params.get('model') || '', backend: params.get('backend') || '', client_key_id: params.get('client_key_id') || '', status: params.get('status') || '', q: params.get('q') || '', since: params.get('since') || '', until: params.get('until') || '' };
+  const filters = { endpoint: params.get('endpoint') || '', model: params.get('model') || '', backend: params.get('backend') || '', client_key_id: params.get('client_key_id') || '', status: params.get('status') || '', q: params.get('q') || '', since: params.get('since') || '', until: params.get('until') || '' };
   for (const key of ['since', 'until'] as const) {
     if (!/^\d+$/.test(filters[key])) continue;
     const date = new Date(Number(filters[key]));
@@ -107,11 +107,13 @@ export function HistoryFilters({ filters, onChange, onRefresh, busy }: { filters
         options={clients.map((c) => ({ value: c.id, label: `${c.name}${c.revoked_at ? ' (revoked)' : ''}` }))} onChange={(v) => update('client_key_id', v)} />
       <FilterSelectField id="hf-status" label="Status" placeholder="All outcomes" value={filters.status}
         options={[{ value: 'ok', label: 'Successful' }, { value: 'error', label: 'Failed' }]} onChange={(v) => update('status', v)} />
+      <FilterSelectField id="hf-endpoint" label="Endpoint" placeholder="All endpoints" value={filters.endpoint}
+        options={['chat', 'responses', 'systemone', 'embeddings', 'images/generations', 'images/edits', 'unknown'].map((value) => ({ value, label: value === 'unknown' ? 'Unknown / legacy' : value }))} onChange={(v) => update('endpoint', v)} />
     </div>
     <div className="flex flex-wrap items-center justify-between gap-3 border-t border-edge-700 pt-4">
       <div className="space-y-1 text-[10px] text-edge-400"><p className="text-edge-200">{activeCount ? `${activeCount} active ${activeCount === 1 ? 'filter' : 'filters'}` : 'All dimensions included'}</p><p id="hf-window-note">A custom From time overrides the global window. Dates use your local timezone.</p></div>
       <div className="flex gap-2">
-        <Button variant="outline" onClick={() => onChange({ model: '', backend: '', client_key_id: '', status: '', q: '', since: '', until: '' })}>Clear filters</Button>
+        <Button variant="outline" onClick={() => onChange({ endpoint: '', model: '', backend: '', client_key_id: '', status: '', q: '', since: '', until: '' })}>Clear filters</Button>
         <Button disabled={busy} onClick={onRefresh}><RotateCcw data-icon="inline-start" className={busy ? 'animate-spin' : ''} />{busy ? 'Loading…' : 'Refresh'}</Button>
       </div>
     </div>

@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,6 +35,15 @@ type ReqRecord struct {
 	UsageKnown  bool             `json:"usage_known"`
 	CostKnown   bool             `json:"cost_known"`
 	AttemptLog  []RequestAttempt `json:"attempts,omitempty"`
+	// Endpoint identifies the inference endpoint; absent on old history.
+	// Images is the number of generated images (images endpoints only).
+	Endpoint          string               `json:"endpoint,omitempty"`
+	Images            int                  `json:"images,omitempty"`
+	ImagesKnown       bool                 `json:"images_known,omitempty"`
+	CostSource        string               `json:"cost_source,omitempty"`
+	PriceSnapshot     *MediaPriceSnapshot  `json:"price_snapshot,omitempty"`
+	UpstreamRequestID string               `json:"upstream_request_id,omitempty"`
+	MediaTokens       *MediaTokenBreakdown `json:"media_tokens,omitempty"`
 }
 
 type RequestAttempt struct {
@@ -68,7 +78,10 @@ func sanitizeRecord(r ReqRecord) ReqRecord {
 	}
 	if !r.UsageKnown {
 		r.TokIn, r.TokOut, r.TokCache = 0, 0, 0
-		r.CostKnown = false
+		// Media counts or provider-reported cost can be known without tokens.
+		if !strings.HasPrefix(r.Endpoint, "images") && r.Endpoint != "embeddings" {
+			r.CostKnown = false
+		}
 	}
 	if !r.CostKnown {
 		r.Cost = 0

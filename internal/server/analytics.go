@@ -31,7 +31,9 @@ func analyticsAggColumns() string {
 		COALESCE(SUM(CASE WHEN cost_known=0 THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(lat_ms),0),
 		COALESCE(SUM(CASE WHEN ttft_ms>0 THEN ttft_ms ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN ttft_ms>0 THEN 1 ELSE 0 END),0)`)
+		COALESCE(SUM(CASE WHEN ttft_ms>0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN images_known=1 THEN images ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN endpoint IN ('images','images/generations','images/edits') AND images_known=0 THEN 1 ELSE 0 END),0)`)
 	for i := range len(latBuckets) + 1 {
 		var latCond, ttftCond string
 		if i < len(latBuckets) {
@@ -50,9 +52,8 @@ func analyticsAggColumns() string {
 	return sb.String()
 }
 
-// addColumns accumulates one request from its stored columns. It must stay
-// exactly equivalent to addRecord (which takes a full ReqRecord) so the SQL
-// projection cannot change any reported total.
+// addColumns accumulates the legacy token/cost/latency projection. Current SQL
+// aggregates also include the media quantities stored alongside each record.
 func (a *usageAccumulator) addColumns(ok, usageKnown, costKnown bool, tin, tout, tcache uint64, cost, latMs, ttftMs float64) {
 	a.Requests++
 	if !ok {
@@ -78,6 +79,11 @@ func (a *usageAccumulator) addColumns(ok, usageKnown, costKnown bool, tin, tout,
 }
 
 func (a *usageAccumulator) addRecord(r ReqRecord) {
+	if r.ImagesKnown {
+		a.Images += int64(r.Images)
+	} else if strings.HasPrefix(r.Endpoint, "images") {
+		a.UnknownImages++
+	}
 	a.Requests++
 	if !r.OK {
 		a.Errors++
@@ -101,6 +107,8 @@ func (a *usageAccumulator) addRecord(r ReqRecord) {
 	}
 }
 func (a *usageAccumulator) merge(b *usageAccumulator) {
+	a.Images += b.Images
+	a.UnknownImages += b.UnknownImages
 	a.Requests += b.Requests
 	a.Errors += b.Errors
 	a.TokIn += b.TokIn
@@ -180,6 +188,7 @@ type AnalyticsResult struct {
 	Models    []UsageGroup      `json:"models"`
 	Providers []UsageGroup      `json:"providers"`
 	Clients   []UsageGroup      `json:"clients"`
+	Endpoints []UsageGroup      `json:"endpoints"`
 	Status    []StatusGroup     `json:"status"`
 	Latency   Distribution      `json:"latency"`
 	TTFT      Distribution      `json:"ttft"`
@@ -196,10 +205,17 @@ func (s *Store) Analytics(ctx context.Context, f RequestFilter) (AnalyticsResult
 	total := &usageAccumulator{}
 	models, providers, clients := map[string]*usageAccumulator{}, map[string]*usageAccumulator{}, map[string]*usageAccumulator{}
 	names := map[string]string{}
+	endpoints := map[string]*usageAccumulator{}
 	nameTS := map[string]int64{}
 	statuses := map[int]int64{}
 	add := func(model, provider, client, name string, status int, ts int64, a *usageAccumulator) {
 		total.merge(a)
+		legacy := endpoints["unknown"]
+		if legacy == nil {
+			legacy = &usageAccumulator{}
+			endpoints["unknown"] = legacy
+		}
+		legacy.merge(a)
 		for _, v := range []struct {
 			m map[string]*usageAccumulator
 			k string
@@ -243,7 +259,7 @@ func (s *Store) Analytics(ctx context.Context, f RequestFilter) (AnalyticsResult
 			dest = append(dest, key)
 		}
 		dest = append(dest, &a.Requests, &a.Errors, &a.TokIn, &a.TokOut, &a.TokCache, &a.Cost,
-			&a.UnknownUsage, &a.UnknownCost, &a.latSum, &a.ttftSum, &a.ttftN)
+			&a.UnknownUsage, &a.UnknownCost, &a.latSum, &a.ttftSum, &a.ttftN, &a.Images, &a.UnknownImages)
 		for i := range latH {
 			dest = append(dest, &latH[i], &ttftH[i])
 		}
@@ -282,7 +298,7 @@ func (s *Store) Analytics(ctx context.Context, f RequestFilter) (AnalyticsResult
 		groupQueries := []struct {
 			col string
 			m   map[string]*usageAccumulator
-		}{{"model", models}, {"backend", providers}, {"client_key_id", clients}}
+		}{{"model", models}, {"backend", providers}, {"client_key_id", clients}, {"endpoint", endpoints}}
 		for _, gq := range groupQueries {
 			grows, gerr := tx.QueryContext(ctx,
 				`SELECT `+gq.col+`, `+aggCols+`, 0, 0 FROM requests WHERE `+where+` GROUP BY `+gq.col, args...)
@@ -423,11 +439,12 @@ func (s *Store) Analytics(ctx context.Context, f RequestFilter) (AnalyticsResult
 	out.Models = groups(models, false)
 	out.Providers = groups(providers, false)
 	out.Clients = groups(clients, true)
+	out.Endpoints = groups(endpoints, false)
 	for status, n := range statuses {
 		out.Status = append(out.Status, StatusGroup{status, n})
 	}
 	sort.Slice(out.Status, func(i, j int) bool { return out.Status[i].Status < out.Status[j].Status })
-	if f.Model == "" && f.Backend == "" && f.ClientKeyID == "" && f.Status == "" && f.Q == "" {
+	if f.Model == "" && f.Backend == "" && f.ClientKeyID == "" && f.Status == "" && f.Q == "" && (f.Endpoint == "" || f.Endpoint == "unknown") {
 		start := ((f.Since + 3599999) / 3600000) * 3600000
 		until := int64(math.MaxInt64)
 		if f.Until > 0 {

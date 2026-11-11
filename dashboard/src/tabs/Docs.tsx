@@ -12,7 +12,7 @@ const SECTIONS: Array<[string, string, string]> = [
   ['05', 'Responses', 'responses'],
   ['06', 'System One', 'system-one'],
   ['07', 'Anthropic Messages', 'anthropic-messages'],
-  ['08', 'Utility endpoints', 'utility-endpoints'],
+  ['08', 'Utility & media', 'utility-endpoints'],
   ['09', 'Errors', 'errors'],
   ['10', 'Failover', 'failover'],
   ['11', 'Model routing', 'model-routing'],
@@ -309,8 +309,9 @@ export default function Docs() {
         <CodeBlock label="Quickstart — curl" code={QUICKSTART_CURL.replace('$BASE_URL', base)} />
         <CodeBlock label="Quickstart — OpenAI Node SDK" code={QUICKSTART_JS} />
         <Note>
-          Only Chat Completions, Responses, and the native System One decision API are implemented.
-          Embeddings, images, audio, and other OpenAI endpoints are not proxied.
+          Implemented: Chat Completions, Responses, Anthropic Messages, the native System One
+          decision API, embeddings, and image generation/editing. Audio, video, and other OpenAI
+          endpoints are not proxied.
         </Note>
       </Section>
 
@@ -359,6 +360,9 @@ export default function Docs() {
               ['POST', '/v1/messages/count_tokens', 'Client key', 'Anthropic token counting; character-based estimate'],
               ['POST', '/v1/responses', 'Client key', 'OpenAI Responses passthrough; upstream must implement /responses'],
               ['POST', '/v1/systemone', 'Client key', 'Native Jev/Clef decision API; non-streaming, uncompressed JSON'],
+              ['POST', '/v1/embeddings', 'Client key', 'OpenAI-compatible embeddings, including batched input'],
+              ['POST', '/v1/images/generations', 'Client key', 'OpenAI-compatible image generation'],
+              ['POST', '/v1/images/edits', 'Client key', 'Image editing; JSON or multipart upload'],
               ['GET', '/v1/models', 'Public', 'Enabled models; a client key narrows the list to its scope'],
               ['GET', '/v1/pricing', 'Client key', 'Scoped catalog in USD per million tokens'],
               ['GET', '/healthz', 'Public', 'Liveness probe; returns ok or draining'],
@@ -500,8 +504,57 @@ export default function Docs() {
         <CodeBlock label="Claude Code setup" code={ANTHROPIC_CLAUDE_CODE} />
       </Section>
 
-      <Section id="utility-endpoints" index="08" kicker="Reference" title="Utility endpoints"
-        description="Discovery, pricing, and operational probes. Model discovery is public; pricing is filtered by the calling key's scope.">
+      <Section id="utility-endpoints" index="08" kicker="Reference" title="Utility and media endpoints"
+        description="Discovery, pricing, embeddings, images, and operational probes. Model discovery is public; everything else is filtered by the calling key's scope.">
+        <Endpoint method="POST" path="/v1/embeddings" alias="/embeddings" />
+        <Prose>
+          OpenAI-compatible embeddings. The model is remapped, the response is returned unchanged,
+          and provider-reported prompt tokens are recorded. Batched input and both float and base64
+          encodings pass through. Embedding vectors are never stored.
+        </Prose>
+        <CodeBlock label="Request" code={`curl $BASE_URL/v1/embeddings \\
+  -H "Authorization: Bearer $VERLOC_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"nv/nvidia/llama-3.2-nv-embedqa-1b-v2","input":["first","second"]}'`.replace('$BASE_URL', base)} />
+
+        <Endpoint method="POST" path="/v1/images/generations" alias="/images/generations" />
+        <Endpoint method="POST" path="/v1/images/edits" alias="/images/edits" />
+        <Prose>
+          OpenAI-compatible image generation and editing. Edits accept JSON or multipart form data;
+          only the model field is rewritten and uploaded bytes are forwarded verbatim. Streaming
+          image generation is not implemented and returns 400. Image counts and any reported token
+          usage are recorded independently. Missing tokens do not mean free images. Large base64
+          responses retain accounting; media bytes and embedding vectors are never saved in history.
+        </Prose>
+        <Prose>
+          Models support a flat USD/image rate (zero means explicitly free), exact size/quality
+          variants, or separate text/image token rates in USD per million. Blank variant conditions
+          are unconstrained; stated conditions match exactly and the most specific match wins.
+          Unsupported catalog conditions and ambiguous matches leave calculated image cost unknown.
+          Token-breakdown pricing
+          needs matching upstream details; cached breakdowns and unspecified provider defaults are
+          not estimated. Optionally trust usage.cost only when the upstream documents it as USD.
+          Cost precedence is provider-reported USD, matching variant, flat rate, then token pricing;
+          unmatched variants remain unknown. Methods are alternatives, not added together.
+          Request detail retains the price snapshot and labels cost as calculated, provider-reported,
+          or unknown. Requests and Analytics filter by endpoint and aggregate returned image counts.
+          Older records without an endpoint stay unknown. Embeddings need only an input token price.
+          In /v1/pricing, unknown token prices are null; input-only embeddings do not invent an output
+          price. Image rates are listed separately under images. Media model types are exposed as
+          image or embedding in /v1/models. Catalog lookup fills gaps without replacing manual overrides.
+        </Prose>
+        <Note>
+          Image submissions are not retried on 5xx or timeouts: the provider may already be
+          generating and billing. Only 401/402/403/429 rotate to another key.
+          Interrupted or malformed accepted image responses are not retried either. A canceled
+          client response does not refund a known upstream expense. RPM and concurrency policies
+          apply to images; TPM is not an image-spend limit. Uploads share the gateway body limit.
+        </Note>
+        <CodeBlock label="Generate" code={`curl $BASE_URL/v1/images/generations \\
+  -H "Authorization: Bearer $VERLOC_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"vl/openai/gpt-image-1","prompt":"a paper boat at dusk","n":1}'`.replace('$BASE_URL', base)} />
+
         <Endpoint method="GET" path="/v1/models" alias="/models" />
         <Prose>
           Lists enabled models, sorted by ID. No credential is required; when a client key is
@@ -724,7 +777,7 @@ export default function Docs() {
           {([
             ['Credential pooling', 'Per-provider key pools rotate round-robin over healthy credentials, cool down failing keys, and recover automatically.'],
             ['Ordered failover', 'Primary and fallback routes are tried in order with bounded attempts and a wall-clock retry budget.'],
-            ['Model discovery', 'Probe an upstream /models endpoint, test a connection, resolve metadata hints, then onboard models transactionally.'],
+            ['Model discovery', 'Probe an upstream /models endpoint, detect chat, image, and embedding models, prefill limits and prices, then onboard transactionally. Tests call the detected endpoint; image tests require explicit credit acknowledgement.'],
             ['Pricing catalog', 'An embedded catalog overlaid by live pricing hints; per-request cost uses the immutable request-time price.'],
             ['Metadata-only analytics', 'Request metadata, tokens, latency, and known cost are stored. Prompts, completions, and bodies never are.'],
             ['Alerts', 'Threshold rules over error rate, failover, cost, latency, TTFT, and key cooldown notify in the dashboard — they do not throttle paid traffic.'],

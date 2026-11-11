@@ -16,11 +16,12 @@ import { GRID_STROKE, InlineError, KpiCard, PALETTE, PanelCard, TICK } from '../
 import Cost from './Cost';
 import Latency from './Latency';
 
-type UsageGroupKey = 'clients' | 'models' | 'providers';
+type UsageGroupKey = 'clients' | 'models' | 'providers' | 'endpoints';
 const UNATTRIBUTED_LABELS: Record<UsageGroupKey, string> = {
   clients: 'Unattributed client',
   models: 'Unattributed model',
   providers: 'Unattributed provider',
+  endpoints: 'Unknown / legacy endpoint',
 };
 
 export default function Analytics(props: TabProps) {
@@ -72,11 +73,12 @@ export default function Analytics(props: TabProps) {
 
       {data && summary && (
         <>
-          <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 xl:grid-cols-4 [&>*]:border-0">
+          <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 xl:grid-cols-5 [&>*]:border-0">
             <KpiCard label="Requests" value={fmtInt(summary.requests)} sub={`${fmtInt(summary.errors)} errors`} />
             <KpiCard label="Known cost" value={fmtMoney(summary.cost)} sub={`${fmtInt(summary.unknown_cost)} requests with unknown cost`} accent="text-chart-4" />
             <KpiCard label="Known input / output" value={`${fmtTokens(summary.tok_in)} / ${fmtTokens(summary.tok_out)}`} sub={`${fmtInt(summary.unknown_usage)} requests with unknown usage`} />
             <KpiCard label="Cache tokens" value={fmtTokens(summary.tok_cache)} sub="Reported cache-read tokens" />
+            <KpiCard label="Generated images" value={fmtInt(summary.images)} sub={`${fmtInt(summary.unknown_images)} image requests with unknown count`} accent="text-chart-5" />
           </div>
 
           {(summary.unknown_usage > 0 || summary.unknown_cost > 0) && (
@@ -92,12 +94,13 @@ export default function Analytics(props: TabProps) {
             action={
               <Select value={group} onValueChange={(v) => setGroup(v as UsageGroupKey)}>
                 <SelectTrigger size="sm" aria-label="Breakdown dimension">
-                  <SelectValue>{group === 'clients' ? 'By client' : group === 'models' ? 'By model' : 'By provider'}</SelectValue>
+                  <SelectValue>{group === 'clients' ? 'By client' : group === 'models' ? 'By model' : group === 'endpoints' ? 'By endpoint' : 'By provider'}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="clients">By client</SelectItem>
                   <SelectItem value="models">By model</SelectItem>
                   <SelectItem value="providers">By provider</SelectItem>
+                  <SelectItem value="endpoints">By endpoint</SelectItem>
                 </SelectContent>
               </Select>
             }
@@ -109,7 +112,7 @@ export default function Analytics(props: TabProps) {
               dimension={group}
               onFilter={(id) => setFilters({
                 ...filters,
-                [group === 'clients' ? 'client_key_id' : group === 'models' ? 'model' : 'backend']: id,
+                [group === 'clients' ? 'client_key_id' : group === 'models' ? 'model' : group === 'endpoints' ? 'endpoint' : 'backend']: id,
               })}
             />
           </PanelCard>
@@ -295,7 +298,7 @@ function UsageTable({ rows, dimension, onFilter }: {
   dimension: UsageGroupKey;
   onFilter: (id: string) => void;
 }) {
-  const dimLabel = dimension === 'clients' ? 'Client API key' : dimension === 'models' ? 'Model' : 'Provider';
+  const dimLabel = dimension === 'clients' ? 'Client API key' : dimension === 'models' ? 'Model' : dimension === 'endpoints' ? 'Endpoint' : 'Provider';
   return (
     <Table className="text-[11px] [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wider [&_td]:py-3">
       <TableHeader>
@@ -304,6 +307,7 @@ function UsageTable({ rows, dimension, onFilter }: {
           <TableHead className="text-right">Requests / errors</TableHead>
           <TableHead className="text-right">Avg latency / TTFT</TableHead>
           <TableHead className="text-right">Input / output / cache</TableHead>
+          <TableHead className="text-right">Images / unknown count</TableHead>
           <TableHead className="text-right">Known cost</TableHead>
           <TableHead className="text-right">Unknown usage / cost</TableHead>
         </TableRow>
@@ -311,7 +315,7 @@ function UsageTable({ rows, dimension, onFilter }: {
       <TableBody>
         {rows.length === 0 && (
           <TableRow>
-            <TableCell colSpan={6} className="py-8 text-center text-xs uppercase tracking-widest text-muted-foreground">
+            <TableCell colSpan={7} className="py-8 text-center text-xs uppercase tracking-widest text-muted-foreground">
               No usage groups match these filters
             </TableCell>
           </TableRow>
@@ -338,6 +342,9 @@ function UsageTable({ rows, dimension, onFilter }: {
               ) : (
                 <>{fmtTokens(row.tok_in)} / {fmtTokens(row.tok_out)} / {fmtTokens(row.tok_cache)}</>
               )}
+            </TableCell>
+            <TableCell className="text-right font-mono text-chart-4">
+              <span className="text-chart-5">{fmtInt(row.images)} / {fmtInt(row.unknown_images)}</span>
             </TableCell>
             <TableCell className="text-right font-mono text-chart-4">
               {row.unknown_cost > 0 && !row.cost ? <span>Unknown</span> : fmtMoney(row.cost)}

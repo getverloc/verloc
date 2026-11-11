@@ -57,6 +57,13 @@ export interface ReqRecord {
   err_msg?: string;
   client_key_id?: string;
   client_name?: string;
+  endpoint?: string;
+  images?: number;
+  images_known?: boolean;
+  cost_source?: string;
+  price_snapshot?: { input?: string; output?: string; cache?: string; image?: number; image_prices?: ImagePricing; size?: string; quality?: string };
+  upstream_request_id?: string;
+  media_tokens?: { text_input: number; image_input: number; text_output: number; image_output: number };
   outcome?: string;
   usage_known?: boolean;
   cost_known?: boolean;
@@ -197,11 +204,19 @@ export interface AdminProvider {
   model_count: number;
 }
 
+export interface ImagePricing {
+  variants?: { size: string; quality: string; price: string }[];
+  text_input?: string; image_input?: string; text_output?: string; image_output?: string;
+  provider_cost?: boolean;
+  unsupported_conditions?: boolean;
+}
+
 export interface AdminModel {
   id: string;
   disabled?: boolean;
   routes?: RouteTarget[];
   pricing_known: boolean;
+  pricing_fields?: string[];
   backend: string;
   upstream: string;
   name: string;
@@ -214,9 +229,13 @@ export interface AdminModel {
   reasoning?: boolean;
   temperature?: boolean;
   modalities?: { input?: string[]; output?: string[]; [key: string]: unknown };
+  operations?: string[];
+  kind?: string;
   pricing_input: number;
   pricing_output: number;
   pricing_cache: number;
+  pricing_image?: number | null;
+  image_prices?: ImagePricing;
   has_meta: boolean;
   embedded: boolean;
 }
@@ -288,6 +307,14 @@ export interface ModelHint {
   pricing_input?: number;
   pricing_output?: number;
   pricing_cache?: number;
+  pricing_image?: number;
+  image_prices?: ImagePricing;
+  type?: string;
+  operations?: string[];
+  modalities?: AdminModel['modalities'];
+  attachment?: boolean;
+  reasoning?: boolean;
+  temperature?: boolean;
   context_window?: number;
   max_tokens?: number;
   source?: string;
@@ -317,9 +344,16 @@ export interface TestResult {
   ok: boolean;
   status: number;
   latency_ms: number;
+  kind?: 'chat' | 'images' | 'embeddings';
   reply?: string;
   error?: string;
   hint?: string;
+  images?: number;
+  images_known?: boolean;
+  usage_known?: boolean;
+  tok_in?: number;
+  tok_out?: number;
+  dimensions?: number;
 }
 
 export const discoverUpstreamModels = (body: ProbeConn) =>
@@ -327,10 +361,12 @@ export const discoverUpstreamModels = (body: ProbeConn) =>
     method: 'POST', body: JSON.stringify(body),
   }, 60000);
 
-export const testUpstreamModel = (body: ProbeConn & { upstream: string; max_tokens?: number }) =>
+export const testUpstreamModel = (body: ProbeConn & {
+  upstream: string; max_tokens?: number; operation?: 'chat' | 'images' | 'embeddings'; confirm_image_spend?: boolean;
+}) =>
   adminJSON<TestResult>('/dash/api/admin/test', {
     method: 'POST', body: JSON.stringify(body),
-  }, 60000);
+  }, 120000);
 
 export const lookupModelHints = (upstreams: string[]) =>
   adminJSON<{ hints: Record<string, ModelHint> }>('/dash/api/admin/model-hints', {
@@ -365,11 +401,13 @@ export const revokeClientKey = (id: string) => adminJSON<{ ok: boolean }>(`/dash
 export interface RequestSummary {
   requests: number; errors: number; tok_in: number; tok_out: number; tok_cache: number; cost: number;
   unknown_usage: number; unknown_cost: number; avg_latency_ms: number; avg_ttft_ms: number;
+  images: number; unknown_images: number;
 }
 export interface UsageGroup extends RequestSummary { id: string; name: string }
 export interface RequestPage { requests: ReqRecord[]; total: number; next_cursor?: string; summary: RequestSummary }
 export interface Analytics {
   summary: RequestSummary; models: UsageGroup[]; providers: UsageGroup[]; clients: UsageGroup[];
+  endpoints: UsageGroup[];
   status: { status: number; requests: number }[];
   latency: { p50: number; p95: number; p99: number; buckets: number[]; bounds: number[] };
   ttft: { p50: number; p95: number; p99: number };

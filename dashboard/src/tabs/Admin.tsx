@@ -92,7 +92,7 @@ export default function Admin({ state, section }: TabProps & { section: Section 
     const q = mq.trim().toLowerCase();
     if (!q) return models;
     return models.filter((m) =>
-      `${m.id} ${m.name} ${m.backend} ${m.upstream}`.toLowerCase().includes(q));
+      `${m.id} ${m.name} ${m.backend} ${m.upstream} ${m.kind || ''} ${(m.operations || []).join(' ')} ${(m.tags || []).join(' ')}`.toLowerCase().includes(q));
   }, [models, mq]);
 
 
@@ -404,6 +404,15 @@ export default function Admin({ state, section }: TabProps & { section: Section 
                     {filteredModels.map((m) => {
                       const routes: RouteTarget[] = [{ backend: m.backend, upstream: m.upstream }, ...(m.routes || [])];
                       const fallbacks = routes.slice(1);
+                      const priceBits: string[] = [];
+                      if (m.pricing_known) priceBits.push(m.kind === 'embeddings' ? `${m.pricing_input} in · $/1M tokens` : `${m.pricing_input} in / ${m.pricing_output} out · $/1M tokens`);
+                      if (m.pricing_image != null) priceBits.push(`$${m.pricing_image} / image`);
+                      if (priceBits.length === 0 && m.image_prices?.variants?.length) {
+                        priceBits.push(`${m.image_prices.variants.length} image price variant${m.image_prices.variants.length === 1 ? '' : 's'}`);
+                      }
+                      if (priceBits.length === 0 && m.image_prices && ['text_input', 'image_input', 'text_output', 'image_output'].some((k) => m.image_prices?.[k as 'text_input'] !== undefined)) priceBits.push('Text/image token components');
+                      if (m.image_prices?.unsupported_conditions) priceBits.push('Incomplete conditions · cost unknown');
+                      const priceLabel = priceBits.length ? priceBits.join(' · ') : 'Pricing unknown';
                       return (
                         <TableRow key={m.id} className={selectedModels.includes(m.id) || editModel?.id === m.id ? 'bg-primary/5' : ''}>
                           <TableCell className="py-5 pl-5 align-top">
@@ -418,8 +427,11 @@ export default function Admin({ state, section }: TabProps & { section: Section 
                               <div className="break-all text-xs font-medium text-foreground">{m.id}</div>
                               <div className="mt-1 break-words text-[11px] text-muted-foreground">{m.name || m.upstream}</div>
                               <div className="mt-3 flex flex-wrap gap-1.5">
-                                <Badge variant="outline" className={m.pricing_known ? 'border-chart-4/30 text-chart-4 font-normal normal-case' : 'border-edge-600 text-muted-foreground font-normal normal-case'}>
-                                  {m.pricing_known ? `${m.pricing_input} in / ${m.pricing_output} out · $/1M` : 'Pricing unknown'}
+                                <Badge variant="outline" className="border-chart-2/40 font-normal normal-case text-chart-2">
+                                  {m.kind === 'images' ? 'image' : m.kind === 'embeddings' ? 'embedding' : m.kind === 'chat' ? 'chat' : m.kind === 'systemone' ? 'System One' : m.operations?.length ? m.operations.join(' + ') : 'kind unknown / unrestricted'}
+                                </Badge>
+                                <Badge variant="outline" className={priceBits.length ? 'border-chart-4/30 text-chart-4 font-normal normal-case' : 'border-edge-600 text-muted-foreground font-normal normal-case'}>
+                                  {priceLabel}
                                 </Badge>
                                 {m.has_meta && <Badge variant="outline" className="border-chart-2/40 text-chart-2">metadata</Badge>}
                               </div>

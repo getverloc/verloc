@@ -1,11 +1,11 @@
 import { useState, type Dispatch, type SetStateAction } from 'react';
 import { upsertAdminModel, type AdminModel, type AdminProvider } from '../../api';
-import type { EditorActions } from './shared';
+import { hasPriceField, type EditorActions } from './shared';
 import type { ModelCapabilitiesDraft } from './ModelCapabilities';
 
-type ModelDraft = Partial<Omit<AdminModel, 'context_window' | 'max_tokens' | 'pricing_input' | 'pricing_output' | 'pricing_cache'>> & ModelCapabilitiesDraft & {
+type ModelDraft = Partial<Omit<AdminModel, 'context_window' | 'max_tokens' | 'pricing_input' | 'pricing_output' | 'pricing_cache' | 'pricing_image'>> & ModelCapabilitiesDraft & {
   id: string; context_window?: string; max_tokens?: string;
-  pricing_input?: string; pricing_output?: string; pricing_cache?: string;
+  pricing_input?: string; pricing_output?: string; pricing_cache?: string; pricing_image?: string;
   tags_text: string;
 };
 
@@ -34,6 +34,12 @@ export function useModelEditor({ providers, models, run, setErr, setConfirm }: E
       return;
     }
     const existing = models.find((model) => model.id === editModel.id.trim());
+    for (const value of [editModel.pricing_input, editModel.pricing_output, editModel.pricing_cache, editModel.pricing_image]) {
+      if (value?.trim() && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
+        setErr('Prices must be finite, non-negative USD values');
+        return;
+      }
+    }
     const routingChanged = existing && (existing.backend !== editModel.backend || existing.upstream !== editModel.upstream || JSON.stringify(existing.routes || []) !== JSON.stringify(editModel.routes || []));
     const body = {
       id: editModel.id.trim(),
@@ -59,6 +65,9 @@ export function useModelEditor({ providers, models, run, setErr, setConfirm }: E
       ...(editModel.pricing_input?.trim() ? { pricing_input: Number(editModel.pricing_input) } : {}),
       ...(editModel.pricing_output?.trim() ? { pricing_output: Number(editModel.pricing_output) } : {}),
       ...(editModel.pricing_cache?.trim() ? { pricing_cache: Number(editModel.pricing_cache) } : {}),
+      ...(editModel.pricing_image?.trim() ? { pricing_image: Number(editModel.pricing_image) } : { clear_image_price: true }),
+      image_prices: editModel.image_prices || {},
+      ...(editModel.operations !== undefined ? { operations: editModel.operations } : {}),
     };
     if (routingChanged || (existing && !originalModelID)) {
       setConfirm({
@@ -77,7 +86,7 @@ export function useModelEditor({ providers, models, run, setErr, setConfirm }: E
     setEditModel({
       id: '', backend: providers[0]?.name || '', upstream: '',
       name: '', context_window: '', max_tokens: '', tags_text: '',
-      pricing_input: '', pricing_output: '', pricing_cache: '',
+      pricing_input: '', pricing_output: '', pricing_cache: '', pricing_image: '',
     });
   };
   const edit = (model: AdminModel) => {
@@ -86,9 +95,10 @@ export function useModelEditor({ providers, models, run, setErr, setConfirm }: E
       ...model, tags_text: (model.tags || []).join(', '),
       context_window: model.context_window ? String(model.context_window) : '',
       max_tokens: model.max_tokens ? String(model.max_tokens) : '',
-      pricing_input: model.pricing_known ? String(model.pricing_input) : '',
-      pricing_output: model.pricing_known ? String(model.pricing_output) : '',
-      pricing_cache: model.pricing_known ? String(model.pricing_cache) : '',
+      pricing_input: hasPriceField(model, 'input') ? String(model.pricing_input) : '',
+      pricing_output: hasPriceField(model, 'output') ? String(model.pricing_output) : '',
+      pricing_cache: hasPriceField(model, 'cache_read') ? String(model.pricing_cache) : '',
+      pricing_image: model.pricing_image != null ? String(model.pricing_image) : '',
     });
   };
   return { editModel, setEditModel, originalModelID, saveModel, startNew, edit };

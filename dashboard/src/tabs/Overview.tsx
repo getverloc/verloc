@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ratePerSec, fmtInt, fmtMoney, fmtTokens, fmtMs,
-  getAnalytics, type TabProps, type Analytics,
+  type TabProps,
 } from '../api';
 import { rollupSeries, fmtSpan } from '../window';
+import { useWindowAnalytics } from '../useWindowAnalytics';
 import { Badge } from '../components/ui/badge';
 import { Card, CardContent } from '../components/ui/card';
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '../components/ui/empty';
@@ -17,36 +18,11 @@ import {
 
 export default function Overview({ state, series, range }: TabProps) {
   const [chartRange, setChartRange] = useState<ChartRangeKey>('30d');
-  const [detail, setDetail] = useState<Analytics | null>(null);
-  const [detailError, setDetailError] = useState('');
-  const [detailRound, setDetailRound] = useState(0);
-
-  useEffect(() => {
-    let stopped = false;
-    let inFlight = false;
-    const controller = new AbortController();
-    setDetail(null);
-    setDetailError('');
-    const load = async () => {
-      if (inFlight || stopped) return;
-      inFlight = true;
-      const query = new URLSearchParams();
-      if (range.ms !== null) query.set('since', String(Date.now() - range.ms));
-      try {
-        const response = await getAnalytics(query, controller.signal);
-        if (!stopped) { setDetail(response); setDetailError(''); }
-      } catch (e) {
-        if (!stopped) setDetailError(e instanceof Error ? e.message : 'Detailed latency unavailable');
-      } finally { inFlight = false; }
-    };
-    void load();
-    const timer = setInterval(load, 15000);
-    return () => { stopped = true; controller.abort(); clearInterval(timer); };
-  }, [range, detailRound]);
+  const { data: detail, error: detailError, retry: retryDetail } = useWindowAnalytics(range);
 
   const days = CHART_RANGES.find((r) => r.value === chartRange)?.days ?? 30;
   const windowed = useMemo(() => filterSeriesByDays(series, days), [series, days]);
-  const roll = useMemo(() => rollupSeries(windowed), [windowed]);
+  const roll = useMemo(() => rollupSeries(series), [series]);
 
   const rps = ratePerSec(state?.delta?.requests ?? 0, state?.delta?.d_ms || 3000);
   const errRate = roll.requests > 0 ? (roll.err / roll.requests) * 100 : 0;
@@ -77,14 +53,15 @@ export default function Overview({ state, series, range }: TabProps) {
         </CardContent>
       </Card>
 
-      <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-3 xl:grid-cols-6 [&>*]:border-0">
+      <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-3 xl:grid-cols-7 [&>*]:border-0">
         {booting ? (
-          Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-[86px]" />)
+          Array.from({ length: 7 }).map((_, i) => <Skeleton key={i} className="h-[86px]" />)
         ) : (
           <>
             <KpiCard label="Requests" value={fmtInt(roll.requests)} sub={`${rps.toFixed(2)}/s now`} />
             <KpiCard label="Known spend" value={fmtMoney(roll.cost)} sub={`lifetime ${fmtMoney(state?.lifetime?.cost ?? 0)}`} accent="text-chart-4" />
             <KpiCard label="Tokens" value={fmtTokens(roll.tokIn + roll.tokOut)} sub={`${fmtTokens(roll.tokIn)} in · ${fmtTokens(roll.tokOut)} out`} />
+            <KpiCard label="Generated images" value={detail ? fmtInt(detail.summary.images) : '—'} sub={detail ? `${fmtInt(detail.summary.unknown_images)} image requests with unknown count` : 'Durable request detail'} accent="text-chart-5" />
             <KpiCard label="Error rate" value={`${errRate.toFixed(1)}%`} sub={`${fmtInt(roll.err)} errors`} accent={errRate > 0 ? 'text-destructive' : 'text-primary'} />
             <KpiCard
               label="Latency p95"
@@ -106,10 +83,11 @@ export default function Overview({ state, series, range }: TabProps) {
           Latency and TTFT use durable request distributions, not averaged snapshot percentiles.
           Unknown usage and missing prices are not zero; inspect coverage in Analytics.
         </p>
-        {detail && (detail.summary.unknown_usage > 0 || detail.summary.unknown_cost > 0) && (
+        {detail && (detail.summary.unknown_usage > 0 || detail.summary.unknown_cost > 0 || detail.summary.unknown_images > 0) && (
           <p>
             <Badge variant="outline" className="whitespace-normal border-chart-4/40 text-chart-4">
               {fmtInt(detail.summary.unknown_usage)} requests with unknown usage · {fmtInt(detail.summary.unknown_cost)} with unknown cost
+              {detail.summary.unknown_images > 0 ? ` · ${fmtInt(detail.summary.unknown_images)} image requests with unknown count` : ''}
             </Badge>
           </p>
         )}
@@ -119,7 +97,7 @@ export default function Overview({ state, series, range }: TabProps) {
             and latency distributions are unavailable for that legacy period.
           </p>
         )}
-        {detailError && <InlineError message={`${detailError}. Retrying automatically.`} onRetry={() => setDetailRound((v) => v + 1)} />}
+        {detailError && <InlineError message={`${detailError}. Retrying automatically.`} onRetry={retryDetail} />}
       </div>
 
       <PanelCard title="Traffic / known spend" description={`Requests and known cost per snapshot tick · ${chartRange} chart range`} action={<Badge variant="outline">Snapshot series</Badge>}>

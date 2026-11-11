@@ -343,6 +343,14 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 		models[i].Hint = mergeDiscoveredModelHint(models[i].Hint, hints[models[i].ID])
 	}
 	log.Printf("[admin] discover models=%d dur=%v", len(models), time.Since(start))
+	for i := range models {
+		if conn.apiFormat == "systemone" || isCloudflareClef(conn.baseURL, models[i].ID) {
+			if models[i].Hint == nil {
+				models[i].Hint = &modelHint{}
+			}
+			models[i].Hint.Type, models[i].Hint.Operations = "systemone", nil
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": models, "count": len(models)})
 }
 
@@ -428,8 +436,10 @@ func (s *Server) handleAdminModelHints(w http.ResponseWriter, r *http.Request) {
 
 type testReq struct {
 	probeReq
-	Upstream  string `json:"upstream"`
-	MaxTokens int    `json:"max_tokens"`
+	Upstream          string `json:"upstream"`
+	MaxTokens         int    `json:"max_tokens"`
+	Operation         string `json:"operation"`
+	ConfirmImageSpend bool   `json:"confirm_image_spend"`
 }
 
 func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
@@ -445,11 +455,30 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "upstream is required")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	operation := strings.ToLower(strings.TrimSpace(req.Operation))
+	switch operation {
+	case "chat", "embeddings", "images":
+	default:
+		writeErr(w, http.StatusBadRequest, "select a supported test operation: chat, embeddings, or images")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
+	if operation == "images" && !req.ConfirmImageSpend {
+		writeErr(w, http.StatusBadRequest, "image test generates one image and may consume provider credits; confirm image spend")
+		return
+	}
 	conn, err := s.resolveProbeConn(ctx, req.probeReq)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	providerName := req.Provider
+	if providerName == "" {
+		providerName = req.Backend
+	}
+	if providerName != "" && !targetSupportsOperation(s.runtime().cfg, RouteTarget{Backend: providerName, Upstream: upstream}, operation) {
+		writeErr(w, http.StatusBadRequest, "saved model metadata does not support this test operation")
 		return
 	}
 	maxTokens := req.MaxTokens
@@ -460,8 +489,15 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		maxTokens = 64
 	}
 	endpoint := "/chat/completions"
-	if conn.apiFormat == "systemone" || isCloudflareClef(conn.baseURL, upstream) {
-		endpoint = "/systemone"
+	switch operation {
+	case "embeddings":
+		endpoint = "/embeddings"
+	case "images":
+		endpoint = "/images/generations"
+	default:
+		if conn.apiFormat == "systemone" || isCloudflareClef(conn.baseURL, upstream) {
+			endpoint = "/systemone"
+		}
 	}
 	targetURL, model, cloudflareEnvelope, err := inferenceTarget(conn.baseURL, conn.apiFormat, upstream, endpoint)
 	if err != nil {
@@ -469,20 +505,28 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload []byte
-	if endpoint == "/systemone" {
+	switch endpoint {
+	case "/systemone":
 		payload, _ = json.Marshal(map[string]any{
 			"model": model, "state": "This is a connectivity check.",
 			"questions": map[string]any{"reachable": map[string]string{
 				"type": "noul", "instructions": "Is this a connectivity check?",
 			}},
 		})
-	} else {
+	case "/embeddings":
+		payload, _ = json.Marshal(map[string]any{"model": model, "input": []string{"verloc connectivity check"}})
+	case "/images/generations":
+		payload, _ = json.Marshal(map[string]any{
+			"model": model, "prompt": "A simple connectivity test: one small green square centered on a white background.",
+			"n": 1,
+		})
+	default:
 		payload, _ = json.Marshal(map[string]any{
 			"model": model, "messages": []map[string]string{{"role": "user", "content": "Reply with the word PONG"}},
 			"max_tokens": maxTokens, "stream": false,
 		})
 	}
-	client := probeClient(30, conn.allowPrivate)
+	client := probeClient(45, conn.allowPrivate)
 	defer client.CloseIdleConnections()
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.ReplaceAll(targetURL, "%ACCOUNT%", conn.accountID), bytes.NewReader(payload))
 	if err != nil {
@@ -493,17 +537,31 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	upReq.Header.Set("Content-Type", "application/json")
 	start := time.Now()
 	resp, err := client.Do(upReq)
+	limit := int64(1 << 18)
+	if operation != "chat" {
+		// Image payloads are base64 and legitimately exceed 256 KiB; the bytes
+		// are validated and discarded, never stored or returned.
+		limit = 16 << 20
+	}
 	var body []byte
+	oversized := false
 	if err == nil {
 		defer resp.Body.Close()
-		body, err = io.ReadAll(io.LimitReader(resp.Body, 1<<18))
+		body, err = io.ReadAll(io.LimitReader(resp.Body, limit+1))
+		if err == nil && int64(len(body)) > limit {
+			oversized = true
+			err = fmt.Errorf("%s response exceeds %d bytes", operation, limit)
+		}
 	}
 	if err != nil {
-		log.Printf("[admin] test upstream=%s err=%v", upstream, err)
+		log.Printf("[admin] test upstream=%s kind=%s err=%v", upstream, operation, err)
+		message, hint := "upstream unreachable", "verloc cannot reach the base_url — check the URL and network"
+		if oversized {
+			message, hint = fmt.Sprintf("%s response exceeds %d bytes", operation, limit), "the test validates but never stores media; use a smaller image size"
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "status": 0, "latency_ms": time.Since(start).Milliseconds(),
-			"error": "upstream unreachable",
-			"hint":  "verloc cannot reach the base_url — check the URL and network",
+			"ok": false, "status": 0, "latency_ms": time.Since(start).Milliseconds(), "kind": operation,
+			"error": message, "hint": hint,
 		})
 		return
 	}
@@ -513,11 +571,34 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		if msg == "" {
 			msg = fmt.Sprintf("upstream status %d", resp.StatusCode)
 		}
-		log.Printf("[admin] test upstream=%s status=%d", upstream, resp.StatusCode)
+		log.Printf("[admin] test upstream=%s kind=%s status=%d", upstream, operation, resp.StatusCode)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "status": resp.StatusCode, "latency_ms": latMs,
+			"ok": false, "status": resp.StatusCode, "latency_ms": latMs, "kind": operation,
 			"error": truncate(msg, 300), "hint": testHint(resp.StatusCode, string(body)),
 		})
+		return
+	}
+	if operation != "chat" {
+		usage, err := readMediaResponse(bytes.NewReader(body), operation)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": false, "status": http.StatusBadGateway, "latency_ms": latMs, "kind": operation,
+				"error": "upstream returned an invalid " + operation + " response",
+			})
+			return
+		}
+		result := map[string]any{
+			"ok": true, "status": 200, "latency_ms": latMs, "kind": operation,
+			"usage_known": usage.TokensKnown, "tok_in": usage.Input, "tok_out": usage.Output,
+		}
+		if operation == "images" {
+			result["images"], result["images_known"] = usage.Images, usage.ImagesKnown
+		}
+		if usage.EmbeddingDimensions > 0 {
+			result["dimensions"] = usage.EmbeddingDimensions
+		}
+		log.Printf("[admin] test upstream=%s kind=%s ok lat=%dms", upstream, operation, latMs)
+		writeJSON(w, http.StatusOK, result)
 		return
 	}
 	reply := chatReply(body)
@@ -525,7 +606,7 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		native, err := systemOneResponse(body, cloudflareEnvelope)
 		if err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{
-				"ok": false, "status": http.StatusBadGateway, "latency_ms": latMs,
+				"ok": false, "status": http.StatusBadGateway, "latency_ms": latMs, "kind": operation,
 				"error": "upstream returned an invalid System One response",
 			})
 			return
@@ -536,9 +617,9 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(native, &result)
 		reply = string(result.Answers)
 	}
-	log.Printf("[admin] test upstream=%s ok lat=%dms", upstream, latMs)
+	log.Printf("[admin] test upstream=%s kind=%s ok lat=%dms", upstream, operation, latMs)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "status": 200, "latency_ms": latMs,
+		"ok": true, "status": 200, "latency_ms": latMs, "kind": operation,
 		"reply": truncate(reply, 200),
 	})
 }

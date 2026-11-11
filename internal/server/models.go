@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"log"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -45,13 +46,27 @@ type modelInfo struct {
 	Knowledge         string         `json:"knowledge,omitempty"`
 	Status            string         `json:"status,omitempty"`
 	Modalities        map[string]any `json:"modalities,omitempty"`
+	Operations        []string       `json:"operations,omitempty"`
+	ImagePrices       *ImagePricing  `json:"image_prices,omitempty"`
+}
+
+func (m modelInfo) MarshalJSON() ([]byte, error) {
+	type fields modelInfo
+	v := struct {
+		fields
+		Rates *pricingPer1M `json:"pricing_per_million,omitempty"`
+	}{fields: fields(m)}
+	if m.PricingKnown {
+		v.Rates = &m.PricingPerMillion
+	}
+	return json.Marshal(v)
 }
 
 // pricingOR is the OpenRouter-compatible per-token pricing. Values are JSON
 // strings (per OpenRouter's schema) to make the unit unambiguous.
 type pricingOR struct {
-	Prompt          string `json:"prompt"`
-	Completion      string `json:"completion"`
+	Prompt          string `json:"prompt,omitempty"`
+	Completion      string `json:"completion,omitempty"`
 	InputCacheRead  string `json:"input_cache_read,omitempty"`
 	InputCacheWrite string `json:"input_cache_write,omitempty"`
 	Request         string `json:"request,omitempty"`
@@ -63,15 +78,41 @@ type pricingOR struct {
 // dashboard's cost calculator. Includes optional tier arrays for models
 // whose rate changes after a token threshold.
 type pricingPer1M struct {
-	Input               float64 `json:"input"`
-	Output              float64 `json:"output"`
-	CacheRead           float64 `json:"cache_read"`
-	Currency            string  `json:"currency"`
-	Per                 string  `json:"per"`
-	InputTiers          []any   `json:"input_tiers,omitempty"`
-	OutputTiers         []any   `json:"output_tiers,omitempty"`
-	InputCacheReadTiers []any   `json:"input_cache_read_tiers,omitempty"`
-	WebSearch           float64 `json:"web_search,omitempty"`
+	Input               float64  `json:"input"`
+	Output              float64  `json:"output"`
+	CacheRead           float64  `json:"cache_read"`
+	Currency            string   `json:"currency"`
+	Per                 string   `json:"per"`
+	InputTiers          []any    `json:"input_tiers,omitempty"`
+	OutputTiers         []any    `json:"output_tiers,omitempty"`
+	InputCacheReadTiers []any    `json:"input_cache_read_tiers,omitempty"`
+	WebSearch           float64  `json:"web_search,omitempty"`
+	Fields              []string `json:"-"`
+}
+
+func (p pricingPer1M) MarshalJSON() ([]byte, error) {
+	type fields pricingPer1M
+	b, err := json.Marshal(fields(p))
+	if err != nil || p.Fields == nil {
+		return b, err
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"input", "output", "cache_read"} {
+		if !slices.Contains(p.Fields, key) {
+			delete(out, key)
+		}
+	}
+	return json.Marshal(out)
+}
+
+func modelPriceFieldKnown(meta *ModelMeta, field string) bool {
+	if meta.PricingFields != nil {
+		return slices.Contains(meta.PricingFields, field)
+	}
+	return meta.PricingKnown == nil || *meta.PricingKnown
 }
 
 type modelCatalog struct {
@@ -112,7 +153,7 @@ func (c *modelCatalog) rebuildLocked() {
 		// pricing data (an explicit "0" is a real free price; blank means
 		// unknown). Force-marking every row billed unpriced models at $0,
 		// violating the project's unknown ≠ zero rule.
-		m.PricingKnown = m.PricingKnown || m.Pricing.Prompt != "" || m.Pricing.Completion != ""
+		m.PricingKnown = m.PricingKnown || m.Pricing.Prompt != "" && (m.Pricing.Completion != "" || modelKind(m.Type) == "embeddings")
 		c.byID[m.ID] = m
 		if m.PricingKnown {
 			c.pricing[m.ID] = m.PricingPerMillion
@@ -246,29 +287,49 @@ func metaToModelInfo(id string, meta *ModelMeta, mapVal string) modelInfo {
 		CacheRead: meta.PricingCache,
 		Currency:  "USD",
 		Per:       "1M tokens",
+		Fields:    meta.PricingFields,
+	}
+	var prices pricingOR
+	if modelPriceFieldKnown(meta, "input") {
+		prices.Prompt = per1MString(meta.PricingInput)
+	}
+	if modelPriceFieldKnown(meta, "output") {
+		prices.Completion = per1MString(meta.PricingOutput)
+	}
+	if modelPriceFieldKnown(meta, "cache_read") {
+		prices.InputCacheRead = per1MString(meta.PricingCache)
+	}
+	typeName := ""
+	if len(meta.Operations) == 1 {
+		switch meta.Operations[0] {
+		case "chat":
+			typeName = "language"
+		case "images":
+			typeName = "image"
+		case "embeddings":
+			typeName = "embedding"
+		}
 	}
 	return modelInfo{
-		ID:            id,
-		Object:        "model",
-		Created:       time.Now().Unix(),
-		OwnedBy:       owned,
-		Upstream:      upstream,
-		ContextWindow: meta.ContextWindow,
-		MaxTokens:     meta.MaxTokens,
-		Type:          "language",
-		Name:          name,
-		Description:   meta.Description,
-		Tags:          meta.Tags,
-		Attachment:    meta.Attachment,
-		Reasoning:     meta.Reasoning,
-		Temperature:   meta.Temperature,
-		Modalities:    meta.Modalities,
-		PricingKnown:  meta.PricingKnown == nil || *meta.PricingKnown,
-		Pricing: pricingOR{
-			Prompt:         per1MString(meta.PricingInput),
-			Completion:     per1MString(meta.PricingOutput),
-			InputCacheRead: per1MString(meta.PricingCache),
-		},
+		ID:                id,
+		Object:            "model",
+		Created:           time.Now().Unix(),
+		OwnedBy:           owned,
+		Upstream:          upstream,
+		ContextWindow:     meta.ContextWindow,
+		MaxTokens:         meta.MaxTokens,
+		Type:              typeName,
+		Name:              name,
+		Description:       meta.Description,
+		Tags:              meta.Tags,
+		Attachment:        meta.Attachment,
+		Reasoning:         meta.Reasoning,
+		Temperature:       meta.Temperature,
+		Modalities:        meta.Modalities,
+		Operations:        meta.Operations,
+		ImagePrices:       meta.ImagePrices,
+		PricingKnown:      meta.PricingKnown == nil || *meta.PricingKnown,
+		Pricing:           prices,
 		PricingPerMillion: per1M,
 	}
 }
@@ -317,7 +378,8 @@ func (m *ModelMeta) UnmarshalJSON(data []byte) error {
 		}
 		input, hasInput := fields["pricing_input"]
 		output, hasOutput := fields["pricing_output"]
-		known := hasInput && hasOutput && string(input) != "null" && string(output) != "null"
+		embeddingOnly := len(decoded.Operations) == 1 && decoded.Operations[0] == "embeddings"
+		known := hasInput && string(input) != "null" && ((hasOutput && string(output) != "null") || embeddingOnly)
 		decoded.PricingKnown = &known
 	}
 	*m = ModelMeta(decoded)

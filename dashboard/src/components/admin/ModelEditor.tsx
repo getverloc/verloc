@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { lookupModelHints, type AdminModel, type AdminProvider } from '../../api';
 import { toast } from 'sonner';
+import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card';
 import { Checkbox } from '../ui/checkbox';
@@ -11,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Separator } from '../ui/separator';
 import { Textarea } from '../ui/textarea';
 import { Check, Search } from 'lucide-react';
-import { fillMetaGaps, findCatalogMatch, metaFromHint, metaFromMatch, revealForm, type EditorActions } from './shared';
+import { fillModelDraftGaps, fillMetaGaps, findCatalogMatch, metaFromHint, metaFromMatch, revealForm, type EditorActions } from './shared';
 import { ModelCapabilities } from './ModelCapabilities';
 import type { ModelEditorState } from './useModelEditor';
 
@@ -34,6 +35,14 @@ export function ModelEditor({ editModel, setEditModel, originalModelID, saveMode
               <CardHeader className="gap-2 border-b border-edge-700 bg-edge-950 p-5">
                 <p className="text-[10px] uppercase tracking-[0.16em] text-chart-3">Model editor</p>
                 <CardTitle className="break-all text-base">{editingExistingModel ? editModel.id : 'New model route'}</CardTitle>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline" className="border-chart-2/40 font-normal text-chart-2">
+                    {(editModel.operations || []).length === 1
+                      ? editModel.operations![0] === 'images' ? 'image' : editModel.operations![0] === 'embeddings' ? 'embedding' : 'chat'
+                      : 'kind unknown / unrestricted'}
+                  </Badge>
+                  {(editModel.operations || []).length > 0 && <span className="text-[10px] text-muted-foreground">endpoints / {editModel.operations!.join(', ')}</span>}
+                </div>
                 <CardDescription className="text-[11px] leading-relaxed">Stage routing and metadata here, then save to apply live. Guided add can discover and prefill models.</CardDescription>
               </CardHeader>
               <CardContent className="space-y-5 p-5">
@@ -81,13 +90,12 @@ export function ModelEditor({ editModel, setEditModel, originalModelID, saveMode
                         const local = metaFromMatch(upstream, findCatalogMatch(upstream, models, editModel.backend || ''));
                         const hint = result.hints[upstream];
                         if (!hint && !local.src) { setErr(`No metadata found for ${upstream}`); return; }
-                        const meta = hint ? fillMetaGaps(upstream, metaFromHint(upstream, hint), local) : local;
-                        setEditModel((current) => !current || current.upstream?.trim() !== upstream ? current : {
-                          ...current, name: meta.dn, description: meta.description, owned_by: meta.owned_by,
-                          tags: meta.tags, tags_text: meta.tags.join(', '), context_window: meta.ctx, max_tokens: meta.mx,
-                          pricing_input: meta.pi, pricing_output: meta.po, pricing_cache: meta.pc,
-                        });
-                        toast.success(`Metadata loaded from ${meta.src}`);
+                        const meta = hint ? fillMetaGaps(upstream, local, metaFromHint(upstream, hint)) : local;
+                        if (meta.kind && !['chat', 'images', 'embeddings', 'systemone'].includes(meta.kind)) {
+                          setErr(`Unsupported model kind: ${meta.kind}. Metadata was not applied.`); return;
+                        }
+                        setEditModel((current) => !current || current.upstream?.trim() !== upstream || current.backend !== editModel.backend ? current : fillModelDraftGaps(current, meta));
+                        toast.success(`Empty fields filled from ${meta.src}; existing values preserved`);
                       } catch (error) {
                         setErr(error instanceof Error ? error.message : 'Metadata lookup failed');
                       } finally {
@@ -97,7 +105,7 @@ export function ModelEditor({ editModel, setEditModel, originalModelID, saveMode
                   >
                     <Search className="size-3.5" />Lookup catalog
                   </Button>
-                  <span className="min-w-0 basis-40 flex-1 text-[11px] leading-relaxed text-muted-foreground">Match the upstream ID to prefill name, limits, and known pricing.</span>
+                  <span className="min-w-0 basis-40 flex-1 text-[11px] leading-relaxed text-muted-foreground">Fill empty fields only. Existing values, including zero prices and explicit capability overrides, are preserved.</span>
                 </div>
                 <Field>
                   <FieldLabel htmlFor="em-name">Display name</FieldLabel>
@@ -162,32 +170,91 @@ export function ModelEditor({ editModel, setEditModel, originalModelID, saveMode
                 <p className="border-b border-edge-700 pb-2 text-[10px] uppercase tracking-[0.14em] text-chart-2">03 / Context + output limits</p>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <Field>
-                    <FieldLabel htmlFor="em-context">Context window</FieldLabel>
+                    <FieldLabel htmlFor="em-context">{editModel.operations?.[0] === 'embeddings' ? 'Max input tokens' : 'Context window (tokens)'}</FieldLabel>
                     <Input id="em-context" value={editModel.context_window ?? ''} onChange={(e) => setEditModel({ ...editModel, context_window: e.target.value })} inputMode="numeric" className="font-mono" />
                   </Field>
-                  <Field>
+                  {!(editModel.operations?.length === 1 && editModel.operations[0] === 'embeddings') && <Field>
                     <FieldLabel htmlFor="em-max-tokens">Max output tokens</FieldLabel>
                     <Input id="em-max-tokens" value={editModel.max_tokens ?? ''} onChange={(e) => setEditModel({ ...editModel, max_tokens: e.target.value })} inputMode="numeric" className="font-mono" />
-                  </Field>
+                  </Field>}
                 </div>
                 <div className="space-y-2 border-b border-edge-700 pb-3">
                   <p className="text-[10px] uppercase tracking-[0.14em] text-chart-4">04 / Pricing per million tokens</p>
-                  <p className="text-[11px] leading-relaxed text-muted-foreground">Leave prices blank when unknown. Enter zero only when the provider explicitly offers free usage.</p>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">Leave prices blank when unknown. Enter zero only when the provider explicitly offers free usage. Embeddings need only an input rate; image models can use a flat image rate, exact variants, or token rates.</p>
                 </div>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <Field>
                     <FieldLabel htmlFor="em-price-input">Price in $/1M</FieldLabel>
                     <Input id="em-price-input" value={editModel.pricing_input ?? ''} onChange={(e) => setEditModel({ ...editModel, pricing_input: e.target.value })} inputMode="decimal" className="font-mono" />
                   </Field>
-                  <Field>
+                  {!(editModel.operations?.length === 1 && editModel.operations[0] === 'embeddings') && <Field>
                     <FieldLabel htmlFor="em-price-output">Out $/1M</FieldLabel>
                     <Input id="em-price-output" value={editModel.pricing_output ?? ''} onChange={(e) => setEditModel({ ...editModel, pricing_output: e.target.value })} inputMode="decimal" className="font-mono" />
-                  </Field>
+                  </Field>}
                   <Field>
                     <FieldLabel htmlFor="em-price-cache">Cache $/1M</FieldLabel>
                     <Input id="em-price-cache" value={editModel.pricing_cache ?? ''} onChange={(e) => setEditModel({ ...editModel, pricing_cache: e.target.value })} inputMode="decimal" className="font-mono" />
                   </Field>
+                  <Field>
+                    <FieldLabel htmlFor="em-price-image">Image $/image</FieldLabel>
+                    <Input id="em-price-image" value={editModel.pricing_image ?? ''} onChange={(e) => setEditModel({ ...editModel, pricing_image: e.target.value })} inputMode="decimal" className="font-mono" />
+                    <FieldDescription>Flat rate per returned image. Blank removes this rate; zero is explicitly free.</FieldDescription>
+                  </Field>
                 </div>
+                <div className="space-y-2 border-b border-edge-700 pb-3">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-chart-5">05 / Endpoints</p>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">No selection allows every endpoint. Restrict when a provider exposes only some operations.</p>
+                </div>
+                <div className="flex flex-wrap gap-5">
+                  {(['chat', 'embeddings', 'images'] as const).map((op) => (
+                    <label key={op} className="flex items-center gap-2 text-xs text-edge-100">
+                      <Checkbox
+                        checked={(editModel.operations || []).includes(op)}
+                        onCheckedChange={(checked) => {
+                          const next = new Set(editModel.operations || []);
+                          if (checked) next.add(op); else next.delete(op);
+                          setEditModel({ ...editModel, operations: Array.from(next) });
+                        }}
+                      />
+                      {op}
+                    </label>
+                  ))}
+                </div>
+                <details className="border border-edge-700 bg-edge-950 p-4">
+                  <summary className="cursor-pointer text-[11px] font-medium text-chart-4">Image pricing · variants and token breakdown</summary>
+                  <div className="mt-3 space-y-4 border-t border-edge-700 pt-4">
+                    {editModel.image_prices?.unsupported_conditions && <div role="alert" className="space-y-2 text-xs text-chart-4">
+                      <p>Catalog pricing has unsupported or conflicting conditions. Calculated image cost stays unknown until you review and replace those rates.</p>
+                      <Button variant="outline" size="sm" onClick={() => setEditModel({ ...editModel, image_prices: { ...editModel.image_prices, unsupported_conditions: false } })}>Use reviewed manual rates</Button>
+                    </div>}
+                    <p className="text-[11px] leading-relaxed text-muted-foreground">Pricing precedence: opted-in provider USD cost, most-specific size/quality variant, flat image rate, then token rates. Methods are alternatives, not added together. Missing quantities or unmatched/ambiguous variants stay unknown. A blank condition is unconstrained; a stated condition must match the request exactly.</p>
+                    {(editModel.image_prices?.variants || []).map((variant, index) => (
+                      <div key={index} className="grid min-w-0 grid-cols-1 gap-3 border-l-2 border-chart-4/40 pl-3 sm:grid-cols-3">
+                        {(['size', 'quality', 'price'] as const).map((field) => (
+                          <Field key={field}>
+                            <FieldLabel htmlFor={`em-variant-${index}-${field}`}>{field === 'price' ? 'USD / image' : field}</FieldLabel>
+                            <Input id={`em-variant-${index}-${field}`} value={variant[field]} onChange={(e) => setEditModel({ ...editModel, image_prices: { ...editModel.image_prices, variants: (editModel.image_prices?.variants || []).map((v, i) => i === index ? { ...v, [field]: e.target.value } : v) } })} />
+                          </Field>
+                        ))}
+                        <Button variant="outline" size="sm" onClick={() => setEditModel({ ...editModel, image_prices: { ...editModel.image_prices, variants: (editModel.image_prices?.variants || []).filter((_, i) => i !== index) } })}>Remove variant</Button>
+                      </div>
+                    ))}
+                    <Button variant="outline" size="sm" onClick={() => setEditModel({ ...editModel, image_prices: { ...editModel.image_prices, variants: [...(editModel.image_prices?.variants || []), { size: '', quality: '', price: '' }] } })}>Add image price variant</Button>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      {(['text_input', 'image_input', 'text_output', 'image_output'] as const).map((field) => (
+                        <Field key={field}>
+                          <FieldLabel htmlFor={`em-image-${field}`}>{field.replace('_', ' ')} $/1M tokens</FieldLabel>
+                          <Input id={`em-image-${field}`} inputMode="decimal" value={editModel.image_prices?.[field] ?? ''} onChange={(e) => setEditModel({ ...editModel, image_prices: { ...editModel.image_prices, [field]: e.target.value.trim() || undefined } })} />
+                        </Field>
+                      ))}
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">Breakdown rates require matching upstream text/image token details. Cached breakdowns are not estimated.</p>
+                    <Label className="flex cursor-pointer items-start gap-2 text-xs font-normal">
+                      <Checkbox checked={!!editModel.image_prices?.provider_cost} onCheckedChange={(v) => setEditModel({ ...editModel, image_prices: { ...editModel.image_prices, provider_cost: v === true } })} />
+                      Trust upstream usage.cost as USD (only when documented by this provider)
+                    </Label>
+                  </div>
+                </details>
                 <Separator />
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                   <div className="flex flex-wrap gap-2">

@@ -1,18 +1,20 @@
 import { useMemo, useState } from 'react';
 import { fmtInt, fmtMoney, fmtTokens, type TabProps } from '../api';
 import { rollupSeries, fmtSpan } from '../window';
+import { useWindowAnalytics } from '../useWindowAnalytics';
 import { Badge } from '../components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { Skeleton } from '../components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
 import { ModelCostBar, type CostBarMetric } from '../components/charts/ModelCostBar';
-import { KpiCard, PanelCard } from '../components/charts/shared';
+import { InlineError, KpiCard, PanelCard } from '../components/charts/shared';
 
 export default function Cost({ state, series, range }: TabProps) {
   const [metric, setMetric] = useState<CostBarMetric>('cost');
   const roll = useMemo(() => rollupSeries(series), [series]);
   const booting = !state;
+  const { data: detail, error, retry } = useWindowAnalytics(range);
 
   const modelRows = useMemo(() => Object.entries(roll.models).map(([name, m]) => ({
     name, cost: m.cost, requests: m.requests, tokens: m.tokIn + m.tokOut,
@@ -29,6 +31,12 @@ export default function Cost({ state, series, range }: TabProps) {
 
   return (
     <div className="space-y-5">
+      {error && <InlineError message={error} onRetry={retry} />}
+      <p className="text-[11px] text-muted-foreground">Snapshots retain reported tokens and known spend across all endpoints. Image quantities and missing-cost coverage come from durable request history, not reconstructed snapshots.</p>
+      <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 [&>*]:border-0">
+        <KpiCard label="Images / durable window" value={detail ? fmtInt(detail.summary.images) : '—'} sub={detail ? `${fmtInt(detail.summary.unknown_images)} requests with unknown image count` : 'Loading durable quantities'} accent="text-chart-5" />
+        <KpiCard label="Unknown cost / durable window" value={detail ? fmtInt(detail.summary.unknown_cost) : '—'} sub="Unknown is not zero or free" accent="text-chart-4" />
+      </div>
       <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-4 [&>*]:border-0">
         {booting ? (
           Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-[86px]" />)
@@ -54,7 +62,7 @@ export default function Cost({ state, series, range }: TabProps) {
                 <span className="cursor-help"><Badge variant="outline" className="border-chart-4/40 text-chart-4">Known</Badge></span>
               </TooltipTrigger>
               <TooltipContent>
-                Totals exclude missing usage and missing pricing. Unknown cost is not free usage.
+                Known spend can come from image counts, reported tokens or opted-in provider USD cost. Unknown cost is not free usage.
               </TooltipContent>
             </Tooltip>
             <Select value={metric} onValueChange={(v) => setMetric(v as CostBarMetric)}>

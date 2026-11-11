@@ -78,7 +78,7 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
     const local = findCatalogMatch(upstream, models, providerName);
     const base = metaFromMatch(upstream, local);
     const external = hint ? metaFromHint(upstream, hint) : null;
-    const meta = external ? fillMetaGaps(upstream, external, base) : base;
+    const meta = external ? fillMetaGaps(upstream, base, external) : base;
     setWIds((prev) => (prev[upstream] ? prev : { ...prev, [upstream]: id }));
     setWMeta((prev) => ({
       ...prev, [upstream]: prev[upstream] ? fillMetaGaps(upstream, prev[upstream], meta) : meta,
@@ -114,7 +114,7 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
       setWDiscovered(res.models || []);
       const sel: Record<string, boolean> = {};
       (res.models || []).forEach((m) => {
-        sel[m.id] = wSel[m.id] ?? true;
+        sel[m.id] = wSel[m.id] ?? (!m.hint?.type || ['chat', 'images', 'embeddings', 'systemone'].includes(m.hint.type));
         wizEnsureRow(m.id, name || 'xx', m.hint);
       });
       setWSel((prev) => ({ ...sel, ...prev }));
@@ -134,20 +134,41 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
   const wizFiltered = useMemo(() => {
     const q = wFilter.trim().toLowerCase();
     if (!q) return wDiscovered;
-    return wDiscovered.filter((m) => `${m.id} ${m.owned_by || ''}`.toLowerCase().includes(q));
+    return wDiscovered.filter((m) => `${m.id} ${m.owned_by || ''} ${m.hint?.type || ''} ${(m.hint?.tags || []).join(' ')}`.toLowerCase().includes(q));
   }, [wDiscovered, wFilter]);
 
   const wizAllFilteredSelected = wizFiltered.length > 0 && wizFiltered.every((m) => !!wSel[m.id]);
 
   const wizTestRow = (upstream: string) => {
-    const conn = wizProbeConn();
-    setWTesting((p) => ({ ...p, [upstream]: true }));
-    testUpstreamModel({ ...conn, upstream })
-      .then((res) => setWTests((p) => ({ ...p, [upstream]: res })))
-      .catch((e) => setWTests((p) => ({
-        ...p, [upstream]: { ok: false, status: 0, latency_ms: 0, error: (e as Error).message },
-      })))
-      .finally(() => setWTesting((p) => ({ ...p, [upstream]: false })));
+    const meta = wMeta[upstream] || emptyMeta(upstream);
+    if (!['chat', 'images', 'embeddings', 'systemone'].includes(meta.kind)) {
+      setWTests((p) => ({
+        ...p,
+        [upstream]: { ok: false, status: 0, latency_ms: 0, error: meta.kind ? `Detected kind “${meta.kind}” is not served by verloc` : 'Choose a model kind before testing' },
+      }));
+      return;
+    }
+    const operation = meta.kind === 'images' || meta.kind === 'embeddings' ? meta.kind : 'chat';
+    const run = () => {
+      const conn = wizProbeConn();
+      setWTesting((p) => ({ ...p, [upstream]: true }));
+      testUpstreamModel({ ...conn, upstream, operation, confirm_image_spend: operation === 'images' })
+        .then((res) => setWTests((p) => ({ ...p, [upstream]: res })))
+        .catch((e) => setWTests((p) => ({
+          ...p, [upstream]: { ok: false, status: 0, latency_ms: 0, error: (e as Error).message },
+        })))
+        .finally(() => setWTesting((p) => ({ ...p, [upstream]: false })));
+    };
+    if (operation === 'images') {
+      setConfirm({
+        title: `Generate one test image with ${upstream}?`,
+        body: 'This sends a real image request to the provider and may consume credits. One image is generated, validated, and discarded — never stored or returned.',
+        confirmLabel: 'Generate test image',
+        run,
+      });
+      return;
+    }
+    run();
   };
 
   const doWizBulkSave = async () => {
@@ -182,6 +203,11 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
             context_window: Number(meta.ctx) || 0,
             max_tokens: Number(meta.mx) || 0, ...(meta.pi.trim() ? { pricing_input: Number(meta.pi) } : {}),
             ...(meta.po.trim() ? { pricing_output: Number(meta.po) } : {}), ...(meta.pc.trim() ? { pricing_cache: Number(meta.pc) } : {}),
+            ...(meta.piImage.trim() ? { pricing_image: Number(meta.piImage) } : {}),
+            ...(meta.imagePrices ? { image_prices: meta.imagePrices } : {}),
+            ...(meta.ops.length ? { operations: meta.ops } : {}),
+            kind: meta.kind,
+            modalities: meta.modalities, attachment: meta.attachment, reasoning: meta.reasoning, temperature: meta.temperature,
           };
         }),
       });
@@ -217,6 +243,15 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
     if (rows.length === 0) {
       setWFetchErr('select at least one model');
       setWizStep(2);
+      return;
+    }
+    const unsupported = rows.filter((u) => {
+      const kind = wMeta[u]?.kind;
+      return !kind || !['chat', 'images', 'embeddings', 'systemone'].includes(kind);
+    });
+    if (unsupported.length > 0) {
+      setWFetchErr(`Choose a supported model kind, or remove these rows before saving: ${unsupported.join(', ')}`);
+      setWizStep(3);
       return;
     }
     for (const u of rows) {
@@ -485,6 +520,13 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
                           <TableCell>
                             <div className="max-w-64 break-all text-[11px] text-chart-2">{m.id}</div>
                             {m.owned_by && <div className="text-[10px] text-muted-foreground">{m.owned_by}</div>}
+                            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                              <Badge variant="outline" className="border-chart-2/40 font-normal normal-case text-chart-2">
+                                {m.hint?.type === 'images' ? 'image' : m.hint?.type === 'embeddings' ? 'embedding' : m.hint?.type === 'chat' ? 'chat' : m.hint?.type ? `unsupported / ${m.hint.type}` : 'kind unknown'}
+                              </Badge>
+                              {m.hint?.pricing_image !== undefined && <span className="text-[10px] text-chart-4">${m.hint.pricing_image}/img</span>}
+                              {m.hint?.pricing_input !== undefined && <span className="text-[10px] text-muted-foreground">${m.hint.pricing_input}/1M in</span>}
+                            </div>
                           </TableCell>
                           <TableCell>
                             {checked ? (
@@ -564,8 +606,10 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
               )}
               {wizSelectedUpstreams.map((u) => {
                 const meta = wMeta[u] || emptyMeta(u);
-                const setMeta = (patch: Partial<WizMeta>) =>
+                const setMeta = (patch: Partial<WizMeta>) => {
+                  setWFetchErr(null);
                   setWMeta((p) => ({ ...p, [u]: { ...meta, ...patch } }));
+                };
                 const t = wTests[u];
                 const testing = !!wTesting[u];
                 return (
@@ -574,18 +618,42 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
                       <div className="min-w-0 flex-1 basis-56">
                         <div className="break-all text-xs text-primary">{wIds[u] || u}</div>
                         <div className="mt-1 flex items-start gap-2 text-[11px] text-muted-foreground"><ArrowRight className="mt-0.5 size-3 shrink-0" /><span className="break-all">{wizProviderName}:{u}</span></div>
-                        {meta.src !== '' && <div className="mt-2 text-[10px] text-chart-3">Metadata source / {meta.src}</div>}
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <Badge variant="outline" className="border-chart-2/40 font-normal text-chart-2">
+                            {meta.kind === 'images' ? 'image generation' : meta.kind === 'embeddings' ? 'embeddings' : meta.kind === 'chat' ? 'chat' : meta.kind === 'systemone' ? 'System One' : meta.kind ? `unsupported / ${meta.kind}` : 'kind not detected'}
+                          </Badge>
+                          {meta.ops.length > 0 && <span className="text-[10px] text-muted-foreground">endpoints / {meta.ops.join(', ')}</span>}
+                          {meta.src !== '' && <span className="text-[10px] text-chart-3">source / {meta.src}</span>}
+                        </div>
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
                         {t && (t.ok
-                          ? <Badge variant="outline" className="border-primary/40 text-primary"><Check className="size-3" />{t.latency_ms}ms</Badge>
+                          ? <Badge variant="outline" className="border-primary/40 text-primary"><Check className="size-3" />{t.kind === 'images' ? `${t.images_known ? t.images : '?'} image` : t.kind === 'embeddings' ? `${t.dimensions || '?'} dims` : 'reply'} · {t.latency_ms}ms</Badge>
                           : <Badge variant="outline" className="border-destructive/40 text-destructive">fail · {t.status || 'err'}</Badge>)}
                         <Button variant="outline" size="xs" disabled={testing} onClick={() => wizTestRow(u)}>
                           <FlaskConical className="size-3" />{testing ? 'Testing…' : 'Test upstream'}
                         </Button>
-                        <Button variant="ghost" size="xs" onClick={() => setWSel((p) => ({ ...p, [u]: false }))}>remove</Button>
+                        <Button variant="ghost" size="xs" onClick={() => { setWFetchErr(null); setWSel((p) => ({ ...p, [u]: false })); }}>remove</Button>
                       </div>
                     </div>
+                    {meta.kind && !['chat', 'images', 'embeddings', 'systemone'].includes(meta.kind) && (
+                      <div className="border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs break-words text-destructive">
+                        Detected kind “{meta.kind}” is not served by verloc. Remove this row before saving.
+                      </div>
+                    )}
+                    {(!meta.kind || ['chat', 'images', 'embeddings'].includes(meta.kind)) && <Field>
+                      <FieldLabel htmlFor={`wiz-${u}-kind`}>Model kind / test endpoint</FieldLabel>
+                      <Select value={meta.kind} onValueChange={(value) => {
+                        if (value) { setMeta({ kind: value, ops: [value] }); setWTests((p) => { const next = { ...p }; delete next[u]; return next; }); }
+                      }}>
+                        <SelectTrigger id={`wiz-${u}-kind`}><SelectValue placeholder="Choose kind before saving or testing">{meta.kind === 'images' ? 'Image generation / editing' : meta.kind === 'embeddings' ? 'Embeddings' : meta.kind === 'chat' ? 'Chat' : undefined}</SelectValue></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="chat">Chat</SelectItem><SelectItem value="embeddings">Embeddings</SelectItem><SelectItem value="images">Image generation / editing</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </Field>}
+                    {meta.modalities && <p className="break-words text-[11px] text-muted-foreground">Modalities / input: {meta.modalities.input?.join(', ') || 'unknown'} · output: {meta.modalities.output?.join(', ') || 'unknown'}</p>}
+                    {meta.imagePrices?.unsupported_conditions && <p className="text-xs text-chart-4">Unsupported or conflicting catalog price conditions. Image cost remains unknown until reviewed in the model editor.</p>}
                     {t && !t.ok && (
                       <div className="border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs break-words text-destructive">
                         {t.error || 'failed'}{t.hint ? ` — ${t.hint}` : ''}
@@ -606,35 +674,44 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
                       <FieldLabel htmlFor={`wiz-${u}-tags`}>Capabilities / tags</FieldLabel>
                       <Input id={`wiz-${u}-tags`} value={meta.tags.join(', ')} onChange={(e) => setMeta({ tags: e.target.value.split(',').map((tag) => tag.trim()).filter(Boolean) })} />
                     </Field>
-                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
                       <Field>
                         <FieldLabel htmlFor={`wiz-${u}-pi`}>In $/1M</FieldLabel>
                         <Input id={`wiz-${u}-pi`} value={meta.pi} onChange={(e) => setMeta({ pi: e.target.value })} inputMode="decimal" className="font-mono" />
                       </Field>
-                      <Field>
+                      {meta.kind !== 'embeddings' && <Field>
                         <FieldLabel htmlFor={`wiz-${u}-po`}>Out $/1M</FieldLabel>
                         <Input id={`wiz-${u}-po`} value={meta.po} onChange={(e) => setMeta({ po: e.target.value })} inputMode="decimal" className="font-mono" />
-                      </Field>
+                      </Field>}
                       <Field>
                         <FieldLabel htmlFor={`wiz-${u}-pc`}>Cache $/1M</FieldLabel>
                         <Input id={`wiz-${u}-pc`} value={meta.pc} onChange={(e) => setMeta({ pc: e.target.value })} inputMode="decimal" className="font-mono" />
                       </Field>
+                      {(meta.kind === 'images' || !meta.kind) && <Field>
+                        <FieldLabel htmlFor={`wiz-${u}-pimg`}>Image $/img</FieldLabel>
+                        <Input id={`wiz-${u}-pimg`} value={meta.piImage} onChange={(e) => setMeta({ piImage: e.target.value })} inputMode="decimal" className="font-mono" />
+                      </Field>}
                       <Field>
-                        <FieldLabel htmlFor={`wiz-${u}-ctx`}>Context</FieldLabel>
+                        <FieldLabel htmlFor={`wiz-${u}-ctx`}>{meta.kind === 'embeddings' ? 'Max input tokens' : 'Context tokens'}</FieldLabel>
                         <Input id={`wiz-${u}-ctx`} value={meta.ctx} onChange={(e) => setMeta({ ctx: e.target.value })} inputMode="numeric" className="font-mono" />
                       </Field>
-                      <Field>
+                      {meta.kind !== 'embeddings' && <Field>
                         <FieldLabel htmlFor={`wiz-${u}-mx`}>Max out</FieldLabel>
                         <Input id={`wiz-${u}-mx`} value={meta.mx} onChange={(e) => setMeta({ mx: e.target.value })} inputMode="numeric" className="font-mono" />
-                      </Field>
+                      </Field>}
                     </div>
+                    {meta.imagePrices?.variants?.length ? (
+                      <p className="text-[10px] leading-relaxed text-muted-foreground">
+                        {meta.imagePrices.variants.length} size/quality price variant{meta.imagePrices.variants.length === 1 ? '' : 's'} detected; review them in the model editor after saving.
+                      </p>
+                    ) : null}
                   </div>
                 );
               })}
               {wizSelectedUpstreams.filter((u) => models.some((m) => m.id === (wIds[u] || '').trim() && (wIds[u] || '').trim() !== '')).length > 0 && (
                 <p className="border-l-2 border-chart-4 bg-chart-4/5 px-3 py-2 text-xs text-chart-4">Existing model IDs will be explicitly confirmed before transactional overwrite.</p>
               )}
-              {wizSelectedUpstreams.filter((u) => { const mt = wMeta[u]; return !mt || ((Number(mt.pi) || 0) === 0 && (Number(mt.po) || 0) === 0); }).length > 0 && (
+              {wizSelectedUpstreams.filter((u) => { const mt = wMeta[u]; return !mt || ((Number(mt.pi) || 0) === 0 && (Number(mt.po) || 0) === 0 && (Number(mt.piImage) || 0) === 0); }).length > 0 && (
                 <p className="text-xs text-muted-foreground">Some prices are zero or unset. Review against provider pricing; unknown cost is not free usage.</p>
               )}
               <DialogFooter className="border-t border-edge-700 pt-4">

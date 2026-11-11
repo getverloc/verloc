@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -44,10 +45,12 @@ var nonRetryableRe = regexp.MustCompile(`(?i)(context_length_exceeded|maximum co
 // runtimeState is swapped atomically on live config apply so in-flight
 // requests keep a stable cfg + backend map for the duration of the call.
 type runtimeState struct {
-	cfg          *Config
-	backends     map[string]*backend
-	modelPrices  map[string]requestPrice
-	targetPrices map[RouteTarget]requestPrice
+	cfg               *Config
+	backends          map[string]*backend
+	modelPrices       map[string]requestPrice
+	targetPrices      map[RouteTarget]requestPrice
+	mediaPrices       map[string]*MediaPriceSnapshot
+	targetMediaPrices map[RouteTarget]*MediaPriceSnapshot
 }
 
 type requestPrice struct {
@@ -65,16 +68,32 @@ func (p requestPrice) cost(in, out, cache uint64) float64 {
 
 func newRuntimeState(cfg *Config, backends map[string]*backend) *runtimeState {
 	rt := &runtimeState{cfg: cfg, backends: backends, modelPrices: make(map[string]requestPrice, len(cfg.ModelMap)), targetPrices: make(map[RouteTarget]requestPrice, len(cfg.ModelMap))}
+	rt.mediaPrices = map[string]*MediaPriceSnapshot{}
+	rt.targetMediaPrices = map[RouteTarget]*MediaPriceSnapshot{}
 	for id, mapped := range cfg.ModelMap {
 		var price requestPrice
+		var image *float64
+		var imagePrices *ImagePricing
 		if meta := cfg.ModelMeta[id]; meta != nil {
 			price = requestPrice{known: meta.PricingKnown == nil || *meta.PricingKnown, input: meta.PricingInput, output: meta.PricingOutput, cache: meta.PricingCache}
+			image, imagePrices = meta.PricingImage, meta.ImagePrices
 		} else if model := catalog.Lookup(id); model != nil {
 			p := model.PricingPerMillion
 			price = requestPrice{known: model.PricingKnown, input: p.Input, output: p.Output, cache: p.CacheRead}
+			// The embedded catalog carries OpenRouter-style per-image pricing
+			// as a decimal string; it is already USD per image.
+			if v, err := strconv.ParseFloat(model.Pricing.Image, 64); err == nil && finitePrice(v) {
+				image = &v
+			}
 		}
 		rt.modelPrices[id] = price
+		rt.mediaPrices[id] = priceSnapshot(price, image, imagePrices)
 		target := primaryTarget(cfg, mapped)
+		if previous, exists := rt.targetMediaPrices[target]; exists && !reflect.DeepEqual(previous, rt.mediaPrices[id]) {
+			rt.targetMediaPrices[target] = &MediaPriceSnapshot{}
+		} else if !exists {
+			rt.targetMediaPrices[target] = rt.mediaPrices[id]
+		}
 		if previous, exists := rt.targetPrices[target]; exists && previous != price {
 			// An ambiguous alias price cannot establish fallback cost coverage.
 			rt.targetPrices[target] = requestPrice{}
@@ -493,7 +512,10 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 	id := randomUUID()
 	w.Header().Set("X-Request-ID", id)
 	rec := ReqRecord{TS: nowMs(), ID: id, IP: clientIP(r), UA: truncate(r.Header.Get("User-Agent"), 60),
-		Status: http.StatusBadRequest, Outcome: "invalid_request"}
+		Status: http.StatusBadRequest, Outcome: "invalid_request", Endpoint: "chat"}
+	if endpoint == "/responses" || endpoint == "/systemone" {
+		rec.Endpoint = strings.TrimPrefix(endpoint, "/")
+	}
 	if identity := ClientIdentityFromRequest(r); identity != nil {
 		rec.ClientKeyID, rec.ClientName = identity.ID, identity.Name
 	}
@@ -611,6 +633,10 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 		fail(404, "model_unavailable", "unknown or disabled model")
 		return
 	}
+	if !modelSupportsOperation(rt.cfg, rec.Model, "chat") {
+		fail(404, "model_unavailable", "model does not support chat completions")
+		return
+	}
 	primary := primaryTarget(rt.cfg, mapped)
 	if endpoint == "/systemone" && metadata.Stream {
 		fail(400, "invalid_request", "System One does not support streaming")
@@ -656,6 +682,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 		target := primary
 		if routeIndex > 0 {
 			target = routes[routeIndex-1]
+		}
+		if routeIndex > 0 && !targetSupportsOperation(rt.cfg, target, "chat") {
+			continue
 		}
 		b := rt.backends[target.Backend]
 		if b == nil || target.Upstream == "" {

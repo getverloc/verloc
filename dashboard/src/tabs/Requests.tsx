@@ -47,6 +47,7 @@ function SkeletonRows({ rows = 8 }: { rows?: number }) {
 function RequestDetail({ record }: { record: ReqRecord }) {
   const meta: [string, string][] = [
     ['Time', fmtDateTime(record.ts)],
+    ['Endpoint', record.endpoint || 'Unknown / legacy'],
     ['Model', record.model],
     ['Upstream', record.upstream || 'Not recorded'],
     ['Provider', record.backend || 'Unattributed'],
@@ -57,7 +58,11 @@ function RequestDetail({ record }: { record: ReqRecord }) {
     ['Latency', fmtMs(record.lat_ms)],
     ['TTFT', fmtMs(record.ttft_ms)],
     ['Input / output / cached input (subset)', record.usage_known ? `${fmtTokens(record.tok_in)} / ${fmtTokens(record.tok_out)} / ${fmtTokens(record.tok_cache)}` : 'Unknown'],
+    ...(record.endpoint?.startsWith('images') ? [['Generated images', record.images_known ? String(record.images ?? 0) : 'Unknown'] as [string, string]] : []),
     ['Cost', record.cost_known ? fmtMoney(record.cost) : 'Unknown'],
+    ['Cost source', record.cost_source || (record.cost_known ? 'Calculated (legacy)' : 'Unknown')],
+    ...(record.media_tokens ? [['Text / image input tokens', `${record.media_tokens.text_input} / ${record.media_tokens.image_input}`], ['Text / image output tokens', `${record.media_tokens.text_output} / ${record.media_tokens.image_output}`]] as [string, string][] : []),
+    ...(record.upstream_request_id ? [['Upstream request ID', record.upstream_request_id] as [string, string]] : []),
   ];
   return (
     <div className="space-y-5">
@@ -66,6 +71,7 @@ function RequestDetail({ record }: { record: ReqRecord }) {
           <div className="flex flex-wrap gap-2">
             <Badge variant={outcomeVariant(record.status)}>{record.status <= 0 ? 'No response' : record.status}</Badge>
             <Badge variant="secondary">{outcomeLabel(record)}</Badge>
+            <Badge variant="outline">{record.endpoint || 'Unknown / legacy'}</Badge>
             <Badge variant="outline">{record.stream ? 'Stream' : 'JSON'}</Badge>
             {record.failover > 0 && <Badge variant="outline">Failover ×{record.failover}</Badge>}
           </div>
@@ -84,6 +90,7 @@ function RequestDetail({ record }: { record: ReqRecord }) {
           </div>
         ))}
       </dl>
+      {record.price_snapshot && <details className="min-w-0 border border-edge-700 bg-edge-950 p-4"><summary className="cursor-pointer text-xs text-chart-4">Request-time pricing snapshot · USD</summary><pre className="mt-3 max-w-full overflow-x-auto text-[11px] text-edge-300">{JSON.stringify(record.price_snapshot, null, 2)}</pre></details>}
       <Separator />
       <div className="space-y-3">
         <h3 className="text-[10px] font-medium uppercase tracking-[.18em] text-primary">Execution / upstream attempts</h3>
@@ -145,11 +152,12 @@ export default function Requests({ range }: TabProps) {
       </CardContent>
     </Card>
     {error && <InlineError message={error} onRetry={() => setRefresh((v) => v + 1)} />}
-    <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-3 xl:grid-cols-6 [&>*]:border-0">
+    <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-3 xl:grid-cols-7 [&>*]:border-0">
       <KpiCard label="Matching requests" value={summary ? fmtInt(summary.requests) : '—'} sub="All matching retained detail" />
       <KpiCard label="Errors" value={summary ? fmtInt(summary.errors) : '—'} accent="text-destructive" sub="Within query" />
       <KpiCard label="Known cost" value={summary ? fmtMoney(summary.cost) : '—'} accent="text-chart-4" sub="Missing prices excluded" />
       <KpiCard label="Known tokens" value={summary ? fmtTokens(summary.tok_in + summary.tok_out) : '—'} sub="Input + output" />
+      <KpiCard label="Generated images" value={summary ? fmtInt(summary.images) : '—'} sub={summary ? `${fmtInt(summary.unknown_images)} image requests with unknown count` : 'Returned image count'} accent="text-chart-5" />
       <KpiCard label="Avg latency" value={summary ? fmtMs(summary.avg_latency_ms) : '—'} accent="text-chart-2" sub="Recorded requests" />
       <KpiCard label="Avg TTFT" value={summary ? fmtMs(summary.avg_ttft_ms) : '—'} accent="text-chart-3" sub="Recorded streams" />
     </div>
@@ -174,7 +182,7 @@ export default function Requests({ range }: TabProps) {
                   <div className="whitespace-nowrap text-[11px] text-edge-200">{fmtDateTime(r.ts)}</div>
                   <Button variant="link" size="sm" onClick={(e) => { e.stopPropagation(); setSelected(r); }} className="mt-1 h-auto max-w-48 justify-start truncate p-0 text-[10px] text-primary" title={`Inspect request ${r.id}`}>{r.id}</Button>
                 </TableCell>
-                <TableCell className="max-w-52 truncate text-edge-100" title={r.model}>{r.model}</TableCell>
+                 <TableCell className="max-w-52 text-edge-100" title={r.model}><div className="truncate">{r.model}</div><div className="mt-1 text-[10px] text-edge-400">{r.endpoint || 'Unknown / legacy'}{r.images_known ? ` · ${r.images ?? 0} img` : ''}</div></TableCell>
                 <TableCell className="text-edge-300">{r.backend || 'Unattributed'}</TableCell>
                 <TableCell className="max-w-40 truncate text-edge-300" title={r.client_name || r.client_key_id || 'Unattributed'}>{r.client_name || r.client_key_id || 'Unattributed'}</TableCell>
                 <TableCell>
