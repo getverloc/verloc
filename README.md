@@ -173,7 +173,7 @@ provider prices.
 | Endpoint | Authentication | Purpose |
 | --- | --- | --- |
 | `POST /v1/chat/completions` | Application API key | Chat Completions, including streaming |
-| `POST /v1/responses` | Application API key | Responses passthrough to a compatible upstream |
+| `POST /v1/responses` | Application API key | OpenAI Responses API translated to Chat Completions, including streaming |
 | `POST /v1/systemone` | Application API key | Native Jev/Clef typed-question evaluation; no streaming |
 | `POST /v1/messages` | Application API key | Anthropic Messages translated to Chat Completions, including streaming |
 | `POST /v1/messages/count_tokens` | Application API key | Local, approximate token count; no upstream inference |
@@ -192,12 +192,25 @@ Token counting uses a character-based estimate, not a provider tokenizer. It enf
 model access, per-key RPM/concurrency, global admission, and bounded body reads, but
 does not consume upstream TPM or incur upstream usage.
 
+Responses requests are translated to Chat Completions and back, so every chat-capable
+model serves `/v1/responses` without its backend implementing it. `model`, `input`
+(string or item array), `instructions`, `tools`/`tool_choice`, `text.format`,
+`max_output_tokens`, sampling fields, `reasoning.effort` and `stream` are mapped.
+Responses features with no chat equivalent are handled deliberately rather than
+silently dropped: `previous_response_id` and `conversation` are rejected with a 400
+because answering them statelessly would return a reply that lost the transcript;
+hosted tools (`web_search`, `file_search`, `code_interpreter`, `computer_use`, `mcp`,
+`image_generation`) are rejected by name for the same reason. `store` is accepted and
+ignored — it defaults to true in the official SDKs and the gateway keeps no response
+state, so responses report `store: false` and `previous_response_id: null` honestly.
+Stateful reads (`GET`/`DELETE /v1/responses/{id}`) are not implemented.
+
 For providers retaining reasoning, replay is isolated by application-key identity,
 public model, provider/upstream route, and conversation/tool-turn content. Reused
 tool-call IDs alone cannot select another turn's reasoning. Stream accumulation
 is bounded to 512 KiB per choice.
 
-Authentication endpoints under `/dash/api/auth/` are reachable before login for setup/session/login. Application API keys never grant administrative access. Responses requests are not translated to Chat Completions: the selected upstream must support `/responses`. Other OpenAI APIs, including embeddings, images, and audio, are not implemented.
+Authentication endpoints under `/dash/api/auth/` are reachable before login for setup/session/login. Application API keys never grant administrative access. Other OpenAI APIs, including audio, are not implemented.
 
 ## Dashboard
 

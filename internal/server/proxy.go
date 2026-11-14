@@ -167,8 +167,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.forward(w, r, "/chat/completions", nil)
 }
 
+// handleResponses implements POST /v1/responses. The client speaks the OpenAI
+// Responses API; forward() translates it to chat completions, so every
+// chat-capable model serves the endpoint without its backend implementing
+// /responses. This mirrors handleAnthropicMessages.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
-	s.forward(w, r, "/responses", nil)
+	s.forward(w, r, "/chat/completions", &responsesContext{})
 }
 
 func (s *Server) handleSystemOne(w http.ResponseWriter, r *http.Request) {
@@ -500,7 +504,7 @@ func prepareTPMRequest(raw []byte, metadata requestMetadata, cfg *Config, endpoi
 	return bounded, reservation, err
 }
 
-func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string, anthropic *anthropicContext) {
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string, adapter inboundAdapter) {
 	// Wrap first so the panic recovery below can determine whether a response
 	// was already committed to the client.
 	tw := &trackingResponseWriter{ResponseWriter: w}
@@ -513,8 +517,11 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 	w.Header().Set("X-Request-ID", id)
 	rec := ReqRecord{TS: nowMs(), ID: id, IP: clientIP(r), UA: truncate(r.Header.Get("User-Agent"), 60),
 		Status: http.StatusBadRequest, Outcome: "invalid_request", Endpoint: "chat"}
-	if endpoint == "/responses" || endpoint == "/systemone" {
-		rec.Endpoint = strings.TrimPrefix(endpoint, "/")
+	rec.Endpoint = strings.TrimPrefix(endpoint, "/")
+	if adapter != nil {
+		// The forwarded endpoint is chat completions; the client-facing
+		// protocol is what analytics should record.
+		rec.Endpoint = adapter.endpointName()
 	}
 	if identity := ClientIdentityFromRequest(r); identity != nil {
 		rec.ClientKeyID, rec.ClientName = identity.ID, identity.Name
@@ -570,8 +577,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 	fail := func(status int, outcome, message string) {
 		rec.Status, rec.Outcome, rec.ErrMsg = status, outcome, message
 		if r.Context().Err() == nil {
-			if anthropic != nil {
-				anthropic.errorWriter(w, status, message)
+			if adapter != nil {
+				adapter.errorWriter(w, status, message)
 			} else {
 				proxyError(w, status, message)
 			}
@@ -612,15 +619,15 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 		}
 		return
 	}
-	if anthropic != nil {
-		// Messages protocol: translate to a chat-completions body once,
-		// before metadata parsing, admission accounting and any upstream
+	if adapter != nil {
+		// Inbound protocol adaptation: translate to a chat-completions body
+		// once, before metadata parsing, admission accounting and any upstream
 		// attempt. Everything downstream sees an ordinary chat request.
-		if err := anthropic.translateRequest(raw); err != nil {
+		if err := adapter.translateRequest(raw); err != nil {
 			fail(400, "invalid_request", err.Error())
 			return
 		}
-		raw = anthropic.body()
+		raw = adapter.body()
 	}
 	var metadata requestMetadata
 	if err := json.Unmarshal(raw, &metadata); err != nil {
@@ -634,7 +641,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 		return
 	}
 	if !modelSupportsOperation(rt.cfg, rec.Model, "chat") {
-		fail(404, "model_unavailable", "model does not support chat completions")
+		fail(404, "model_unavailable", "model does not support "+capabilityLabel(adapter))
 		return
 	}
 	primary := primaryTarget(rt.cfg, mapped)
@@ -812,11 +819,11 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 					rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = i, o, c, true
 				}
 				onFirst := func() { rec.TTFTMs = float64(time.Since(start).Nanoseconds()) / 1e6 }
-				if anthropic != nil {
-					// The Messages SSE translator writes Anthropic events
-					// directly to the committed writer; headers commit on
-					// its first event exactly like the passthrough path.
-					err = anthropic.streamCopier(streamWriter, idle, onUsage, onFirst)
+				if adapter != nil {
+					// The adapter's SSE translator writes its own event
+					// sequence directly to the committed writer; headers
+					// commit on the first event like the passthrough path.
+					err = adapter.streamCopier(streamWriter, idle, onUsage, onFirst)
 				} else {
 					err = streamCopyWithUsage(streamWriter, idle, onUsage, onFirst, streamOptions{
 						aliasReasoning: !b.stripReasoning,
@@ -921,12 +928,33 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				copyResponseHeaders(w, resp, false)
 				w.Header().Del("Content-Length") // Reasoning aliases can change the body length.
 				w.Header().Set("X-Request-ID", id)
-				if anthropic != nil && !spilled {
-					// Messages protocol: translate the complete chat body
-					// back to Messages shape. (Spilled oversized bodies
-					// stream through; translation requires the whole body.)
-					body = anthropic.translateResponse(body)
+				if adapter != nil {
+					// Inbound protocol adaptation: translate the complete chat
+					// body back to the client's shape. A spilled body is
+					// materialized for this (bounded by maxNonStreamBody);
+					// emitting an untranslated chat body would hand the client
+					// the wrong protocol, which is worse than the memory cost.
+					if spilled {
+						if body, err = sb.bytes(); err != nil {
+							sb.close()
+							b.pool.RecordErr(ks)
+							finishAttempt(502, "interrupted")
+							lastStatus = 502
+							continue
+						}
+					}
+					translated := adapter.translateResponse(body)
+					if translated == nil {
+						sb.close()
+						b.pool.RecordErr(ks)
+						finishAttempt(502, "upstream_error")
+						fail(502, "upstream_error", "upstream response could not be translated")
+						return
+					}
+					body = translated
+					spilled = false
 					w.Header().Set("Content-Type", "application/json")
+					w.Header().Del("Content-Length")
 				}
 				w.WriteHeader(http.StatusOK)
 				if spilled {

@@ -138,6 +138,9 @@ func (a *anthropicContext) translateRequest(raw []byte) error {
 // body returns the forwarded request bytes (the translated chat body).
 func (a *anthropicContext) body() []byte { return a.chatBody }
 
+// endpointName is the client-facing protocol, recorded as rec.Endpoint.
+func (a *anthropicContext) endpointName() string { return "messages" }
+
 // errorWriter emits Messages-shaped errors, including the wording Claude
 // Code matches for capability-rejection recovery.
 func (a *anthropicContext) errorWriter(w http.ResponseWriter, status int, message string) {

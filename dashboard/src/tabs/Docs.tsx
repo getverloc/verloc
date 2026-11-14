@@ -165,10 +165,53 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":
 data: [DONE]`;
 
 const RESPONSES_REQUEST = `{
-  "model": "<responses-capable-model-id>",
+  "model": "<model-id>",
+  "instructions": "Be concise.",
   "input": "Explain consistent hashing in one paragraph.",
   "max_output_tokens": 300
 }`;
+
+const RESPONSES_CONVERSATION = `{
+  "model": "<model-id>",
+  "input": [
+    { "type": "message", "role": "user", "content": "What is the weather in Delhi?" },
+    { "type": "function_call", "call_id": "call_1",
+      "name": "get_weather", "arguments": "{\\"city\\":\\"Delhi\\"}" },
+    { "type": "function_call_output", "call_id": "call_1", "output": "31C, clear" }
+  ]
+}`;
+
+const RESPONSES_RESPONSE = `{
+  "id": "resp_...",
+  "object": "response",
+  "status": "completed",
+  "model": "<model-id>",
+  "output": [
+    { "type": "message", "role": "assistant", "status": "completed",
+      "content": [{ "type": "output_text", "text": "Consistent hashing...", "annotations": [] }] }
+  ],
+  "output_text": "Consistent hashing...",
+  "store": false,
+  "previous_response_id": null,
+  "usage": {
+    "input_tokens": 36, "output_tokens": 87, "total_tokens": 123,
+    "input_tokens_details": { "cached_tokens": 0 },
+    "output_tokens_details": { "reasoning_tokens": 0 }
+  }
+}`;
+
+const RESPONSES_SDK = `from openai import OpenAI
+
+client = OpenAI(base_url="https://<gateway>/v1", api_key="vlk_...")
+
+# Non-streaming: output_text is a convenience over output[]
+response = client.responses.create(model="<model-id>", input="Explain consistent hashing.")
+print(response.output_text)
+
+# Streaming: typed events, not chat deltas
+for event in client.responses.create(model="<model-id>", input="Explain.", stream=True):
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")`;
 
 const SYSTEMONE_REQUEST = `{
   "model": "@cf/cloudflare/clef",
@@ -358,7 +401,7 @@ export default function Docs() {
               ['POST', '/v1/chat/completions', 'Client key', 'OpenAI-compatible chat; supports SSE streaming'],
               ['POST', '/v1/messages', 'Client key', 'Anthropic Messages protocol (Claude Code / Anthropic SDKs); SSE streaming'],
               ['POST', '/v1/messages/count_tokens', 'Client key', 'Anthropic token counting; character-based estimate'],
-              ['POST', '/v1/responses', 'Client key', 'OpenAI Responses passthrough; upstream must implement /responses'],
+              ['POST', '/v1/responses', 'Client key', 'OpenAI Responses API translated to chat completions; SSE streaming'],
               ['POST', '/v1/systemone', 'Client key', 'Native Jev/Clef decision API; non-streaming, uncompressed JSON'],
               ['POST', '/v1/embeddings', 'Client key', 'OpenAI-compatible embeddings, including batched input'],
               ['POST', '/v1/images/generations', 'Client key', 'OpenAI-compatible image generation'],
@@ -413,24 +456,84 @@ export default function Docs() {
       </Section>
 
       <Section id="responses" index="05" kicker="Inference" title="Responses API"
-        description="A passthrough for the OpenAI Responses API. Responses requests are never translated into Chat Completions.">
+        description="The OpenAI Responses wire protocol, so Responses-native clients and the OpenAI SDKs can point at verloc by changing only the base URL and key.">
         <Endpoint method="POST" path="/v1/responses" alias="/responses" />
         <Prose>
-          The selected upstream provider must implement the Responses API. The same model routing,
-          failover, and usage accounting apply. Streaming follows the SSE conventions above, with
-          terminal detection for response.completed, response.failed, and response.incomplete events.
+          Requests are translated to the chat-completions shape, routed through the same gateway path
+          (key rotation, failover, limits, analytics), and responses are translated back to the
+          Responses object — including streaming, function calls, and structured outputs. No backend
+          needs to implement <code className="font-mono text-edge-200">/responses</code>: any model
+          that serves chat snapshots it.
         </Prose>
+        <Spec rows={[
+          ['model', 'string (required)', 'Public verloc model ID, exactly as in /v1/models.'],
+          ['input', 'string | items', 'A bare string, or an array of typed items: message, function_call, function_call_output, reasoning.'],
+          ['instructions', 'string', 'System-level guidance. Sent as a leading system message.'],
+          ['max_output_tokens', 'integer', 'Mapped to the upstream max_tokens, capped by the provider limit.'],
+          ['temperature · top_p', 'number', 'Passed through unchanged.'],
+          ['tools', 'array', 'Function tools, internally tagged (type: "function" with a top-level name). Hosted tool types are rejected — see below.'],
+          ['tool_choice · parallel_tool_calls', 'string | object', 'auto / none / required, or a named function.'],
+          ['text.format', 'object', 'Structured Outputs. Moved from response_format into text.format; json_schema is accepted here.'],
+          ['reasoning.effort', 'string', 'Mapped to reasoning_effort; ignored by backends that do not accept it.'],
+          ['stream', 'boolean', 'Typed SSE events. include_usage is requested automatically so response.completed carries usage.'],
+        ]} />
         <CodeBlock label="Request" code={RESPONSES_REQUEST} />
+        <CodeBlock label="Response" code={RESPONSES_RESPONSE} />
+        <CodeBlock label="Conversation replay (stateless)" code={RESPONSES_CONVERSATION} />
         <Prose>
-          Usage is read from a top-level <code className="font-mono text-edge-200">usage</code> object or from
-          <code className="mx-1 font-mono text-edge-200">response.usage</code>, using
-          <code className="mx-1 font-mono text-edge-200">input_tokens</code> and
-          <code className="mx-1 font-mono text-edge-200">output_tokens</code>. Omitted usage is recorded as unknown, never as zero.
+          The gateway keeps no response state, so multi-turn work is done by replaying the transcript:
+          send the assistant's <code className="font-mono text-edge-200">function_call</code> items and
+          their <code className="mx-1 font-mono text-edge-200">function_call_output</code> results back in
+          <code className="mx-1 font-mono text-edge-200">input</code>, paired by
+          <code className="mx-1 font-mono text-edge-200">call_id</code>.
         </Prose>
+        <Note>
+          Some Responses features cannot be honoured over a chat backend. They are rejected with a
+          400 naming the field rather than silently dropped, because a silently-ignored field returns
+          a confident answer that is quietly wrong.
+        </Note>
+        <Table className="min-w-[560px]">
+          <TableHeader>
+            <TableRow>
+              <TableHead>Field</TableHead>
+              <TableHead>Behaviour</TableHead>
+              <TableHead>Reason</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {([
+              ['store', 'Accepted, ignored', 'Defaults to true in the SDKs. The gateway stores nothing, so responses report store: false — never a promise it cannot keep.'],
+              ['previous_response_id', '400', 'A client depending on continuation would receive a stateless reply that lost the transcript.'],
+              ['conversation', '400', 'Same as above: no server-side conversation state exists.'],
+              ['n > 1', '400', 'The Responses API returns a single generation; chat would silently pick one of the candidates.'],
+              ['web_search · file_search', '400', 'Hosted tools run upstream. Cannot be emulated over chat.'],
+              ['code_interpreter · computer_use', '400', 'As above.'],
+              ['mcp · image_generation', '400', 'As above.'],
+            ] as Array<[string, string, string]>).map(([field, behaviour, reason]) => (
+              <TableRow key={field}>
+                <TableCell className="py-3 font-mono text-[11px] whitespace-nowrap text-edge-100">{field}</TableCell>
+                <TableCell className="py-3 text-[11px] text-edge-300">{behaviour}</TableCell>
+                <TableCell className="py-3 text-[11px] text-edge-400">{reason}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <Prose>
+          Usage is reported in the Responses vocabulary —
+          <code className="mx-1 font-mono text-edge-200">input_tokens</code>,
+          <code className="mx-1 font-mono text-edge-200">output_tokens</code> and
+          <code className="mx-1 font-mono text-edge-200">total_tokens</code>, with
+          <code className="mx-1 font-mono text-edge-200">cached_tokens</code> under
+          <code className="mx-1 font-mono text-edge-200">input_tokens_details</code>. When an upstream
+          reports no usage the field is omitted and the request is recorded as unknown, never as zero.
+          Stateful reads (<code className="mx-1 font-mono text-edge-200">GET</code> /
+          <code className="mx-1 font-mono text-edge-200">DELETE /v1/responses/&#123;id&#125;</code>) are not implemented.
+        </Prose>
+        <CodeBlock label="OpenAI SDK (Python)" code={RESPONSES_SDK} />
       </Section>
 
       <Section id="system-one" index="06" kicker="Native" title="System One"
-        description="The typed decision API for Jev and Cloudflare Clef models. Native models cannot be called through Chat Completions or Responses, and vice versa.">
+        description="The typed decision API for Jev and Cloudflare Clef models. Native models cannot be called through Chat Completions, and chat models cannot be called through System One.">
         <Endpoint method="POST" path="/v1/systemone" alias="/systemone" />
         <Spec rows={[
           ['model', 'string (required)', 'Public model ID mapped to a native provider (api_format "systemone") or a Cloudflare Clef route.'],
@@ -599,7 +702,9 @@ export default function Docs() {
               ['400', 'request body required', 'No request body was sent.'],
               ['400', 'invalid request JSON', 'Body is not JSON, or model/stream/limit fields are the wrong type.'],
               ['400', 'System One does not support streaming', 'stream: true was sent to /v1/systemone.'],
-              ['400', 'model does not support this inference endpoint', 'A native model was called on chat/responses, or vice versa.'],
+              ['400', 'model does not support this inference endpoint', 'A System One model was called on chat, or a chat model on /v1/systemone.'],
+              ['400', 'previous_response_id / conversation is not supported', 'A stateful Responses request. Send the full conversation in input instead.'],
+              ['400', 'tool "…" requires a backend that serves the Responses API natively', 'A hosted Responses tool (web_search, file_search, code_interpreter, mcp, image_generation) was requested.'],
               ['400', 'TPM-limited input requires known model token bounds', 'A token-limited key hit a model with no configured context window.'],
               ['403', 'model is not allowed for this client key', 'The key scope excludes the requested model.'],
               ['404', 'unknown or disabled model', 'The model ID is not configured or is disabled.'],
