@@ -153,28 +153,6 @@ func (l *RecentLog) Snapshot(n int) []ReqRecord {
 	return out
 }
 
-// Since returns records with ts > sinceMs, oldest first (for SSE live tail).
-func (l *RecentLog) Since(sinceMs int64) []ReqRecord {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	var out []ReqRecord
-	if l.full {
-		for i := 0; i < len(l.buf); i++ {
-			r := l.buf[(l.head+i)%len(l.buf)]
-			if r.TS > sinceMs && r.TS > 0 {
-				out = append(out, r)
-			}
-		}
-	} else {
-		for i := 0; i < l.head; i++ {
-			if l.buf[i].TS > sinceMs {
-				out = append(out, l.buf[i])
-			}
-		}
-	}
-	return out
-}
-
 func shortID() string {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)

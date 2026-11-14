@@ -823,6 +823,3 @@ func (s *Security) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	s.respondSession(w, r, token, csrf)
 }
-
-// Close does not close the shared control store, which remains owned by Server.
-func (s *Security) Close() error { return nil }

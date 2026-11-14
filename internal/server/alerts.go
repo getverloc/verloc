@@ -79,14 +79,6 @@ func (t *tickAgg) finalize() {
 	t.P99Ms = histogramPercentile(t.LatHist, 99)
 }
 
-// merge accumulates o and immediately derives percentiles. Percentiles are
-// order-independent over additive histograms, so this is equivalent to
-// add followed by finalize and is kept for ad-hoc callers.
-func (t *tickAgg) merge(o tickAgg) {
-	t.add(o)
-	t.finalize()
-}
-
 // Aggregator keeps a rolling view of per-tick activity: a 24h global tick
 // ring plus per-scope (backend:<name>, model:<id>) minute buckets, lazily
 // created for scopes that have alert rules.

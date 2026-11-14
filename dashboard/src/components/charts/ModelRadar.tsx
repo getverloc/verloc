@@ -5,7 +5,8 @@ import { useMemo } from 'react';
 import { PolarAngleAxis, PolarGrid, Radar, RadarChart } from 'recharts';
 import { fmtInt, fmtMoney, fmtMs, fmtTokens } from '../../api';
 import { ChartContainer, ChartLegend, ChartLegendContent, ChartTooltip, ChartTooltipContent } from '../ui/chart';
-import { ChartEmptyState, ChartSkeleton, PALETTE, shortName } from './shared';
+import { ChartEmptyState, ChartSkeleton } from './shared';
+import { PALETTE, shortName } from './config';
 
 export interface ModelFootprint {
   name: string;

@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
+import { clientKeyStatus } from '../client-key-state';
 import { toast } from 'sonner';
 import { Ban, Check, Copy, KeyRound, Pencil, Plus, RefreshCw, RotateCw } from 'lucide-react';
 import {
@@ -34,6 +35,7 @@ const toLocalInput = (ts: number) =>
   new Date(ts - new Date(ts).getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 
 export default function ClientKeys() {
+  const [now, setNow] = useState(Date.now);
   const [keys, setKeys] = useState<ClientKey[]>([]);
   const [models, setModels] = useState<AdminModel[]>([]);
   const [loading, setLoading] = useState(true);
@@ -53,9 +55,11 @@ export default function ClientKeys() {
   const [secretError, setSecretError] = useState('');
 
   const refresh = async () => {
-    setLoadError('');
     try {
-      setKeys((await listClientKeys()).keys || []);
+      const result = await listClientKeys();
+      setLoadError('');
+      setNow(Date.now());
+      setKeys(result.keys || []);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : 'Could not load API keys');
     } finally {
@@ -64,10 +68,16 @@ export default function ClientKeys() {
   };
 
   useEffect(() => {
-    void refresh();
+    let active = true;
+    listClientKeys()
+      .then((result) => { if (active) setKeys(result.keys || []); })
+      .catch((e) => { if (active) setLoadError(e instanceof Error ? e.message : 'Could not load API keys'); })
+      .finally(() => { if (active) setLoading(false); });
+    const timer = setInterval(() => setNow(Date.now()), 1000);
     listAdminModels()
-      .then((m) => setModels(m.models || []))
-      .catch((e) => setLoadError(e instanceof Error ? e.message : 'Could not load model scopes'));
+      .then((m) => { if (active) setModels(m.models || []); })
+      .catch((e) => { if (active) setLoadError(e instanceof Error ? e.message : 'Could not load model scopes'); });
+    return () => { active = false; clearInterval(timer); };
   }, []);
 
   const openCreate = () => {
@@ -172,9 +182,8 @@ export default function ClientKeys() {
     ? [...models.map((m) => m.id), ...draft.allowed_models].filter((id, i, arr) => arr.indexOf(id) === i)
     : [];
 
-  const now = Date.now();
-  const activeKeys = keys.filter((key) => !key.revoked_at && (!key.expires_at || key.expires_at > now));
-  const expiredKeys = keys.filter((key) => !key.revoked_at && key.expires_at > 0 && key.expires_at <= now);
+  const activeKeys = keys.filter((key) => clientKeyStatus(key, now) === 'Active');
+  const expiredKeys = keys.filter((key) => clientKeyStatus(key, now) === 'Expired');
   const summary = [
     { label: 'Credentials', value: keys.length, detail: 'Including retained history', accent: '' },
     { label: 'Active', value: activeKeys.length, detail: `${expiredKeys.length} expired`, accent: 'text-primary' },
@@ -250,7 +259,7 @@ export default function ClientKeys() {
               </TableHeader>
               <TableBody>
                 {keys.map((key) => {
-                  const status = key.revoked_at ? 'Revoked' : key.expires_at > 0 && key.expires_at < Date.now() ? 'Expired' : 'Active';
+                  const status = clientKeyStatus(key, now);
                   return (
                     <TableRow key={key.id} className={key.revoked_at ? 'opacity-60' : 'hover:bg-edge-800/60'}>
                       <TableCell className="py-5 pl-5 whitespace-normal">

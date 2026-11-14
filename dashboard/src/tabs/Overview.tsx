@@ -12,9 +12,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Skeleton } from '../components/ui/skeleton';
 import { TrafficAreaChart } from '../components/charts/TrafficAreaChart';
 import { CostSharePie } from '../components/charts/CostSharePie';
-import {
-  CHART_RANGES, filterSeriesByDays, InlineError, KpiCard, PanelCard, type ChartRangeKey,
-} from '../components/charts/shared';
+import { InlineError, KpiCard, PanelCard } from '../components/charts/shared';
+import { CHART_RANGES, filterSeriesByDays, type ChartRangeKey } from '../components/charts/config';
 
 export default function Overview({ state, series, range }: TabProps) {
   const [chartRange, setChartRange] = useState<ChartRangeKey>('30d');

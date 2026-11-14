@@ -22,6 +22,9 @@ jobs:
       - name: dashboard lint
         working-directory: dashboard
         run: npm run lint
+      - name: dashboard regressions
+        working-directory: dashboard
+        run: npm test
       - name: dashboard type-check and embed build
         working-directory: dashboard
         run: npm run build

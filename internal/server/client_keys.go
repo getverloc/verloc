@@ -468,7 +468,10 @@ type PolicyError struct {
 	RetryAfter int
 }
 
+// PolicyError remains an error for callers that need standard error handling.
 func (e *PolicyError) Error() string { return e.Message }
+
+var _ error = (*PolicyError)(nil)
 
 type ClientLease struct {
 	Identity *ClientIdentity

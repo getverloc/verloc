@@ -5,7 +5,8 @@ import { useMemo } from 'react';
 import { Bar, BarChart, CartesianGrid, Cell, XAxis, YAxis } from 'recharts';
 import { fmtInt, fmtMoney, fmtTokens } from '../../api';
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '../ui/chart';
-import { ChartEmptyState, ChartSkeleton, GRID_STROKE, PALETTE, shortName, TICK } from './shared';
+import { ChartEmptyState, ChartSkeleton } from './shared';
+import { GRID_STROKE, PALETTE, shortName, TICK } from './config';
 
 export type CostBarMetric = 'cost' | 'requests';
 

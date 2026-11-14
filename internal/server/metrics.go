@@ -281,18 +281,6 @@ func (mt *Metrics) backend(name string) *metricSet {
 	return s
 }
 
-func (mt *Metrics) Record(model, backend string, stream bool, status int, tin, tout, tcache, latNs, ttftNs uint64) {
-	// Derive ok from the status: hardcoding true recorded every 5xx as a
-	// success for any caller of this convenience wrapper.
-	mt.Record2(model, backend, stream, status, tin, tout, tcache, latNs, ttftNs, status >= 200 && status < 300)
-}
-
-// Record2 records one completed request with explicit ok/err classification.
-func (mt *Metrics) Record2(model, backend string, stream bool, status int, tin, tout, tcache, latNs, ttftNs uint64, ok bool) {
-	cost := costOf(model, tin, tout, tcache)
-	mt.record(model, backend, stream, status, tin, tout, tcache, latNs, ttftNs, ok, cost)
-}
-
 // RecordRequest meters the immutable route-pricing decision made for this
 // logical request. It never consults a subsequently edited runtime catalog.
 func (mt *Metrics) RecordRequest(rec ReqRecord) {
@@ -326,14 +314,6 @@ func (mt *Metrics) record(model, backend string, stream bool, status int, tin, t
 	latMs := float64(latNs) / 1e6
 	mt.pushRecent(latMs)
 	mt.pushTick(latMs, float64(ttftNs)/1e6)
-}
-
-func (mt *Metrics) RecordErr(model, backend string, stream bool, status int, latNs uint64) {
-	latMs := float64(latNs) / 1e6
-	mt.model(model).add(1, 0, 1, stream, 0, 0, 0, latNs, 0, false, status)
-	mt.backend(backend).add(1, 0, 1, stream, 0, 0, 0, latNs, 0, false, status)
-	mt.pushRecent(latMs)
-	mt.pushTick(latMs, 0)
 }
 
 func (mt *Metrics) RecordFailover(model, backend string) {

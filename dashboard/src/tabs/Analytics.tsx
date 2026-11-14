@@ -4,7 +4,8 @@ import {
   getAnalytics, fmtMoney, fmtInt, fmtTokens, fmtMs, fmtDateTime,
   type Analytics as AnalyticsData, type TabProps, type UsageGroup,
 } from '../api';
-import { HistoryFilters, useHistoryFilters } from '../components/HistoryFilters';
+import { HistoryFilters } from '../components/HistoryFilters';
+import { useHistoryFilters } from '../useHistoryFilters';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '../components/ui/empty';
@@ -12,7 +13,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Skeleton } from '../components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '../components/ui/chart';
-import { GRID_STROKE, InlineError, KpiCard, PALETTE, PanelCard, TICK } from '../components/charts/shared';
+import { InlineError, KpiCard, PanelCard } from '../components/charts/shared';
+import { GRID_STROKE, PALETTE, TICK } from '../components/charts/config';
 import Cost from './Cost';
 import Latency from './Latency';
 
@@ -25,25 +27,25 @@ const UNATTRIBUTED_LABELS: Record<UsageGroupKey, string> = {
 };
 
 export default function Analytics(props: TabProps) {
-  const { filters, setFilters, params, refreshWindow } = useHistoryFilters(props.range);
-  const [data, setData] = useState<AnalyticsData | null>(null);
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(true);
+  const { filters, setFilters, params, refreshWindow } = useHistoryFilters(props.range, props.rangeAnchor);
+  const [result, setResult] = useState<{ requestKey: { scope: string }; data: AnalyticsData | null; error: string } | null>(null);
   const [refresh, setRefresh] = useState(0);
   const [group, setGroup] = useState<UsageGroupKey>('clients');
   const query = params.toString();
+  const scope = JSON.stringify([query, refresh]);
+  const requestKey = useMemo(() => ({ scope }), [scope]);
+  const current = result?.requestKey === requestKey ? result : null;
+  const data = current?.data ?? null;
+  const error = current?.error ?? '';
+  const busy = current === null;
 
   useEffect(() => {
     const ac = new AbortController();
-    setBusy(true);
-    setError('');
-    setData(null);
     getAnalytics(new URLSearchParams(query), ac.signal)
-      .then(setData)
-      .catch((e) => { if (!ac.signal.aborted) setError(e instanceof Error ? e.message : 'Analytics unavailable'); })
-      .finally(() => { if (!ac.signal.aborted) setBusy(false); });
+      .then((data) => { if (!ac.signal.aborted) setResult({ requestKey, data, error: '' }); })
+      .catch((e) => { if (!ac.signal.aborted) setResult({ requestKey, data: null, error: e instanceof Error ? e.message : 'Analytics unavailable' }); });
     return () => ac.abort();
-  }, [query, refresh]);
+  }, [query, requestKey]);
 
   const retry = () => { refreshWindow(); setRefresh((v) => v + 1); };
   const summary = data?.summary;

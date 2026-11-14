@@ -50,10 +50,8 @@ type Store struct {
 type keyEventReq struct {
 	ts      int64
 	backend string
-	key     string
 	event   string
 	status  int
-	msg     string
 }
 
 func OpenStore(path string) (*Store, error) {
@@ -433,8 +431,6 @@ func (s *Store) QueueKeyEvent(ts int64, backend, key, event string, status int, 
 		s.keyEvDrop.Add(1)
 	}
 }
-
-func (s *Store) DroppedKeyEvents() uint64 { return s.keyEvDrop.Load() }
 
 // RecentAlerts returns the last n alert events, newest first.
 func (s *Store) RecentAlerts(n int) []AlertEvent {

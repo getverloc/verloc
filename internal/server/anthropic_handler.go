@@ -114,8 +114,6 @@ type anthropicContext struct {
 	model string
 	// chatBody is the translated chat-completions request body.
 	chatBody []byte
-	// metadata holds the parsed original request for admission accounting.
-	metadata requestMetadata
 }
 
 // translateRequest converts the inbound Messages body once, before any
@@ -131,7 +129,6 @@ func (a *anthropicContext) translateRequest(raw []byte) error {
 	}
 	a.chatBody = encoded
 	a.model = parsed.Model
-	a.metadata = requestMetadata{Model: parsed.Model, Stream: parsed.Stream, MaxTokens: parsed.MaxTokens}
 	return nil
 }
 
@@ -157,7 +154,7 @@ func (a *anthropicContext) streamCopier(w http.ResponseWriter, src io.Reader, on
 func (a *anthropicContext) translateResponse(body []byte) []byte {
 	out, err := openAIToAnthropic(body, a.model)
 	if err != nil {
-		return body
+		return nil
 	}
 	return out
 }

@@ -517,7 +517,7 @@ export interface TabProps {
   state: State | null;
   series: SeriesPoint[];
   range: RangePreset;
+  rangeAnchor: number;
   liveAlerts: AlertEvent[];
   liveKeyEvents: KeyEvent[];
-  onRange: (r: RangePreset) => void;
 }

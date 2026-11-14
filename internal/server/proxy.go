@@ -470,9 +470,7 @@ func prepareTPMRequest(raw []byte, metadata requestMetadata, cfg *Config, endpoi
 			body[field] = output
 		}
 	}
-	if endpoint == "/responses" {
-		body["max_output_tokens"] = output
-	} else if metadata.MaxTokens == 0 && metadata.MaxCompletion == 0 {
+	if metadata.MaxTokens == 0 && metadata.MaxCompletion == 0 {
 		body["max_tokens"] = output
 	}
 	multimodal := nonTextInput(body["input"])
@@ -1089,12 +1087,8 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return reasoningPrefix(s, n) + "..."
 }
-
-// Upstream error bodies may echo credentials or prompts; only generic metadata
-// may reach admin responses, request history, or logs.
-func errorMessage(_ []byte) string { return "upstream rejected request" }
 
 // handleMetrics exposes a live, depless JSON snapshot of all proxy activity.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

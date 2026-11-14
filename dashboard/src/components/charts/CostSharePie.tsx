@@ -4,7 +4,8 @@ import { useMemo, useState } from 'react';
 import { Cell, Pie, PieChart } from 'recharts';
 import { fmtInt, fmtMoney } from '../../api';
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '../ui/chart';
-import { ChartEmptyState, ChartSkeleton, PALETTE } from './shared';
+import { ChartEmptyState, ChartSkeleton } from './shared';
+import { PALETTE } from './config';
 
 export interface ProviderCostSlice {
   name: string;

@@ -84,7 +84,6 @@ export default function Settings({ state }: TabProps) {
 
   useEffect(() => {
     let active = true;
-    setLoading(true);
     Promise.all([getSettings(), getAudit()])
       .then(([s, a]) => {
         if (active) {

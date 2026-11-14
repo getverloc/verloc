@@ -52,60 +52,6 @@ func analyticsAggColumns() string {
 	return sb.String()
 }
 
-// addColumns accumulates the legacy token/cost/latency projection. Current SQL
-// aggregates also include the media quantities stored alongside each record.
-func (a *usageAccumulator) addColumns(ok, usageKnown, costKnown bool, tin, tout, tcache uint64, cost, latMs, ttftMs float64) {
-	a.Requests++
-	if !ok {
-		a.Errors++
-	}
-	a.TokIn += tin
-	a.TokOut += tout
-	a.TokCache += tcache
-	a.Cost += cost
-	if !usageKnown {
-		a.UnknownUsage++
-	}
-	if !costKnown {
-		a.UnknownCost++
-	}
-	a.latSum += latMs
-	a.latHist[bucketOf(latMs)]++
-	if ttftMs > 0 {
-		a.ttftSum += ttftMs
-		a.ttftN++
-		a.ttftHist[bucketOf(ttftMs)]++
-	}
-}
-
-func (a *usageAccumulator) addRecord(r ReqRecord) {
-	if r.ImagesKnown {
-		a.Images += int64(r.Images)
-	} else if strings.HasPrefix(r.Endpoint, "images") {
-		a.UnknownImages++
-	}
-	a.Requests++
-	if !r.OK {
-		a.Errors++
-	}
-	a.TokIn += r.TokIn
-	a.TokOut += r.TokOut
-	a.TokCache += r.TokCache
-	a.Cost += r.Cost
-	if !r.UsageKnown {
-		a.UnknownUsage++
-	}
-	if !r.CostKnown {
-		a.UnknownCost++
-	}
-	a.latSum += r.LatMs
-	a.latHist[bucketOf(r.LatMs)]++
-	if r.TTFTMs > 0 {
-		a.ttftSum += r.TTFTMs
-		a.ttftN++
-		a.ttftHist[bucketOf(r.TTFTMs)]++
-	}
-}
 func (a *usageAccumulator) merge(b *usageAccumulator) {
 	a.Images += b.Images
 	a.UnknownImages += b.UnknownImages

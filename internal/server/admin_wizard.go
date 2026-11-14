@@ -294,7 +294,7 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if resp.StatusCode != http.StatusOK {
-			writeErr(w, http.StatusBadGateway, errorMessage(body))
+			writeErr(w, http.StatusBadGateway, "upstream rejected request")
 			return
 		}
 		pageModels := parseModelsList(body)
@@ -567,10 +567,8 @@ func (s *Server) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	}
 	latMs := time.Since(start).Milliseconds()
 	if resp.StatusCode != http.StatusOK {
-		msg := errorMessage(body)
-		if msg == "" {
-			msg = fmt.Sprintf("upstream status %d", resp.StatusCode)
-		}
+		// Upstream bodies may echo credentials or prompts; expose only the status.
+		msg := fmt.Sprintf("upstream rejected request (status %d)", resp.StatusCode)
 		log.Printf("[admin] test upstream=%s kind=%s status=%d", upstream, operation, resp.StatusCode)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": false, "status": resp.StatusCode, "latency_ms": latMs, "kind": operation,

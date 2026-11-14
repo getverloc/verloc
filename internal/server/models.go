@@ -177,14 +177,6 @@ func (c *modelCatalog) Lookup(id string) *modelInfo {
 	return c.byID[id]
 }
 
-func (c *modelCatalog) All() []modelInfo {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	out := make([]modelInfo, len(c.all))
-	copy(out, c.all)
-	return out
-}
-
 // PricingMap returns the catalog's shared pricing table. Callers must not
 // mutate it (the dashboard only marshals it); it is rebuilt atomically
 // with the catalog on every SyncFromConfig.
@@ -345,22 +337,6 @@ func indexByte(s string, b byte) int {
 		}
 	}
 	return -1
-}
-
-// costOf computes the USD cost of a request given per-1M-token pricing.
-// Unknown pricing stays unknown to callers; zero here is only the numeric
-// contribution to an explicitly labeled estimated-cost aggregate.
-func costOf(modelID string, in, out, cache uint64) float64 {
-	catalog.mu.RLock()
-	p, ok := catalog.pricing[modelID]
-	catalog.mu.RUnlock()
-	if !ok {
-		return 0
-	}
-	if cache > in {
-		cache = in
-	}
-	return (float64(in-cache)*p.Input + float64(out)*p.Output + float64(cache)*p.CacheRead) / 1e6
 }
 
 // JSON field presence distinguishes an explicitly free model from missing

@@ -6,7 +6,8 @@ import { Skeleton } from '../components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { LatencyAreaChart } from '../components/charts/LatencyAreaChart';
 import { ModelRadar } from '../components/charts/ModelRadar';
-import { InlineError, KpiCard, PanelCard, shortName } from '../components/charts/shared';
+import { InlineError, KpiCard, PanelCard } from '../components/charts/shared';
+import { shortName } from '../components/charts/config';
 
 export default function Latency({ state, series, range }: TabProps) {
   const roll = useMemo(() => rollupSeries(series), [series]);

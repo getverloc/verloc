@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "oxlint",
+    "lint": "oxlint --deny-warnings",
     "test": "node --experimental-strip-types --test tests/*.test.mjs",
     "preview": "vite preview"
   },
@@ -30,7 +30,6 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "oxlint": "^1.88.0",
-    "shadcn": "^4.21.5",
     "typescript": "~6.0.2",
     "vite": "^8.1.1"
   }

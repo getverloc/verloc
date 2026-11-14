@@ -737,14 +737,6 @@ func decodeModelRows(rows []json.RawMessage, source string) []catalogEntry {
 	return out
 }
 
-func decodeModelList(body []byte, source string) ([]catalogEntry, error) {
-	rows, err := modelListRows(body)
-	if err != nil {
-		return nil, err
-	}
-	return decodeModelRows(rows, source), nil
-}
-
 func getJSON(ctx context.Context, url string, limit int64, timeout time.Duration) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

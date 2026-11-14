@@ -7,7 +7,8 @@ import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from 'recharts';
 import { fmtMs, type RangePreset, type SeriesPoint } from '../../api';
 import { fmtAxis } from '../../window';
 import { ChartContainer, ChartLegend, ChartLegendContent, ChartTooltip, ChartTooltipContent } from '../ui/chart';
-import { ChartEmptyState, ChartSkeleton, GRID_STROKE, PALETTE, TICK } from './shared';
+import { ChartEmptyState, ChartSkeleton } from './shared';
+import { GRID_STROKE, PALETTE, TICK } from './config';
 
 export function LatencyAreaChart({ series, range, loading }: {
   series: SeriesPoint[];

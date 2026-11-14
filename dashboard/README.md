@@ -18,3 +18,11 @@ npm run lint    # oxlint
 `internal/server/static/` is committed so a Go-only build works without Node.
 After a frontend change, rebuild the assets **and** the Go binary; a running
 binary embeds the previous assets and cannot pick up new ones from disk.
+
+## Component styles
+
+`src/styles/shadcn.css` is the MIT-licensed stylesheet from shadcn 4.23.0,
+vendored verbatim with its license. The build needs these Tailwind variants,
+not the shadcn CLI and its server/registry dependencies. Keep `components.json`
+and the `src/lib/utils.ts` alias for optional component generation; run the CLI
+separately when adding components, after reviewing its current advisories.

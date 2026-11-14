@@ -1,47 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
+import type { HistoryFilter } from '../history-filters';
 import { RotateCcw, Search } from 'lucide-react';
-import { listAdminModels, listAdminProviders, listClientKeys, type AdminModel, type AdminProvider, type ClientKey, type RangePreset } from '../api';
+import { listAdminModels, listAdminProviders, listClientKeys, type AdminModel, type AdminProvider, type ClientKey } from '../api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-
-export interface HistoryFilter { endpoint: string; model: string; backend: string; client_key_id: string; status: string; q: string; since: string; until: string }
-function readHistoryFilters(): HistoryFilter {
-  const params = new URLSearchParams(location.search);
-  const filters = { endpoint: params.get('endpoint') || '', model: params.get('model') || '', backend: params.get('backend') || '', client_key_id: params.get('client_key_id') || '', status: params.get('status') || '', q: params.get('q') || '', since: params.get('since') || '', until: params.get('until') || '' };
-  for (const key of ['since', 'until'] as const) {
-    if (!/^\d+$/.test(filters[key])) continue;
-    const date = new Date(Number(filters[key]));
-    if (Number.isFinite(date.getTime())) filters[key] = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-  }
-  return filters;
-}
-export function useHistoryFilters(range: RangePreset) {
-  const [filters, setFilters] = useState<HistoryFilter>(readHistoryFilters);
-  const [anchor, setAnchor] = useState(Date.now);
-  useEffect(() => {
-    const update = () => setFilters(readHistoryFilters());
-    window.addEventListener('popstate', update);
-    return () => window.removeEventListener('popstate', update);
-  }, []);
-  useEffect(() => {
-    const url = new URL(location.href);
-    for (const [key, value] of Object.entries(filters)) { if (value) url.searchParams.set(key, value); else url.searchParams.delete(key); }
-    history.replaceState(null, '', url);
-  }, [filters]);
-  const params = useMemo(() => {
-    const query = new URLSearchParams();
-    for (const [key, value] of Object.entries(filters)) {
-      if (!value) continue;
-      if (key === 'since' || key === 'until') { const ts = new Date(value).getTime(); if (Number.isFinite(ts)) query.set(key, String(ts)); }
-      else query.set(key, value);
-    }
-    if (!filters.since && range.ms !== null) query.set('since', String(Date.now() - range.ms));
-    return query;
-  }, [filters, range, anchor]);
-  return { filters, setFilters, params, refreshWindow: () => setAnchor(Date.now()) };
-}
 
 function FilterSelectField({ id, label, value, placeholder, options, onChange }: {
   id: string; label: string; value: string; placeholder: string;
@@ -75,8 +39,7 @@ export function HistoryFilters({ filters, onChange, onRefresh, busy }: { filters
   const [optionsRefresh, setOptionsRefresh] = useState(0);
   useEffect(() => {
     let active = true;
-    setOptionsError('');
-    Promise.all([listAdminModels(), listAdminProviders(), listClientKeys()]).then(([m, p, c]) => { if (active) { setModels(m.models || []); setProviders(p.providers || []); setClients(c.keys || []); } }).catch((e) => { if (active) setOptionsError(e instanceof Error ? e.message : 'Filter choices unavailable'); });
+    Promise.all([listAdminModels(), listAdminProviders(), listClientKeys()]).then(([m, p, c]) => { if (active) { setOptionsError(''); setModels(m.models || []); setProviders(p.providers || []); setClients(c.keys || []); } }).catch((e) => { if (active) setOptionsError(e instanceof Error ? e.message : 'Filter choices unavailable'); });
     return () => { active = false; };
   }, [optionsRefresh]);
   const update = (key: keyof HistoryFilter, value: string) => onChange({ ...filters, [key]: value });

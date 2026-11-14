@@ -43,9 +43,9 @@ export default function Admin({ state, section }: TabProps & { section: Section 
   const [wizOpen, setWizOpen] = useState(false);
 
   const refresh = useCallback(async (opts?: { keepErr?: boolean }) => {
-    if (!opts?.keepErr) setErr(null);
     try {
       const [p, m] = await Promise.all([listAdminProviders(), listAdminModels()]);
+      if (!opts?.keepErr) setErr(null);
       setProviders(p.providers || []);
       setModels(m.models || []);
     } catch (e) {
@@ -55,7 +55,14 @@ export default function Admin({ state, section }: TabProps & { section: Section 
     }
   }, []);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    let active = true;
+    Promise.all([listAdminProviders(), listAdminModels()])
+      .then(([p, m]) => { if (active) { setProviders(p.providers || []); setModels(m.models || []); } })
+      .catch((e) => { if (active) setErr((e as Error).message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
 
 
   const run = async (fn: () => Promise<void>, success: string) => {

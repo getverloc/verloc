@@ -26,8 +26,6 @@ import (
 )
 
 const (
-	dimEncodingJSON   = 0
-	dimEncodingBinary = 1
 	// dimCodecVersion is written as a leading byte on binary blobs and is not a
 	// valid '{' or '[' so it can never be confused with JSON.
 	dimCodecVersion = 0x7f

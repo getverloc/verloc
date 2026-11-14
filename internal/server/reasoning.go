@@ -243,17 +243,6 @@ type reasoningToolCall struct {
 	id, kind, name, arguments strings.Builder
 }
 
-func (a *sseReasoningAcc) ingest(payload []byte) {
-	if a == nil || len(payload) == 0 {
-		return
-	}
-	chunk, ok := decodeChunkMap(payload)
-	if !ok {
-		return
-	}
-	a.ingestMap(chunk)
-}
-
 // ingestMap is ingest for an already-decoded chunk, so the streaming path
 // can decode once and share the result with the reasoning alias.
 func (a *sseReasoningAcc) ingestMap(chunk map[string]any) {
@@ -401,23 +390,6 @@ func (a *sseReasoningAcc) store(cache *reasoningCache, ctx reasoningContext) {
 		key.history = reasoningHistoryNext(key.history, message)
 		cache.put(key, string(choice.buf))
 	}
-}
-
-// aliasReasoningInChunk copies delta/message.reasoning onto reasoning_content
-// so clients that only look for the DeepSeek field still capture thinking.
-func aliasReasoningInChunk(payload []byte) ([]byte, bool) {
-	chunk, ok := decodeChunkMap(payload)
-	if !ok {
-		return payload, false
-	}
-	if !aliasReasoningMap(chunk) {
-		return payload, false
-	}
-	out, err := json.Marshal(chunk)
-	if err != nil {
-		return payload, false
-	}
-	return out, true
 }
 
 // aliasReasoningMap applies the reasoning alias to an already-decoded

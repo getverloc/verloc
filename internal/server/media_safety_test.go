@@ -203,8 +203,14 @@ func TestMediaClientFailureRetainsUpstreamExpense(t *testing.T) {
 		t.Fatalf("upstream expense lost: %+v", r)
 	}
 	stats := s.runtime().backends["primary"].pool.Stats()
-	if len(stats) != 1 || stats[0].Cost != .1 || r.AttemptLog[0].Status != 200 {
-		t.Fatal("client disconnect hid the completed upstream expense")
+	if len(stats) != 1 || stats[0].Cost != .1 || stats[0].Requests != 1 || stats[0].OK != 1 || stats[0].Err != 0 || !stats[0].Healthy || r.AttemptLog[0].Status != 200 {
+		t.Fatalf("client disconnect misattributed upstream completion: stats=%+v record=%+v", stats, r)
+	}
+	metrics := s.metrics.Snapshot(s.runtime().backends)
+	backends, _ := metrics["per_backend"].(map[string]any)
+	primary, _ := backends["primary"].(map[string]any)
+	if primary["requests"] != uint64(1) || primary["ok"] != uint64(0) || primary["err"] != uint64(1) || primary["cost"] != .1 {
+		t.Fatalf("disconnect metrics should count one failed client request and one upstream expense: %+v", primary)
 	}
 }
 

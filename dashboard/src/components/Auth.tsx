@@ -19,12 +19,15 @@ export default function Auth({ children }: { children: ReactNode }) {
     try { setSession(await getSession()); } catch (e) { setError(e instanceof Error ? e.message : 'Unable to load session'); }
   };
   useEffect(() => {
-    void load();
+    let active = true;
+    getSession().then((next) => { if (active) setSession(next); }).catch((e) => {
+      if (active) setError(e instanceof Error ? e.message : 'Unable to load session');
+    });
     const expired = () => { setSession({ authenticated: false, setup_required: false }); setError('Your session expired. Sign in again.'); };
     const signedOut = () => { setSession({ authenticated: false, setup_required: false }); };
     window.addEventListener('verloc:unauthorized', expired);
     window.addEventListener('verloc:logout', signedOut);
-    return () => { window.removeEventListener('verloc:unauthorized', expired); window.removeEventListener('verloc:logout', signedOut); };
+    return () => { active = false; window.removeEventListener('verloc:unauthorized', expired); window.removeEventListener('verloc:logout', signedOut); };
   }, []);
   if (session?.authenticated) return children;
   const title = !session ? 'Connecting to gateway' : session.setup_required ? 'Set up owner access' : 'Sign in to verloc';

@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Inbox, TriangleAlert } from 'lucide-react';
 import { getRequests, fmtInt, fmtMoney, fmtTokens, fmtMs, fmtDateTime, type RequestPage, type TabProps, type ReqRecord } from '../api';
-import { HistoryFilters, useHistoryFilters } from '../components/HistoryFilters';
+import { HistoryFilters } from '../components/HistoryFilters';
+import { useHistoryFilters } from '../useHistoryFilters';
 import { InlineError, KpiCard } from '../components/charts/shared';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -120,26 +121,32 @@ function RequestDetail({ record }: { record: ReqRecord }) {
   );
 }
 
-export default function Requests({ range }: TabProps) {
-  const { filters, setFilters, params, refreshWindow } = useHistoryFilters(range);
-  const [data, setData] = useState<RequestPage | null>(null);
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(true);
-  const [cursor, setCursor] = useState('');
-  const [previous, setPrevious] = useState<string[]>([]);
+export default function Requests({ range, rangeAnchor }: TabProps) {
+  const { filters, setFilters, params, refreshWindow } = useHistoryFilters(range, rangeAnchor);
+  const [result, setResult] = useState<{ requestKey: { scope: string }; data: RequestPage | null; error: string } | null>(null);
+  const query = params.toString();
+  const [page, setPage] = useState({ query, cursor: '', previous: [] as string[] });
+  if (page.query !== query) setPage({ query, cursor: '', previous: [] });
+  const { cursor, previous } = page.query === query ? page : { cursor: '', previous: [] as string[] };
+
   const [refresh, setRefresh] = useState(0);
   const [selected, setSelected] = useState<ReqRecord | null>(null);
-  const query = params.toString();
-  useEffect(() => { setCursor(''); setPrevious([]); }, [query]);
+  const scope = JSON.stringify([query, cursor, refresh]);
+  const requestKey = useMemo(() => ({ scope }), [scope]);
+  const current = result?.requestKey === requestKey ? result : null;
+  const data = current?.data ?? null;
+  const error = current?.error ?? '';
+  const busy = current === null;
   useEffect(() => {
     const ac = new AbortController();
-    setBusy(true); setError(''); setData(null);
     const request = new URLSearchParams(query); request.set('limit', '50'); if (cursor) request.set('cursor', cursor);
-    getRequests(request, ac.signal).then(setData).catch((e) => { if (!ac.signal.aborted) setError(e instanceof Error ? e.message : 'Could not load requests'); }).finally(() => { if (!ac.signal.aborted) setBusy(false); });
+    getRequests(request, ac.signal)
+      .then((data) => { if (!ac.signal.aborted) setResult({ requestKey, data, error: '' }); })
+      .catch((e) => { if (!ac.signal.aborted) setResult({ requestKey, data: null, error: e instanceof Error ? e.message : 'Could not load requests' }); });
     return () => ac.abort();
-  }, [query, cursor, refresh]);
+  }, [query, cursor, requestKey]);
   const summary = data?.summary;
-  const refreshAll = () => { refreshWindow(); setCursor(''); setPrevious([]); setRefresh((v) => v + 1); };
+  const refreshAll = () => { refreshWindow(); setPage({ query, cursor: '', previous: [] }); setRefresh((v) => v + 1); };
   const canPrev = previous.length > 0;
   return <div className="space-y-5">
     <Card className="gap-0 rounded-none border-edge-700 bg-edge-900/95 py-0 shadow-none">
@@ -223,7 +230,7 @@ export default function Requests({ range }: TabProps) {
                 href="#"
                 aria-disabled={!canPrev || busy}
                 className={!canPrev || busy ? 'pointer-events-none opacity-50' : undefined}
-                onClick={(e) => { e.preventDefault(); if (canPrev && !busy) { setCursor(previous[previous.length - 1]); setPrevious((v) => v.slice(0, -1)); } }}
+                onClick={(e) => { e.preventDefault(); if (canPrev && !busy) { setPage({ query, cursor: previous[previous.length - 1], previous: previous.slice(0, -1) }); } }}
               />
             </PaginationItem>
             <PaginationItem>
@@ -234,7 +241,7 @@ export default function Requests({ range }: TabProps) {
                 href="#"
                 aria-disabled={busy || !data?.next_cursor}
                 className={busy || !data?.next_cursor ? 'pointer-events-none opacity-50' : undefined}
-                onClick={(e) => { e.preventDefault(); if (data?.next_cursor && !busy) { setPrevious((v) => [...v, cursor]); setCursor(data.next_cursor as string); } }}
+                onClick={(e) => { e.preventDefault(); if (data?.next_cursor && !busy) { setPage({ query, cursor: data.next_cursor, previous: [...previous, cursor] }); } }}
               />
             </PaginationItem>
           </PaginationContent>

@@ -19,20 +19,18 @@ import (
 // and message_delta + message_stop at the end. Block indices are implicit in
 // the emitted events' index fields.
 type anthropicStreamState struct {
-	model    string
-	msgID    string
-	started  bool
-	roleSent bool
+	model   string
+	msgID   string
+	started bool
 	// block bookkeeping
-	blockIndex       int
-	blockType        string // "text" | "thinking" | "tool_use"
-	toolOpen         bool
-	textOpen         bool
-	thinkOpen        bool
-	toolJSON         strings.Builder
-	toolID           string
-	toolName         string
-	toolEmittedStart bool
+	blockIndex int
+	blockType  string // "text" | "thinking" | "tool_use"
+	toolOpen   bool
+	textOpen   bool
+	thinkOpen  bool
+	toolJSON   strings.Builder
+	toolID     string
+	toolName   string
 	// completion bookkeeping
 	stopReason *string
 	inputTok   uint64

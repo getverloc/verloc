@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { discoverUpstreamModels, lookupModelHints, onboard, testUpstreamModel, type AdminModel, type AdminProvider, type DiscoveredModel, type ModelHint, type ProbeConn, type TestResult } from '../../api';
 import { toast } from 'sonner';
 import { Badge } from '../ui/badge';
@@ -53,7 +53,11 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
   const [wTesting, setWTesting] = useState<Record<string, boolean>>({});
   const [wSaving, setWSaving] = useState(false);
 
-  useEffect(() => { if (wizOpen) setWFetchErr(null); }, [wizOpen]);
+  const [previousOpen, setPreviousOpen] = useState(wizOpen);
+  if (wizOpen !== previousOpen) {
+    setPreviousOpen(wizOpen);
+    if (wizOpen) setWFetchErr(null);
+  }
 
   // ---- Wizard helpers (staged inputs; nothing is saved until review) ----
   const wizProviderName = wUseExisting || wName.trim();

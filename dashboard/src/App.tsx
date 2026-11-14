@@ -85,6 +85,7 @@ export default function App() { return <Auth><Gateway /></Auth>; }
 function Gateway() {
   const [tab, setTab] = useState<TabKey>(locationTab);
   const [range, setRange] = useState<RangePreset>(locationRange);
+  const [rangeAnchor, setRangeAnchor] = useState(Date.now);
   const [navOpen, setNavOpen] = useState(false);
   const [state, setState] = useState<State | null>(null);
   const [series, setSeries] = useState<SeriesPoint[]>([]);
@@ -98,12 +99,12 @@ function Gateway() {
   const [liveOn, setLiveOn] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   useEffect(() => {
-    const pop = () => { setTab(locationTab()); setRange(locationRange()); };
+    const pop = () => { setTab(locationTab()); setRange(locationRange()); setRangeAnchor(Date.now()); };
     window.addEventListener('popstate', pop);
     return () => window.removeEventListener('popstate', pop);
   }, []);
   const navigate = (next: TabKey) => { const url = new URL(location.href); url.searchParams.set('tab', next); history.pushState(null, '', url); setTab(next); setNavOpen(false); };
-  const changeRange = (next: RangePreset) => { const url = new URL(location.href); url.searchParams.set('range', next.key); history.pushState(null, '', url); setRange(next); };
+  const changeRange = (next: RangePreset, anchor: number) => { const url = new URL(location.href); url.searchParams.set('range', next.key); history.pushState(null, '', url); setRange(next); setRangeAnchor(anchor); };
   useEffect(() => {
     let stopped = false;
     let inFlight = false;
@@ -140,7 +141,7 @@ function Gateway() {
   }, []);
   const viewSeries = seriesKey === range.key ? series : EMPTY_SERIES;
   const roll = useMemo(() => rollupSeries(viewSeries), [viewSeries]);
-  const props: TabProps = { state, series: viewSeries, range, liveAlerts, liveKeyEvents, onRange: changeRange };
+  const props: TabProps = { state, series: viewSeries, range, rangeAnchor, liveAlerts, liveKeyEvents };
   const selectedTab = TABS.find((item) => item.key === tab)!;
   const selectedGroup = NAV_GROUPS.find((group) => group.keys.includes(tab))!;
   const tabNumber = String(TABS.findIndex((item) => item.key === tab) + 1).padStart(2, '0');
@@ -254,7 +255,7 @@ function Gateway() {
                 <div role="status" className="mt-1.5 text-[9px] leading-relaxed text-edge-500">{seriesKey !== range.key ? 'Loading historical snapshots…' : !viewSeries.length ? 'No historical snapshots in this window' : `${fmtMoney(roll.cost)} known spend · ${fmtInt(roll.requests)} requests · ${fmtTokens(roll.tokIn + roll.tokOut)} tokens · ${fmtSpan(roll.from, roll.to)}`}</div>
               </div>
               <div className="window-presets" role="group" aria-label="Reporting window">
-                {RANGE_PRESETS.map((preset) => <Button key={preset.key} variant={range.key === preset.key ? 'secondary' : 'ghost'} size="xs" aria-pressed={range.key === preset.key} className={range.key === preset.key ? 'bg-primary/10 text-primary' : 'text-edge-400'} onClick={() => changeRange(preset)}>{preset.label}</Button>)}
+                {RANGE_PRESETS.map((preset) => <Button key={preset.key} variant={range.key === preset.key ? 'secondary' : 'ghost'} size="xs" aria-pressed={range.key === preset.key} className={range.key === preset.key ? 'bg-primary/10 text-primary' : 'text-edge-400'} onClick={() => changeRange(preset, Date.now())}>{preset.label}</Button>)}
               </div>
             </div>
           )}

@@ -11,10 +11,6 @@ import (
 	"strings"
 )
 
-// anthropicVersion is echoed back on Messages responses; the header value
-// clients send is accepted as-is (Claude Code sends 2023-06-01).
-const anthropicVersion = "2023-06-01"
-
 // ---------------------------------------------------------------------------
 // Anthropic Messages request shape (inbound from the client)
 // ---------------------------------------------------------------------------
@@ -643,11 +639,4 @@ func anthropicCountTokens(body []byte) ([]byte, error) {
 	// token is the classic heuristic and errs on the high side of chars.
 	inputTokens := len(body) / 4
 	return json.Marshal(map[string]any{"input_tokens": inputTokens})
-}
-
-// isAnthropicClient reports whether the request came from an Anthropic-
-// protocol client, keyed on the anthropic-version header (which every
-// Anthropic SDK and Claude Code sends; discovery requests do not).
-func isAnthropicClient(r *http.Request) bool {
-	return r.Header.Get("anthropic-version") != ""
 }

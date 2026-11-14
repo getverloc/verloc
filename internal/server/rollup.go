@@ -353,17 +353,6 @@ func (s *Store) RebuildTotals() error {
 	return err
 }
 
-// SumSnapshots computes the lifetime totals directly from raw ticks. Only used
-// to verify the maintained row (tests, repair) — never on a request path.
-func (s *Store) SumSnapshots() (cost float64, requests, tokIn, tokOut, tokCache, errN int64) {
-	row := s.db.QueryRow(
-		`SELECT COALESCE(SUM(d_cost),0), COALESCE(SUM(d_requests),0), COALESCE(SUM(d_tok_in),0),
-		        COALESCE(SUM(d_tok_out),0), COALESCE(SUM(d_tok_cache),0), COALESCE(SUM(d_err),0)
-		 FROM snapshots`)
-	_ = row.Scan(&cost, &requests, &tokIn, &tokOut, &tokCache, &errN)
-	return
-}
-
 // LifetimeTotals sums the retained window. This is the dashboard's
 // headline lifetime cost — it survives verloc restarts.
 // LifetimeTotals reads the running totals row maintained by InsertDelta.

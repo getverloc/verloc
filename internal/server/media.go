@@ -541,6 +541,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			_ = controller.SetWriteDeadline(time.Time{})
 			if writeErr != nil {
 				rec.Status, rec.Outcome, rec.ErrMsg = 499, "canceled", "client write failed"
+				// The attempt tracks upstream completion; the request tracks delivery.
 				finishAttempt(resp.StatusCode, "completed")
 				return
 			}
