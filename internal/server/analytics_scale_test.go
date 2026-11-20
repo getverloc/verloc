@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"testing"
@@ -43,105 +46,327 @@ func TestSnapshotHourEquivalenceAndSeriesSinceHourlyTier(t *testing.T) {
 		}
 	}
 
-	type hourRow struct {
+	type rollupRow struct {
 		req, tin, tout, tcache, errN, ms int64
 		cost                             float64
 		latW, latSum, ttftW, ttftSum     float64
 		histN, missingN                  int64
 		models                           []byte
 	}
-	readHours := func() map[int64]hourRow {
-		rows, err := s.db.Query(`SELECT hour,requests,tok_in,tok_out,tok_cache,err,ms,cost,lat_w,lat_sum,ttft_w,ttft_sum,hist_n,missing_n,models FROM snapshot_hour ORDER BY hour`)
+	readTier := func(table, col string) map[int64]rollupRow {
+		rows, err := s.db.Query(`SELECT ` + col + `,requests,tok_in,tok_out,tok_cache,err,ms,cost,lat_w,lat_sum,ttft_w,ttft_sum,hist_n,missing_n,models FROM ` + table + ` ORDER BY ` + col)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer rows.Close()
-		out := map[int64]hourRow{}
+		out := map[int64]rollupRow{}
 		for rows.Next() {
-			var h int64
-			var r hourRow
-			if err := rows.Scan(&h, &r.req, &r.tin, &r.tout, &r.tcache, &r.errN, &r.ms, &r.cost,
+			var k int64
+			var r rollupRow
+			if err := rows.Scan(&k, &r.req, &r.tin, &r.tout, &r.tcache, &r.errN, &r.ms, &r.cost,
 				&r.latW, &r.latSum, &r.ttftW, &r.ttftSum, &r.histN, &r.missingN, &r.models); err != nil {
 				t.Fatal(err)
 			}
-			out[h] = r
+			out[k] = r
 		}
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
 		return out
 	}
-
-	incr := readHours()
-	if len(incr) != 24 {
-		t.Fatalf("incremental snapshot_hour rows=%d, want 24", len(incr))
+	compareTier := func(label string, aMap, bMap map[int64]rollupRow) {
+		t.Helper()
+		if len(aMap) != len(bMap) {
+			t.Fatalf("%s len=%d, want %d", label, len(bMap), len(aMap))
+		}
+		for k, a := range aMap {
+			b, ok := bMap[k]
+			if !ok {
+				t.Fatalf("%s bucket %d missing", label, k)
+			}
+			if a.req != b.req || a.tin != b.tin || a.tout != b.tout || a.tcache != b.tcache ||
+				a.errN != b.errN || a.ms != b.ms || a.histN != b.histN || a.missingN != b.missingN ||
+				diffFloat(a.cost, b.cost) || diffFloat(a.latW, b.latW) || diffFloat(a.latSum, b.latSum) ||
+				diffFloat(a.ttftW, b.ttftW) || diffFloat(a.ttftSum, b.ttftSum) || string(a.models) != string(b.models) {
+				t.Fatalf("%s bucket %d mismatch:\n a=%+v\n b=%+v", label, k, a, b)
+			}
+		}
 	}
+
+	incrHours := readTier("snapshot_hour", "hour")
+	incr10m := readTier("snapshot_10m", "bucket")
+	if len(incrHours) != 24 {
+		t.Fatalf("incremental snapshot_hour rows=%d, want 24", len(incrHours))
+	}
+	if len(incr10m) != 144 {
+		t.Fatalf("incremental snapshot_10m rows=%d, want 144", len(incr10m))
+	}
+
 	if _, err := s.RebuildRollups(ctx); err != nil {
 		t.Fatal(err)
 	}
-	rebuilt := readHours()
-	if len(rebuilt) != len(incr) {
-		t.Fatalf("rebuilt snapshot_hour rows=%d, want %d", len(rebuilt), len(incr))
+	compareTier("RebuildRollups/hour", incrHours, readTier("snapshot_hour", "hour"))
+	compareTier("RebuildRollups/10m", incr10m, readTier("snapshot_10m", "bucket"))
+
+	// RebuildCoarseRollupsFromMinutes must produce identical snapshot_10m and
+	// snapshot_hour rows directly from snapshot_minute.
+	tenN, hrN, err := s.RebuildCoarseRollupsFromMinutes(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for h, a := range incr {
-		b, ok := rebuilt[h]
-		if !ok {
-			t.Fatalf("hour %d missing after RebuildRollups", h)
+	if tenN != 144 || hrN != 24 {
+		t.Fatalf("RebuildCoarseRollupsFromMinutes=(%d,%d), want (144,24)", tenN, hrN)
+	}
+	compareTier("RebuildCoarseFromMinutes/hour", incrHours, readTier("snapshot_hour", "hour"))
+	compareTier("RebuildCoarseFromMinutes/10m", incr10m, readTier("snapshot_10m", "bucket"))
+
+	// Verify SeriesSince uses hourly tier (AggregateBucketMs >= 3600000) and
+	// 10m tier (AggregateBucketMs == 600000..1800000) while preserving exact
+	// totals, dimensions, and histograms for full-range and mid-bucket queries.
+	cases := []struct {
+		name      string
+		since     int64
+		maxPoints int
+		minBucket int64
+		maxBucket int64
+	}{
+		{"hour_all", 0, 10, hourMs, 4 * hourMs},
+		{"hour_mid", base + 20*60_000, 10, hourMs, 4 * hourMs},
+		{"hour_75pct_budget", base + 20*60_000, 30, hourMs, hourMs}, // 24h >= 30*1h*3/4 -> uses 1h tier directly
+		{"10m_all", 0, 100, tenMinMs, 3 * tenMinMs},
+		{"10m_mid", base + 4*60_000, 100, tenMinMs, 3 * tenMinMs},
+		{"10m_75pct_budget", base + 4*60_000, 160, tenMinMs, tenMinMs}, // 24h >= 160*10m*3/4 -> uses 10m tier directly
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := s.SeriesSince(ctx, tc.since, tc.maxPoints)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) == 0 || len(rows) > tc.maxPoints {
+				t.Fatalf("len(rows)=%d, want 1..%d", len(rows), tc.maxPoints)
+			}
+			if rows[0].AggregateBucketMs < tc.minBucket || rows[0].AggregateBucketMs > tc.maxBucket {
+				t.Fatalf("AggregateBucketMs=%d, want [%d, %d]", rows[0].AggregateBucketMs, tc.minBucket, tc.maxBucket)
+			}
+			// Compare against raw ticks directly.
+			var wantReq, wantIn, wantOut, wantErr int64
+			var wantCost float64
+			if err := s.db.QueryRow(`SELECT COALESCE(SUM(d_requests),0), COALESCE(SUM(d_tok_in),0), COALESCE(SUM(d_tok_out),0), COALESCE(SUM(d_err),0), COALESCE(SUM(d_cost),0) FROM snapshots WHERE ts >= ?`, tc.since).
+				Scan(&wantReq, &wantIn, &wantOut, &wantErr, &wantCost); err != nil {
+				t.Fatal(err)
+			}
+			var gotReq, gotIn, gotOut, gotErr, modelReq, backendReq int64
+			var gotCost float64
+			for _, r := range rows {
+				gotReq += r.Requests
+				gotIn += r.TokIn
+				gotOut += r.TokOut
+				gotErr += r.Err
+				gotCost += r.Cost
+				for _, m := range r.Models {
+					modelReq += m.Requests
+				}
+				for _, b := range r.Backends {
+					backendReq += b.Requests
+				}
+				if r.DistributionsUnavailable || r.LatP95 == 0 {
+					t.Fatalf("missing distributions on bucket ts=%d", r.TS)
+				}
+			}
+			if gotReq != wantReq || gotIn != wantIn || gotOut != wantOut || gotErr != wantErr || diffFloat(gotCost, wantCost) {
+				t.Fatalf("totals mismatch: got (%d,%d,%d,%d,%v) want (%d,%d,%d,%d,%v)",
+					gotReq, gotIn, gotOut, gotErr, gotCost, wantReq, wantIn, wantOut, wantErr, wantCost)
+			}
+			if modelReq != wantReq || backendReq != wantReq {
+				t.Fatalf("dimensions lost: modelReq=%d backendReq=%d want=%d", modelReq, backendReq, wantReq)
+			}
+			// Verify leading partial bucket does NOT absorb the first full bucket
+			// when AggregateBucketMs == tier width (no 1.7x first-point spike).
+			if tc.name == "hour_75pct_budget" {
+				// base + 20m .. base + 58m = 20 ticks = 40 requests; hour 1 = 30 ticks = 60 requests.
+				if rows[0].Requests != 40 || rows[1].Requests != 60 {
+					t.Fatalf("leading partial hour merged into hour 1: rows[0].Requests=%d rows[1].Requests=%d (want 40, 60)",
+						rows[0].Requests, rows[1].Requests)
+				}
+			}
+			if tc.name == "10m_75pct_budget" {
+				// base + 4m, 6m, 8m = 3 ticks = 6 requests; next 10m bucket = 5 ticks = 10 requests.
+				if rows[0].Requests != 6 || rows[1].Requests != 10 {
+					t.Fatalf("leading partial 10m merged into bucket 1: rows[0].Requests=%d rows[1].Requests=%d (want 6, 10)",
+						rows[0].Requests, rows[1].Requests)
+				}
+			}
+		})
+	}
+}
+
+func TestMarshalSeriesRowsParityAndGzipCache(t *testing.T) {
+	rows := []SeriesRow{
+		{
+			TS: 1700000000000, Requests: 0, MS: 60000,
+			DistributionsApproximate: true, AggregateBucketMs: 60000,
+		},
+		{
+			TS: 1700000060000, Requests: 5, TokIn: 1200, TokOut: 345, TokCache: 80,
+			Cost: 0.00000042, MS: 60000, Err: 1,
+			Models: map[string]deltaModel{
+				`weird/"model<>&\n日本語`: {Requests: 5, TokIn: 1200, TokOut: 345, TokCache: 80, Err: 1, Failover: 2, Cost: 0.00000042},
+			},
+			Backends: map[string]deltaBackend{
+				"openai": {Requests: 5, TokIn: 1200, TokOut: 345, TokCache: 80, Err: 1, Failover: 2, Cost: 0.00000042},
+			},
+			LatAvg: 423.5, LatP50: 300, LatP95: 1200, LatP99: 2500, TTFTAvg: 95.25,
+			DistributionsUnavailable: false, DistributionsApproximate: true, AggregateBucketMs: 600000,
+		},
+	}
+
+	fastBytes := marshalSeriesRows(rows)
+	stdBytes, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotFast, gotStd []SeriesRow
+	if err := json.Unmarshal(fastBytes, &gotFast); err != nil {
+		t.Fatalf("fast JSON invalid: %v\n%s", err, string(fastBytes))
+	}
+	if err := json.Unmarshal(stdBytes, &gotStd); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotFast, gotStd) {
+		t.Fatalf("marshalSeriesRows mismatch:\n got=%+v\n std=%+v", gotFast, gotStd)
+	}
+
+	gz := gzipSeriesBytes(fastBytes)
+	gr, err := gzip.NewReader(bytes.NewReader(gz))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	unzipped, err := io.ReadAll(gr)
+	_ = gr.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(unzipped, fastBytes) {
+		t.Fatal("gzip round-trip mismatch")
+	}
+}
+
+func TestSeriesCacheAndCoarseBackfill(t *testing.T) {
+	s := testKeyEventStore(t)
+	ctx := context.Background()
+	base := int64(1700000000000 / 3600000 * 3600000)
+
+	// Seed 4 hours of ticks (every 2 minutes = 120 ticks), alternating idle & active.
+	for i := range 120 {
+		d := &Delta{TS: base + int64(i)*120_000, MS: 120_000}
+		if i%3 == 0 {
+			d.Requests = 1
+			d.TokIn = 100
+			d.Cost = 0.001
+			d.Models = map[string]deltaModel{"m": {Requests: 1, TokIn: 100, Cost: 0.001}}
+			d.Backends = map[string]deltaBackend{"b": {Requests: 1, TokIn: 100, Cost: 0.001}}
+			d.Payload = `{"avg":200,"p50":200,"p95":200,"p99":200,"ttft":50,"ttft_n":1,"lat_hist":[0,0,1,0,0,0,0,0,0,0,0]}`
 		}
-		if a.req != b.req || a.tin != b.tin || a.tout != b.tout || a.tcache != b.tcache ||
-			a.errN != b.errN || a.ms != b.ms || a.histN != b.histN || a.missingN != b.missingN ||
-			diffFloat(a.cost, b.cost) || diffFloat(a.latW, b.latW) || diffFloat(a.latSum, b.latSum) ||
-			diffFloat(a.ttftW, b.ttftW) || diffFloat(a.ttftSum, b.ttftSum) || string(a.models) != string(b.models) {
-			t.Fatalf("hour %d mismatch:\n incr=%+v\n rebuilt=%+v", h, a, b)
+		if err := s.InsertDelta(d); err != nil {
+			t.Fatal(err)
 		}
 	}
 
-	// Verify SeriesSince uses hourly tier (AggregateBucketMs >= 3600000) and
-	// preserves exact totals, dimensions, and histograms for both full-range
-	// and mid-hour sinceMs queries.
-	for _, since := range []int64{0, base + 20*60_000} {
-		rows, err := s.SeriesSince(ctx, since, 10)
-		if err != nil {
-			t.Fatal(err)
+	// SeriesSinceEncoded must support both plain JSON and pre-compressed gzip
+	// and match SeriesSince. 4 hours = 24 10m buckets > 20 maxPoints -> 20m buckets.
+	raw1, err := s.SeriesSinceJSON(ctx, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz1, isGz, err := s.SeriesSinceEncoded(ctx, 0, 20, true)
+	if err != nil || !isGz {
+		t.Fatalf("SeriesSinceEncoded gzip=(%v, %v), want true, nil", isGz, err)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(gz1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gunzipped, err := io.ReadAll(gr)
+	_ = gr.Close()
+	if err != nil || !bytes.Equal(gunzipped, raw1) {
+		t.Fatalf("SeriesSinceEncoded gzip payload mismatch (err=%v)", err)
+	}
+	rows1, err := s.SeriesSince(ctx, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []SeriesRow
+	if err := json.Unmarshal(raw1, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != len(rows1) || len(decoded) == 0 {
+		t.Fatalf("decoded len=%d, rows1 len=%d", len(decoded), len(rows1))
+	}
+	if decoded[0].AggregateBucketMs != 2*tenMinMs {
+		t.Fatalf("expected 10m tier (bucket=%d), got %d", 2*tenMinMs, decoded[0].AggregateBucketMs)
+	}
+
+	// Inserting a new delta must immediately invalidate the cache.
+	if err := s.InsertDelta(&Delta{
+		TS: base + 120*120_000, MS: 120_000, Requests: 7, TokIn: 700, Cost: 0.007,
+		Models:   map[string]deltaModel{"m": {Requests: 7, TokIn: 700, Cost: 0.007}},
+		Backends: map[string]deltaBackend{"b": {Requests: 7, TokIn: 700, Cost: 0.007}},
+		Payload:  `{"avg":200,"p50":200,"p95":200,"p99":200,"ttft":50,"ttft_n":7,"lat_hist":[0,0,7,0,0,0,0,0,0,0,0]}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw2, err := s.SeriesSinceJSON(ctx, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded2 []SeriesRow
+	if err := json.Unmarshal(raw2, &decoded2); err != nil {
+		t.Fatal(err)
+	}
+	var sum1, sum2 int64
+	for _, r := range decoded {
+		sum1 += r.Requests
+	}
+	for _, r := range decoded2 {
+		sum2 += r.Requests
+	}
+	if sum2 != sum1+7 {
+		t.Fatalf("cache did not invalidate after InsertDelta: sum1=%d sum2=%d", sum1, sum2)
+	}
+
+	// Direct SQL deletion of snapshot_10m must invalidate cache and fall back cleanly
+	// to snapshot_minute, then EnsureRollupsBackfilled must fast-rebuild snapshot_10m
+	// from snapshot_minute.
+	if _, err := s.db.Exec(`DELETE FROM snapshot_10m`); err != nil {
+		t.Fatal(err)
+	}
+	rowsFallback, err := s.SeriesSince(ctx, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sumFallback int64
+	for _, r := range rowsFallback {
+		sumFallback += r.Requests
+	}
+	if sumFallback != sum2 {
+		t.Fatalf("fallback totals mismatch: got %d want %d", sumFallback, sum2)
+	}
+
+	s.EnsureRollupsBackfilled(ctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var n10 int
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshot_10m`).Scan(&n10)
+		if n10 > 0 {
+			break
 		}
-		if len(rows) == 0 || len(rows) > 10 {
-			t.Fatalf("since=%d: len(rows)=%d, want 1..10", since, len(rows))
-		}
-		if rows[0].AggregateBucketMs < 3600000 {
-			t.Fatalf("since=%d: expected hourly tier (bucket>=3600000), got %d", since, rows[0].AggregateBucketMs)
-		}
-		// Compare against raw ticks directly.
-		var wantReq, wantIn, wantOut, wantErr int64
-		var wantCost float64
-		if err := s.db.QueryRow(`SELECT COALESCE(SUM(d_requests),0), COALESCE(SUM(d_tok_in),0), COALESCE(SUM(d_tok_out),0), COALESCE(SUM(d_err),0), COALESCE(SUM(d_cost),0) FROM snapshots WHERE ts >= ?`, since).
-			Scan(&wantReq, &wantIn, &wantOut, &wantErr, &wantCost); err != nil {
-			t.Fatal(err)
-		}
-		var gotReq, gotIn, gotOut, gotErr, modelReq, backendReq int64
-		var gotCost float64
-		for _, r := range rows {
-			gotReq += r.Requests
-			gotIn += r.TokIn
-			gotOut += r.TokOut
-			gotErr += r.Err
-			gotCost += r.Cost
-			for _, m := range r.Models {
-				modelReq += m.Requests
-			}
-			for _, b := range r.Backends {
-				backendReq += b.Requests
-			}
-			if r.DistributionsUnavailable || r.LatP95 == 0 {
-				t.Fatalf("since=%d: missing distributions on bucket ts=%d", since, r.TS)
-			}
-		}
-		if gotReq != wantReq || gotIn != wantIn || gotOut != wantOut || gotErr != wantErr || diffFloat(gotCost, wantCost) {
-			t.Fatalf("since=%d totals mismatch: got (%d,%d,%d,%d,%v) want (%d,%d,%d,%d,%v)",
-				since, gotReq, gotIn, gotOut, gotErr, gotCost, wantReq, wantIn, wantOut, wantErr, wantCost)
-		}
-		if modelReq != wantReq || backendReq != wantReq {
-			t.Fatalf("since=%d dimensions lost: modelReq=%d backendReq=%d want=%d", since, modelReq, backendReq, wantReq)
-		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var n10 int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshot_10m`).Scan(&n10)
+	if n10 == 0 {
+		t.Fatal("EnsureRollupsBackfilled did not rebuild snapshot_10m from snapshot_minute")
 	}
 }
 

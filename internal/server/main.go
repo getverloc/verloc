@@ -434,10 +434,12 @@ var gzipSkipPaths = map[string]bool{
 }
 
 // gzipWriterPool reuses *gzip.Writer instances (~800 KB deflate state each)
-// across compressed responses instead of allocating per request.
+// across compressed responses instead of allocating per request. BestSpeed
+// (level 1) cuts JSON compression CPU ~4-5x vs level 6 with minimal size delta.
 var gzipWriterPool = sync.Pool{
 	New: func() any {
-		return gzip.NewWriter(io.Discard)
+		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return w
 	},
 }
 

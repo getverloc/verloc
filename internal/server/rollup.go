@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+const (
+	minuteMs = int64(60_000)
+	tenMinMs = int64(600_000)
+	hourMs   = int64(3_600_000)
+)
+
 func mergeMinuteAcc(a, b *minuteAcc) *minuteAcc {
 	a.req += b.req
 	a.errN += b.errN
@@ -53,9 +59,10 @@ func mergeMinuteAcc(a, b *minuteAcc) *minuteAcc {
 	return a
 }
 
-// RebuildRollups rebuilds snapshot_minute and snapshot_hour from the raw tick
-// table in a single ascending pass. This is the migration for history that
-// predates the rollups (and the repair path if a rollup is ever lost).
+// RebuildRollups rebuilds snapshot_minute, snapshot_10m, and snapshot_hour
+// from the raw tick table in a single ascending pass. This is the migration
+// for history that predates the rollups (and the repair path if a rollup is
+// ever lost).
 func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -74,14 +81,19 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 	if _, err = tx.Exec(`DELETE FROM snapshot_minute`); err != nil {
 		return 0, err
 	}
+	if _, err = tx.Exec(`DELETE FROM snapshot_10m`); err != nil {
+		return 0, err
+	}
 	if _, err = tx.Exec(`DELETE FROM snapshot_hour`); err != nil {
 		return 0, err
 	}
 
 	var (
 		curMinute int64 = -1
+		curTenMin int64 = -1
 		curHour   int64 = -1
 		minAcc          = newMinuteAcc()
+		tenMinAcc       = newMinuteAcc()
 		hourAcc         = newMinuteAcc()
 		written   int
 	)
@@ -95,17 +107,35 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 		hourAcc = newMinuteAcc()
 		return nil
 	}
+	flushTenMin := func() error {
+		if curTenMin < 0 {
+			return nil
+		}
+		if err := tenMinAcc.insertDirect(tx, "snapshot_10m", "bucket", curTenMin); err != nil {
+			return err
+		}
+		tenMinAcc = newMinuteAcc()
+		return nil
+	}
 	flushMinute := func() error {
 		if curMinute < 0 {
 			return nil
 		}
-		hr := curMinute / 3600000 * 3600000
+		tm := curMinute / tenMinMs * tenMinMs
+		if tm != curTenMin {
+			if err := flushTenMin(); err != nil {
+				return err
+			}
+			curTenMin = tm
+		}
+		hr := curMinute / hourMs * hourMs
 		if hr != curHour {
 			if err := flushHour(); err != nil {
 				return err
 			}
 			curHour = hr
 		}
+		mergeMinuteAcc(tenMinAcc, minAcc)
 		mergeMinuteAcc(hourAcc, minAcc)
 		if err := minAcc.insertDirect(tx, "snapshot_minute", "minute", curMinute); err != nil {
 			return err
@@ -133,7 +163,7 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 		if d.Backends == nil {
 			d.Backends = map[string]deltaBackend{}
 		}
-		minute := d.TS / 60000 * 60000
+		minute := d.TS / minuteMs * minuteMs
 		if minute != curMinute {
 			if err := flushMinute(); err != nil {
 				return 0, err
@@ -148,59 +178,218 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 	if err := flushMinute(); err != nil {
 		return 0, err
 	}
+	if err := flushTenMin(); err != nil {
+		return 0, err
+	}
 	if err := flushHour(); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	s.bumpSeriesRev()
 	return written, nil
 }
 
+// RebuildCoarseRollupsFromMinutes builds snapshot_10m and snapshot_hour from
+// an already-populated snapshot_minute table in one ascending pass (~20x fewer
+// rows than raw ticks). Used for fast upgrade backfills when minute rollups
+// are already present.
+func (s *Store) RebuildCoarseRollupsFromMinutes(ctx context.Context) (int, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT minute, requests, err, tok_in, tok_out, tok_cache, cost, ms,
+		       lat_w, lat_sum, ttft_w, ttft_sum,
+		       CASE WHEN requests=0 AND err=0 AND cost=0 THEN '' WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
+		       CASE WHEN requests=0 AND err=0 AND cost=0 THEN '' WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
+		       CASE WHEN requests=0 AND err=0 AND cost=0 THEN X'' ELSE models END,
+		       hist_n, missing_n
+		FROM snapshot_minute
+		ORDER BY minute ASC`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM snapshot_10m`); err != nil {
+		return 0, 0, err
+	}
+	if _, err = tx.Exec(`DELETE FROM snapshot_hour`); err != nil {
+		return 0, 0, err
+	}
+
+	var (
+		curTenMin int64 = -1
+		curHour   int64 = -1
+		tenMinAcc       = newMinuteAcc()
+		hourAcc         = newMinuteAcc()
+		tenCount  int
+		hourCount int
+	)
+	flushHour := func() error {
+		if curHour < 0 {
+			return nil
+		}
+		if err := hourAcc.insertDirect(tx, "snapshot_hour", "hour", curHour); err != nil {
+			return err
+		}
+		hourCount++
+		hourAcc = newMinuteAcc()
+		return nil
+	}
+	flushTenMin := func() error {
+		if curTenMin < 0 {
+			return nil
+		}
+		if err := tenMinAcc.insertDirect(tx, "snapshot_10m", "bucket", curTenMin); err != nil {
+			return err
+		}
+		tenCount++
+		tenMinAcc = newMinuteAcc()
+		return nil
+	}
+
+	var (
+		m, req, errN, tin, tout, tcache, ms, histN, missingN int64
+		cost, latW, latSum, ttftW, ttftSum                   float64
+		hj, thj, mj                                          sql.RawBytes
+	)
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return 0, 0, err
+		}
+		if err := rows.Scan(&m, &req, &errN, &tin, &tout, &tcache, &cost, &ms,
+			&latW, &latSum, &ttftW, &ttftSum, &hj, &thj, &mj, &histN, &missingN); err != nil {
+			return 0, 0, err
+		}
+		tm := m / tenMinMs * tenMinMs
+		if tm != curTenMin {
+			if err := flushTenMin(); err != nil {
+				return 0, 0, err
+			}
+			curTenMin = tm
+		}
+		hr := m / hourMs * hourMs
+		if hr != curHour {
+			if err := flushHour(); err != nil {
+				return 0, 0, err
+			}
+			curHour = hr
+		}
+		for _, acc := range []*minuteAcc{tenMinAcc, hourAcc} {
+			acc.req += req
+			acc.errN += errN
+			acc.tin += tin
+			acc.tout += tout
+			acc.tcache += tcache
+			acc.cost += cost
+			acc.ms += ms
+			acc.latW += latW
+			acc.latSum += latSum
+			acc.ttftW += ttftW
+			acc.ttftSum += ttftSum
+			acc.histN += histN
+			acc.missingN += missingN
+		}
+		if len(mj) > 0 {
+			gotH, gotTH, _ := decodeMinutesInto(mj, tenMinAcc.models, tenMinAcc.backends, &tenMinAcc.hist, &tenMinAcc.ttftHist)
+			_, _, _ = decodeMinutesInto(mj, hourAcc.models, hourAcc.backends, &hourAcc.hist, &hourAcc.ttftHist)
+			if !gotH && len(hj) > 0 {
+				var h []uint64
+				if json.Unmarshal(hj, &h) == nil && len(h) == len(latBuckets)+1 {
+					for i, v := range h {
+						tenMinAcc.hist[i] += v
+						hourAcc.hist[i] += v
+					}
+				}
+			}
+			if !gotTH && len(thj) > 0 {
+				var th []uint64
+				if json.Unmarshal(thj, &th) == nil && len(th) == len(latBuckets)+1 {
+					for i, v := range th {
+						tenMinAcc.ttftHist[i] += v
+						hourAcc.ttftHist[i] += v
+					}
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+	if err := flushTenMin(); err != nil {
+		return 0, 0, err
+	}
+	if err := flushHour(); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	s.bumpSeriesRev()
+	return tenCount, hourCount, nil
+}
+
 // EnsureRollupsBackfilled repairs derived state for history that predates it.
-// It stays O(1) when everything is consistent. Runs in the background so
-// startup is never blocked by a large rebuild.
+// Synchronous checks stay O(1)/O(log N) via EXISTS(... LIMIT 1) and B-tree
+// endpoint seeks so startup is never stalled by full-table scans on a large
+// database; any needed repair runs in a background goroutine while reads
+// remain exact via transparent fallback.
 func (s *Store) EnsureRollupsBackfilled(ctx context.Context) {
 	s.mu.Lock()
-	var minutes, hours, ticks, totalTicks, reqCount, reqCacheReady int64
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshot_minute`).Scan(&minutes)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshot_hour`).Scan(&hours)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&ticks)
-	_ = s.db.QueryRow(`SELECT ticks FROM analytics_totals WHERE id=1`).Scan(&totalTicks)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&reqCount)
+	var hasTicks, hasMinutes, hasTenMin, hasHours, hasReqs int
+	var oldestSnap, newestSnap, totalTicks, totalOldest, totalNewest, reqCacheReady int64
+	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshots LIMIT 1)`).Scan(&hasTicks)
+	if hasTicks > 0 {
+		_ = s.db.QueryRow(`SELECT
+			COALESCE((SELECT ts FROM snapshots ORDER BY ts ASC LIMIT 1), 0),
+			COALESCE((SELECT ts FROM snapshots ORDER BY ts DESC LIMIT 1), 0)`).Scan(&oldestSnap, &newestSnap)
+	}
+	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshot_minute LIMIT 1)`).Scan(&hasMinutes)
+	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshot_10m LIMIT 1)`).Scan(&hasTenMin)
+	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshot_hour LIMIT 1)`).Scan(&hasHours)
+	_ = s.db.QueryRow(`SELECT ticks, oldest_ts, newest_ts FROM analytics_totals WHERE id=1`).Scan(&totalTicks, &totalOldest, &totalNewest)
+	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests LIMIT 1)`).Scan(&hasReqs)
 	_ = s.db.QueryRow(`SELECT COALESCE((SELECT value FROM analytics_meta WHERE name='request_hour_cache_ready'), 0)`).Scan(&reqCacheReady)
 	s.mu.Unlock()
-	// A database upgraded from a schema without analytics_totals (or one that
-	// briefly ran a build that never seeded it) has ticks but an empty/partial
-	// totals row, so LifetimeTotals and the retained-window Range would read
-	// zero for all pre-existing history. The healthy invariant is exactly one
-	// totals increment per snapshot row, so any mismatch marks the row as
-	// unseeded. RebuildTotals takes s.mu like every tick insert, so it cannot
-	// interleave with the live writer.
-	needsTotals := ticks > 0 && totalTicks != ticks
-	needsRollups := ticks > 0 && (minutes == 0 || hours == 0)
-	needsReqCache := reqCount > 0 && reqCacheReady == 0
-	if !needsTotals && !needsRollups && !needsReqCache {
+
+	needsFullRollups := hasTicks > 0 && hasMinutes == 0
+	needsCoarseRollups := hasTicks > 0 && hasMinutes > 0 && (hasTenMin == 0 || hasHours == 0)
+	needsTotalsQuick := hasTicks > 0 && (totalTicks == 0 || totalOldest != oldestSnap || totalNewest != newestSnap)
+	needsReqCache := hasReqs > 0 && reqCacheReady == 0
+	if !needsFullRollups && !needsCoarseRollups && !needsTotalsQuick && !needsReqCache {
 		return
 	}
-	// All rebuilds are whole-history scans. Deferring the repair to this
-	// goroutine removes any boot-time stall while keeping reads correct via
-	// transparent fallback until each derived table is populated.
 	go func() {
-		if needsTotals {
+		if needsTotalsQuick {
 			if err := s.RebuildTotals(); err != nil {
 				log.Printf("[analytics] totals backfill failed: %v", err)
 			} else {
-				log.Printf("[analytics] totals backfill complete: %d ticks", ticks)
+				_, _, cnt := s.Range()
+				log.Printf("[analytics] totals backfill complete: %d ticks", cnt)
 			}
 		}
-		if needsRollups {
+		if needsFullRollups {
 			start := time.Now()
 			n, err := s.RebuildRollups(ctx)
 			if err != nil {
 				log.Printf("[analytics] rollup backfill failed: %v", err)
 			} else {
 				log.Printf("[analytics] rollup backfill complete: %d minutes in %v", n, time.Since(start).Round(time.Millisecond))
+			}
+		} else if needsCoarseRollups {
+			start := time.Now()
+			tenN, hrN, err := s.RebuildCoarseRollupsFromMinutes(ctx)
+			if err != nil {
+				log.Printf("[analytics] coarse rollup backfill failed: %v", err)
+			} else {
+				log.Printf("[analytics] coarse rollup backfill complete: %d 10m + %d hours in %v", tenN, hrN, time.Since(start).Round(time.Millisecond))
 			}
 		}
 		if needsReqCache {
@@ -215,34 +404,23 @@ func (s *Store) EnsureRollupsBackfilled(ctx context.Context) {
 	}()
 }
 
-// rollTick folds one tick into both its minute and hour rollup buckets inside
-// the caller's transaction, parsing d.Payload only once.
+// rollTick folds one tick into its minute, 10-minute, and hour rollup buckets
+// inside the caller's transaction, parsing d.Payload only once.
 func (s *Store) rollTick(tx *sql.Tx, d *Delta) error {
 	acc := newMinuteAcc()
 	acc.addDelta(d)
-	if err := acc.writeTable(tx, "snapshot_minute", "minute", d.TS/60000*60000); err != nil {
+	if err := acc.writeTable(tx, "snapshot_minute", "minute", d.TS/minuteMs*minuteMs); err != nil {
 		return err
 	}
-	return acc.writeTable(tx, "snapshot_hour", "hour", d.TS/3600000*3600000)
+	if err := acc.writeTable(tx, "snapshot_10m", "bucket", d.TS/tenMinMs*tenMinMs); err != nil {
+		return err
+	}
+	return acc.writeTable(tx, "snapshot_hour", "hour", d.TS/hourMs*hourMs)
 }
 
-// rollMinute folds one tick into its minute bucket.
-func (s *Store) rollMinute(tx *sql.Tx, d *Delta) error {
-	acc := newMinuteAcc()
-	acc.addDelta(d)
-	return acc.writeTable(tx, "snapshot_minute", "minute", d.TS/60000*60000)
-}
-
-// rollHour folds one tick into its hour bucket.
-func (s *Store) rollHour(tx *sql.Tx, d *Delta) error {
-	acc := newMinuteAcc()
-	acc.addDelta(d)
-	return acc.writeTable(tx, "snapshot_hour", "hour", d.TS/3600000*3600000)
-}
-
-// minuteAcc accumulates one minute (or hour) of ticks. Both the live per-tick
-// rollup and the one-time backfill fold through this type, so the two paths
-// cannot drift.
+// minuteAcc accumulates one minute (or 10m / hour) of ticks. Both the live
+// per-tick rollup and the one-time backfill fold through this type, so the two
+// paths cannot drift.
 type minuteAcc struct {
 	blobBuf                          bytes.Buffer
 	req, errN, tin, tout, tcache, ms int64

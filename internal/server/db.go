@@ -42,9 +42,19 @@ type Store struct {
 	requestDrop  atomic.Uint64
 	summaryMu    sync.Mutex
 	summaryCache map[string]summaryCacheEntry
+	seriesRev    atomic.Uint64
+	seriesMu     sync.Mutex
+	seriesCache  map[seriesCacheKey]*seriesCacheEntry
 	writeErrors  atomic.Uint64
 	lastWrite    atomic.Int64
 	queued       atomic.Int64
+}
+
+func (s *Store) bumpSeriesRev() {
+	s.seriesRev.Add(1)
+	s.seriesMu.Lock()
+	clear(s.seriesCache)
+	s.seriesMu.Unlock()
 }
 
 type keyEventReq struct {
@@ -163,12 +173,23 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_snap_ts ON snapshots(ts);`,
 		// Derived caches. `requests` and `snapshots` stay the immutable detail
 		// authority; these tables only take work OFF THE READ PATH by letting a
-		// 30-day chart aggregate minutes/hours instead of re-reading ~864k raw
-		// ticks (measured 7.5s and 892MB per poll). They are additive-only and
-		// never used to double-count detail: for a window that predates their
-		// earliest row, the reader transparently falls back to finer tiers.
+		// 7-day / 30-day chart aggregate 10-minute or hourly buckets instead of
+		// re-reading ~864k raw ticks (measured 7.5s and 892MB per poll). They are
+		// additive-only and never used to double-count detail: for a window that
+		// predates their earliest row, the reader transparently falls back to
+		// finer tiers.
 		`CREATE TABLE IF NOT EXISTS snapshot_minute (
 		   minute INTEGER PRIMARY KEY,
+		   requests INTEGER NOT NULL, err INTEGER NOT NULL,
+		   tok_in INTEGER NOT NULL, tok_out INTEGER NOT NULL, tok_cache INTEGER NOT NULL,
+		   cost REAL NOT NULL, ms INTEGER NOT NULL,
+		   lat_w REAL NOT NULL, lat_sum REAL NOT NULL, ttft_w REAL NOT NULL, ttft_sum REAL NOT NULL,
+		   hist TEXT NOT NULL, ttft_hist TEXT NOT NULL,
+		   hist_n INTEGER NOT NULL DEFAULT 0, missing_n INTEGER NOT NULL DEFAULT 0,
+		   models TEXT NOT NULL, backends TEXT NOT NULL
+		 )`,
+		`CREATE TABLE IF NOT EXISTS snapshot_10m (
+		   bucket INTEGER PRIMARY KEY,
 		   requests INTEGER NOT NULL, err INTEGER NOT NULL,
 		   tok_in INTEGER NOT NULL, tok_out INTEGER NOT NULL, tok_cache INTEGER NOT NULL,
 		   cost REAL NOT NULL, ms INTEGER NOT NULL,
@@ -283,7 +304,7 @@ func (s *Store) migrate() error {
 	}
 	if hasCacheFlag == 0 {
 		var existingReqs int64
-		if err = tx.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&existingReqs); err != nil {
+		if err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests LIMIT 1)`).Scan(&existingReqs); err != nil {
 			return err
 		}
 		ready := 0
@@ -389,7 +410,7 @@ func (s *Store) InsertDelta(d *Delta) error {
 	if err != nil {
 		return err
 	}
-	// One transaction: the tick row, the running totals, and the minute/hour
+	// One transaction: the tick row, the running totals, and the minute/10m/hour
 	// rollups must not disagree. LifetimeTotals previously SUMmed all of
 	// snapshots on every dashboard poll (250ms at 1M ticks, holding s.mu so it
 	// blocked this very writer for 241ms) — the totals row is the fix.
@@ -426,6 +447,9 @@ func (s *Store) InsertDelta(d *Delta) error {
 	}
 	err = tx.Commit()
 	s.noteWrite(err)
+	if err == nil {
+		s.bumpSeriesRev()
+	}
 	return err
 }
 
@@ -760,7 +784,11 @@ func (s *Store) ZeroErrorCounters(dryRun bool) (ZeroErrorCountersStats, error) {
 	if _, err := tx.Exec(`UPDATE legacy_hourly SET errors=0 WHERE errors != 0`); err != nil {
 		return stats, err
 	}
-	return stats, tx.Commit()
+	err = tx.Commit()
+	if err == nil {
+		s.bumpSeriesRev()
+	}
+	return stats, err
 }
 
 // RecentKeyEvents returns the last n key events, newest first.

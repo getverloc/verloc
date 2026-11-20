@@ -292,7 +292,7 @@ func (s *Server) handleDashSeries(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("[]"))
 		return
 	}
-	rows, err := s.store.SeriesSince(r.Context(), since, limit)
+	raw, gzipped, err := s.store.SeriesSinceEncoded(r.Context(), since, limit, acceptsGzip(r))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
@@ -300,8 +300,14 @@ func (s *Server) handleDashSeries(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Historical analytics unavailable", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rows)
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	if gzipped {
+		varyAcceptEncoding(h)
+		h.Set("Content-Encoding", "gzip")
+		h.Set("Content-Length", strconv.Itoa(len(raw)))
+	}
+	_, _ = w.Write(raw)
 }
 
 func parseSince(r *http.Request) int64 {

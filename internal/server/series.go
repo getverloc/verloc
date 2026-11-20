@@ -1,57 +1,460 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
+	"math"
+	"strconv"
 )
+
+const seriesCacheMaxEntries = 32
+
+type seriesCacheKey struct {
+	sinceMs   int64
+	maxPoints int
+}
+
+type seriesTier uint8
+
+const (
+	seriesTierScan seriesTier = iota
+	seriesTierHour
+	seriesTier10m
+	seriesTierMinute
+	seriesTierBuckets
+)
+
+type seriesCacheEntry struct {
+	rev       uint64
+	snapN     int
+	snapMin   int64
+	snapMax   int64
+	tier      seriesTier
+	tierFirst int64
+	tierLast  int64
+	rows      []SeriesRow
+	jsonBytes []byte
+	gzipBytes []byte
+}
+
+type rollupTierSpec struct {
+	tier     seriesTier
+	table    string
+	col      string
+	widthMs  int64
+	boundsQ  string
+	minmaxQ  string
+	selectQ  string
+	leadingQ string
+}
+
+var (
+	tierSpecHour = newRollupTierSpec(seriesTierHour, "snapshot_hour", "hour", hourMs)
+	tierSpec10m  = newRollupTierSpec(seriesTier10m, "snapshot_10m", "bucket", tenMinMs)
+	tierSpecMin  = newRollupTierSpec(seriesTierMinute, "snapshot_minute", "minute", minuteMs)
+)
+
+func newRollupTierSpec(tier seriesTier, table, col string, widthMs int64) rollupTierSpec {
+	return rollupTierSpec{
+		tier:    tier,
+		table:   table,
+		col:     col,
+		widthMs: widthMs,
+		boundsQ: `SELECT
+			(SELECT COUNT(*) FROM (SELECT 1 FROM ` + table + ` WHERE ` + col + ` >= ? LIMIT ?)),
+			COALESCE((SELECT ` + col + ` FROM ` + table + ` ORDER BY ` + col + ` ASC LIMIT 1), 0),
+			COALESCE((SELECT ` + col + ` FROM ` + table + ` WHERE ` + col + ` >= ? ORDER BY ` + col + ` ASC LIMIT 1), 0),
+			COALESCE((SELECT ` + col + ` FROM ` + table + ` ORDER BY ` + col + ` DESC LIMIT 1), 0)`,
+		minmaxQ: `SELECT
+			COALESCE((SELECT ` + col + ` FROM ` + table + ` ORDER BY ` + col + ` ASC LIMIT 1), 0),
+			COALESCE((SELECT ` + col + ` FROM ` + table + ` ORDER BY ` + col + ` DESC LIMIT 1), 0)`,
+		selectQ: `SELECT ` + col + `, requests, tok_in, tok_out, tok_cache, cost, ms, err,
+			       lat_w, lat_sum, ttft_w, ttft_sum,
+			       CASE WHEN requests=0 AND err=0 AND cost=0 THEN '' WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
+			       CASE WHEN requests=0 AND err=0 AND cost=0 THEN '' WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
+			       CASE WHEN requests=0 AND err=0 AND cost=0 THEN X'' ELSE models END,
+			       missing_n
+			FROM ` + table + `
+			WHERE ` + col + ` >= ?
+			ORDER BY ` + col + ` ASC`,
+		leadingQ: `SELECT minute, requests, tok_in, tok_out, tok_cache, cost, ms, err,
+			       lat_w, lat_sum, ttft_w, ttft_sum,
+			       CASE WHEN requests=0 AND err=0 AND cost=0 THEN '' WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
+			       CASE WHEN requests=0 AND err=0 AND cost=0 THEN '' WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
+			       CASE WHEN requests=0 AND err=0 AND cost=0 THEN X'' ELSE models END,
+			       missing_n
+			FROM snapshot_minute
+			WHERE minute >= ? AND minute < ?
+			ORDER BY minute ASC`,
+	}
+}
+
+func (s *Store) seriesSnapshotBounds(ctx context.Context, sinceMs int64, maxPoints int) (n int, minTs, maxTs int64, err error) {
+	// O(log N) min/max seeks + capped count stopping at maxPoints+1 rows.
+	// Replaces `SELECT COUNT(*), MIN(ts), MAX(ts)` which walked every matching
+	// index entry (174ms on ~1M ticks).
+	err = s.db.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM (SELECT 1 FROM snapshots WHERE ts >= ? LIMIT ?)),
+		COALESCE((SELECT ts FROM snapshots WHERE ts >= ? ORDER BY ts ASC LIMIT 1), 0),
+		COALESCE((SELECT ts FROM snapshots WHERE ts >= ? ORDER BY ts DESC LIMIT 1), 0)`,
+		sinceMs, maxPoints+1, sinceMs, sinceMs).Scan(&n, &minTs, &maxTs)
+	return
+}
+
+func (s *Store) tierMinMax(ctx context.Context, tier seriesTier) (first, last int64, ok bool) {
+	var q string
+	switch tier {
+	case seriesTierHour:
+		q = tierSpecHour.minmaxQ
+	case seriesTier10m:
+		q = tierSpec10m.minmaxQ
+	case seriesTierMinute:
+		q = tierSpecMin.minmaxQ
+	default:
+		return 0, 0, true
+	}
+	if err := s.db.QueryRowContext(ctx, q).Scan(&first, &last); err != nil {
+		return 0, 0, false
+	}
+	return first, last, true
+}
+
+func (s *Store) lookupSeriesCache(ctx context.Context, key seriesCacheKey, rev uint64, n int, minTs, maxTs int64) *seriesCacheEntry {
+	s.seriesMu.Lock()
+	e := s.seriesCache[key]
+	s.seriesMu.Unlock()
+	if e == nil || e.rev != rev || e.snapN != n || e.snapMin != minTs || e.snapMax != maxTs {
+		return nil
+	}
+	// Confirm the backing rollup tier wasn't cleared/modified out-of-band via
+	// raw SQL (O(log N) primary-key seek, ~20µs).
+	if e.tier == seriesTierHour || e.tier == seriesTier10m || e.tier == seriesTierMinute {
+		tf, tl, ok := s.tierMinMax(ctx, e.tier)
+		if !ok || tf != e.tierFirst || tl != e.tierLast {
+			return nil
+		}
+	}
+	return e
+}
+
+func (s *Store) storeSeriesCache(key seriesCacheKey, e *seriesCacheEntry) {
+	s.seriesMu.Lock()
+	if s.seriesRev.Load() != e.rev {
+		s.seriesMu.Unlock()
+		return
+	}
+	if s.seriesCache == nil {
+		s.seriesCache = make(map[seriesCacheKey]*seriesCacheEntry, 8)
+	} else if len(s.seriesCache) >= seriesCacheMaxEntries {
+		clear(s.seriesCache)
+	}
+	s.seriesCache[key] = e
+	s.seriesMu.Unlock()
+}
 
 // SeriesSince returns snapshots in [sinceMs, +∞) oldest-first. When the
 // result exceeds maxPoints it is downsampled into equal-width buckets, using
-// the coarsest pre-aggregated rollup tier (snapshot_hour -> snapshot_minute ->
-// raw snapshots) whose resolution fits the requested bucket width.
-// ctx cancels the scan so a newer window can take the DB lock.
+// the coarsest pre-aggregated rollup tier (snapshot_hour -> snapshot_10m ->
+// snapshot_minute -> raw snapshots) whose resolution fits the requested bucket
+// width. ctx cancels the scan so a newer window can take the DB lock.
 func (s *Store) SeriesSince(ctx context.Context, sinceMs int64, maxPoints int) ([]SeriesRow, error) {
+	e, err := s.seriesSinceEntry(ctx, sinceMs, maxPoints, false, false)
+	if err != nil {
+		return nil, err
+	}
+	if e == nil {
+		return []SeriesRow{}, nil
+	}
+	return e.rows, nil
+}
+
+// SeriesSinceJSON returns the JSON-encoded response for SeriesSince, caching
+// the serialized bytes across identical requests within the same tick revision.
+func (s *Store) SeriesSinceJSON(ctx context.Context, sinceMs int64, maxPoints int) ([]byte, error) {
+	b, _, err := s.SeriesSinceEncoded(ctx, sinceMs, maxPoints, false)
+	return b, err
+}
+
+// SeriesSinceEncoded returns the serialized JSON response for SeriesSince,
+// optionally pre-compressed with gzip when acceptGzip is true. Both plain JSON
+// and gzipped payloads are cached per tick revision so repeated/concurrent
+// dashboard polls skip SQL scanning, JSON encoding, and gzip compression.
+func (s *Store) SeriesSinceEncoded(ctx context.Context, sinceMs int64, maxPoints int, acceptGzip bool) ([]byte, bool, error) {
+	e, err := s.seriesSinceEntry(ctx, sinceMs, maxPoints, true, acceptGzip)
+	if err != nil {
+		return nil, false, err
+	}
+	if e == nil {
+		return []byte("[]\n"), false, nil
+	}
+	if acceptGzip && len(e.gzipBytes) > 0 {
+		return e.gzipBytes, true, nil
+	}
+	return e.jsonBytes, false, nil
+}
+
+func (s *Store) seriesSinceEntry(ctx context.Context, sinceMs int64, maxPoints int, needJSON, needGzip bool) (*seriesCacheEntry, error) {
 	if maxPoints < 1 {
 		maxPoints = 500
 	}
-	// Lock-free read: this used to hold s.mu across the whole scan, so one
-	// 126ms dashboard read blocked the tick writer. WAL readers never
-	// block the single writer, and this method touches only s.db.
-	// NOTE: an earlier attempt consulted the rollup before counting ticks
-	// and broke sparse-history windows (few old ticks must serve tick-level
-	// points, not minute buckets). The count is an index-only walk and was
-	// never the bottleneck — the per-tick JSON decode was, fixed by the
-	// rollup itself. Correctness first: count, then choose.
-	var n int
-	var minTs, maxTs int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(MIN(ts),0), COALESCE(MAX(ts),0) FROM snapshots WHERE ts >= ?`,
-		sinceMs).Scan(&n, &minTs, &maxTs); err != nil {
+	rev := s.seriesRev.Load()
+	n, minTs, maxTs, err := s.seriesSnapshotBounds(ctx, sinceMs, maxPoints)
+	if err != nil {
 		return nil, err
 	}
 	if n == 0 {
-		return []SeriesRow{}, nil
+		return nil, nil
 	}
+
+	key := seriesCacheKey{sinceMs: sinceMs, maxPoints: maxPoints}
+	if cached := s.lookupSeriesCache(ctx, key, rev, n, minTs, maxTs); cached != nil {
+		hasJSON := !needJSON || cached.jsonBytes != nil
+		hasGzip := !needGzip || cached.gzipBytes != nil
+		if hasJSON && hasGzip {
+			return cached, nil
+		}
+		next := *cached
+		if needJSON && next.jsonBytes == nil {
+			next.jsonBytes = marshalSeriesRows(cached.rows)
+		}
+		if needGzip && next.gzipBytes == nil {
+			next.gzipBytes = gzipSeriesBytes(next.jsonBytes)
+		}
+		s.storeSeriesCache(key, &next)
+		return &next, nil
+	}
+
+	var (
+		rows      []SeriesRow
+		tier      seriesTier
+		tierFirst int64
+		tierLast  int64
+	)
 	if n <= maxPoints {
-		return s.seriesScan(ctx, sinceMs)
+		rows, err = s.seriesScan(ctx, sinceMs)
+		tier = seriesTierScan
+	} else {
+		rows, tier, tierFirst, tierLast, err = s.seriesDownsampled(ctx, sinceMs, minTs, maxTs, maxPoints)
 	}
-	// Prefer the hourly rollup when each output bucket spans >= 1 hour (~60x
-	// fewer rows than snapshot_minute, ~1200x fewer than raw ticks).
-	if (maxTs-minTs)/int64(maxPoints) >= 3600000 {
-		if rows, ok, err := s.seriesFromHours(ctx, sinceMs, minTs, maxPoints); ok {
-			return rows, err
+	if err != nil {
+		return nil, err
+	}
+
+	entry := &seriesCacheEntry{
+		rev:       rev,
+		snapN:     n,
+		snapMin:   minTs,
+		snapMax:   maxTs,
+		tier:      tier,
+		tierFirst: tierFirst,
+		tierLast:  tierLast,
+		rows:      rows,
+	}
+	if needJSON || needGzip {
+		entry.jsonBytes = marshalSeriesRows(rows)
+	}
+	if needGzip {
+		entry.gzipBytes = gzipSeriesBytes(entry.jsonBytes)
+	}
+	s.storeSeriesCache(key, entry)
+	return entry, nil
+}
+
+func gzipSeriesBytes(raw []byte) []byte {
+	var buf bytes.Buffer
+	buf.Grow(len(raw)/6 + 64)
+	gz := gzipWriterPool.Get().(*gzip.Writer)
+	gz.Reset(&buf)
+	_, err := gz.Write(raw)
+	if cerr := gz.Close(); err == nil {
+		err = cerr
+	}
+	gz.Reset(io.Discard)
+	gzipWriterPool.Put(gz)
+	if err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// marshalSeriesRows encodes SeriesRow slices directly without reflection,
+// cutting JSON serialization cost ~8-10x on 500-800 point dashboard payloads.
+func marshalSeriesRows(rows []SeriesRow) []byte {
+	if len(rows) == 0 {
+		return []byte("[]\n")
+	}
+	buf := make([]byte, 0, len(rows)*240+4)
+	buf = append(buf, '[')
+	for i := range rows {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		r := &rows[i]
+		buf = append(buf, `{"ts":`...)
+		buf = strconv.AppendInt(buf, r.TS, 10)
+		buf = append(buf, `,"d_requests":`...)
+		buf = strconv.AppendInt(buf, r.Requests, 10)
+		buf = append(buf, `,"d_tok_in":`...)
+		buf = strconv.AppendInt(buf, r.TokIn, 10)
+		buf = append(buf, `,"d_tok_out":`...)
+		buf = strconv.AppendInt(buf, r.TokOut, 10)
+		buf = append(buf, `,"d_tok_cache":`...)
+		buf = strconv.AppendInt(buf, r.TokCache, 10)
+		buf = append(buf, `,"d_cost":`...)
+		buf = appendJSONFloat(buf, r.Cost)
+		buf = append(buf, `,"d_ms":`...)
+		buf = strconv.AppendInt(buf, r.MS, 10)
+		buf = append(buf, `,"d_err":`...)
+		buf = strconv.AppendInt(buf, r.Err, 10)
+
+		if len(r.Models) > 0 {
+			buf = append(buf, `,"d_models":{`...)
+			first := true
+			for k, v := range r.Models {
+				if !first {
+					buf = append(buf, ',')
+				}
+				first = false
+				buf = appendJSONString(buf, k)
+				buf = append(buf, `:{"requests":`...)
+				buf = strconv.AppendInt(buf, v.Requests, 10)
+				buf = append(buf, `,"tok_in":`...)
+				buf = strconv.AppendInt(buf, v.TokIn, 10)
+				buf = append(buf, `,"tok_out":`...)
+				buf = strconv.AppendInt(buf, v.TokOut, 10)
+				buf = append(buf, `,"tok_cache":`...)
+				buf = strconv.AppendInt(buf, v.TokCache, 10)
+				buf = append(buf, `,"err":`...)
+				buf = strconv.AppendInt(buf, v.Err, 10)
+				buf = append(buf, `,"failover":`...)
+				buf = strconv.AppendInt(buf, v.Failover, 10)
+				buf = append(buf, `,"cost":`...)
+				buf = appendJSONFloat(buf, v.Cost)
+				buf = append(buf, '}')
+			}
+			buf = append(buf, '}')
+		}
+
+		if len(r.Backends) > 0 {
+			buf = append(buf, `,"d_backends":{`...)
+			first := true
+			for k, v := range r.Backends {
+				if !first {
+					buf = append(buf, ',')
+				}
+				first = false
+				buf = appendJSONString(buf, k)
+				buf = append(buf, `:{"requests":`...)
+				buf = strconv.AppendInt(buf, v.Requests, 10)
+				buf = append(buf, `,"tok_in":`...)
+				buf = strconv.AppendInt(buf, v.TokIn, 10)
+				buf = append(buf, `,"tok_out":`...)
+				buf = strconv.AppendInt(buf, v.TokOut, 10)
+				buf = append(buf, `,"tok_cache":`...)
+				buf = strconv.AppendInt(buf, v.TokCache, 10)
+				buf = append(buf, `,"err":`...)
+				buf = strconv.AppendInt(buf, v.Err, 10)
+				buf = append(buf, `,"failover":`...)
+				buf = strconv.AppendInt(buf, v.Failover, 10)
+				buf = append(buf, `,"cost":`...)
+				buf = appendJSONFloat(buf, v.Cost)
+				buf = append(buf, '}')
+			}
+			buf = append(buf, '}')
+		}
+
+		if r.LatAvg != 0 {
+			buf = append(buf, `,"lat_avg_ms":`...)
+			buf = appendJSONFloat(buf, r.LatAvg)
+		}
+		if r.LatP50 != 0 {
+			buf = append(buf, `,"lat_p50_ms":`...)
+			buf = appendJSONFloat(buf, r.LatP50)
+		}
+		if r.LatP95 != 0 {
+			buf = append(buf, `,"lat_p95_ms":`...)
+			buf = appendJSONFloat(buf, r.LatP95)
+		}
+		if r.LatP99 != 0 {
+			buf = append(buf, `,"lat_p99_ms":`...)
+			buf = appendJSONFloat(buf, r.LatP99)
+		}
+		if r.TTFTAvg != 0 {
+			buf = append(buf, `,"ttft_avg_ms":`...)
+			buf = appendJSONFloat(buf, r.TTFTAvg)
+		}
+		if r.DistributionsUnavailable {
+			buf = append(buf, `,"distributions_unavailable":true`...)
+		} else {
+			buf = append(buf, `,"distributions_unavailable":false`...)
+		}
+		if r.DistributionsApproximate {
+			buf = append(buf, `,"distributions_approximate":true`...)
+		} else {
+			buf = append(buf, `,"distributions_approximate":false`...)
+		}
+		if r.AggregateBucketMs != 0 {
+			buf = append(buf, `,"aggregate_bucket_ms":`...)
+			buf = strconv.AppendInt(buf, r.AggregateBucketMs, 10)
+		}
+		buf = append(buf, '}')
+	}
+	buf = append(buf, ']', '\n')
+	return buf
+}
+
+func appendJSONFloat(dst []byte, f float64) []byte {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return append(dst, '0')
+	}
+	abs := math.Abs(f)
+	fmtByte := byte('f')
+	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		fmtByte = 'e'
+	}
+	return strconv.AppendFloat(dst, f, fmtByte, -1, 64)
+}
+
+func (s *Store) seriesDownsampled(ctx context.Context, sinceMs, minTs, maxTs int64, maxPoints int) ([]SeriesRow, seriesTier, int64, int64, error) {
+	span := maxTs - minTs
+	if span < 0 {
+		span = 0
+	}
+	// Prefer the coarsest rollup tier that delivers at least ~75% of the
+	// requested point budget (or exact bucket width >= tier width):
+	//   - snapshot_hour (1h): 30d (720 rows even at limit=800) & all-time
+	//   - snapshot_10m (10m): 7d (1,008 rows at limit=500/800) & 14d
+	//   - snapshot_minute (1m): 1h, 6h, 24h (60..1,440 rows)
+	// Always fall back transparently to finer tiers if a coarse tier is not
+	// yet populated or does not cover the requested window.
+	useHour := span/int64(maxPoints) >= hourMs || (span >= hourMs && span >= int64(maxPoints)*hourMs*3/4)
+	use10m := useHour || span/int64(maxPoints) >= tenMinMs || (span >= tenMinMs && span >= int64(maxPoints)*tenMinMs*3/4)
+
+	if useHour {
+		if rows, tf, tl, ok, err := s.seriesFromTier(ctx, tierSpecHour, sinceMs, minTs, maxPoints); ok {
+			return rows, seriesTierHour, tf, tl, err
+		} else if err != nil {
+			return nil, 0, 0, 0, err
 		}
 	}
-	// Prefer the minute rollup: re-reading every raw tick to produce 500 points
-	// cost 7.5s and 892MB at 1M ticks, and it re-read the whole table on every
-	// 10s poll. The rollup carries the same merged dimensions, latency
-	// histogram and TTFT accumulators, so the output is equivalent for any
-	// window it covers.
-	if rows, ok, err := s.seriesFromMinutes(ctx, sinceMs, minTs, maxPoints); ok {
-		return rows, err
+	if use10m {
+		if rows, tf, tl, ok, err := s.seriesFromTier(ctx, tierSpec10m, sinceMs, minTs, maxPoints); ok {
+			return rows, seriesTier10m, tf, tl, err
+		} else if err != nil {
+			return nil, 0, 0, 0, err
+		}
 	}
-	return s.seriesBuckets(ctx, sinceMs, minTs, maxTs, maxPoints)
+	if rows, tf, tl, ok, err := s.seriesFromTier(ctx, tierSpecMin, sinceMs, minTs, maxPoints); ok {
+		return rows, seriesTierMinute, tf, tl, err
+	} else if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	rows, err := s.seriesBuckets(ctx, sinceMs, minTs, maxTs, maxPoints)
+	return rows, seriesTierBuckets, 0, 0, err
 }
 
 // seriesScan reads every tick in the window. Lock-free: WAL readers never block the single writer.
@@ -128,9 +531,10 @@ func (a *seriesRollupAcc) finalize(bucketMs int64) SeriesRow {
 	return a.row
 }
 
-// foldRollupRows streams ordered rollup rows (from snapshot_minute or
-// snapshot_hour) into equal-width SeriesRow buckets using zero-alloc
-// decodeMinutesInto. Rows must arrive in ascending timestamp order.
+// foldRollupRows streams ordered rollup rows (from snapshot_minute,
+// snapshot_10m, or snapshot_hour) into equal-width SeriesRow buckets using
+// zero-alloc decodeMinutesInto. Rows must arrive in ascending timestamp order.
+// Idle rows (empty dimension blob) skip decoding and lazy-map allocation.
 func foldRollupRows(
 	ctx context.Context,
 	rows *sql.Rows,
@@ -157,10 +561,7 @@ func foldRollupRows(
 			if *cur != nil {
 				*out = append(*out, (*cur).finalize(bucketMs))
 			}
-			a := &seriesRollupAcc{
-				models:   make(map[string]deltaModel, 8),
-				backends: make(map[string]deltaBackend, 8),
-			}
+			a := &seriesRollupAcc{}
 			a.row.TS = rowTS
 			*cur = a
 			*curIdx = idx
@@ -179,23 +580,29 @@ func foldRollupRows(
 		a.ttftSum += ttftSum
 		a.missingN += missingN
 
-		gotH, gotTH, _ := decodeMinutesInto(mj, a.models, a.backends, &a.hist, &a.ttftHist)
-		// Legacy JSON-era rows keep their histograms in the separate hist
-		// columns, not in the dimension blob: fall back to them so those
-		// buckets do not silently report zeroed percentiles.
-		if !gotH && len(hj) > 0 {
-			var h []uint64
-			if json.Unmarshal(hj, &h) == nil && len(h) == len(latBuckets)+1 {
-				for i, v := range h {
-					a.hist[i] += v
+		if len(mj) > 0 || len(hj) > 0 || len(thj) > 0 {
+			if a.models == nil {
+				a.models = make(map[string]deltaModel, 4)
+				a.backends = make(map[string]deltaBackend, 4)
+			}
+			gotH, gotTH, _ := decodeMinutesInto(mj, a.models, a.backends, &a.hist, &a.ttftHist)
+			// Legacy JSON-era rows keep their histograms in the separate hist
+			// columns, not in the dimension blob: fall back to them so those
+			// buckets do not silently report zeroed percentiles.
+			if !gotH && len(hj) > 0 {
+				var h []uint64
+				if json.Unmarshal(hj, &h) == nil && len(h) == len(latBuckets)+1 {
+					for i, v := range h {
+						a.hist[i] += v
+					}
 				}
 			}
-		}
-		if !gotTH && len(thj) > 0 {
-			var th []uint64
-			if json.Unmarshal(thj, &th) == nil && len(th) == len(latBuckets)+1 {
-				for i, v := range th {
-					a.ttftHist[i] += v
+			if !gotTH && len(thj) > 0 {
+				var th []uint64
+				if json.Unmarshal(thj, &th) == nil && len(th) == len(latBuckets)+1 {
+					for i, v := range th {
+						a.ttftHist[i] += v
+					}
 				}
 			}
 		}
@@ -203,162 +610,110 @@ func foldRollupRows(
 	return rows.Err()
 }
 
-// seriesFromHours aggregates the hourly rollup tier (with optional minute-tier
-// prefix for a partial leading hour when sinceMs falls mid-hour).
-func (s *Store) seriesFromHours(ctx context.Context, sinceMs, oldestTick int64, maxPoints int) ([]SeriesRow, bool, error) {
-	var hours, firstHour, lastHour int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(MIN(hour),0), COALESCE(MAX(hour),0) FROM snapshot_hour`).
-		Scan(&hours, &firstHour, &lastHour); err != nil {
-		return nil, false, err
+// seriesFromTier aggregates one rollup tier (snapshot_hour, snapshot_10m, or
+// snapshot_minute), blending leading partial-bucket minutes from
+// snapshot_minute when sinceMs falls mid-bucket on a coarse tier.
+func (s *Store) seriesFromTier(ctx context.Context, spec rollupTierSpec, sinceMs, oldestTick int64, maxPoints int) ([]SeriesRow, int64, int64, bool, error) {
+	var winCount, firstOverall, firstInWin, lastOverall int64
+	if err := s.db.QueryRowContext(ctx, spec.boundsQ, sinceMs, maxPoints+1, sinceMs).
+		Scan(&winCount, &firstOverall, &firstInWin, &lastOverall); err != nil {
+		return nil, 0, 0, false, err
 	}
-	if hours == 0 {
-		return nil, false, nil
+	if firstOverall == 0 {
+		return nil, 0, 0, false, nil
 	}
-	rollupComplete := oldestTick == 0 || oldestTick >= firstHour-3600000
-	windowInsideRollup := sinceMs > 0 && sinceMs >= firstHour-3600000
+	rollupComplete := oldestTick == 0 || oldestTick >= firstOverall-spec.widthMs
+	windowInsideRollup := sinceMs > 0 && sinceMs >= firstOverall-spec.widthMs
 	if !rollupComplete && !windowInsideRollup {
-		return nil, false, nil
+		return nil, 0, 0, false, nil
 	}
-	needLeadingMinutes := sinceMs > firstHour && sinceMs%3600000 != 0
+
+	needLeadingMinutes := spec.widthMs > minuteMs && sinceMs > firstOverall && sinceMs%spec.widthMs != 0
+	var firstMinInWin, lastMin int64
 	if needLeadingMinutes {
-		var minCount, firstMinute int64
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*), COALESCE(MIN(minute),0) FROM snapshot_minute`).
-			Scan(&minCount, &firstMinute); err != nil {
-			return nil, false, err
+		var firstMin int64
+		if err := s.db.QueryRowContext(ctx, `SELECT
+			COALESCE((SELECT minute FROM snapshot_minute ORDER BY minute ASC LIMIT 1), 0),
+			COALESCE((SELECT minute FROM snapshot_minute WHERE minute >= ? ORDER BY minute ASC LIMIT 1), 0),
+			COALESCE((SELECT minute FROM snapshot_minute ORDER BY minute DESC LIMIT 1), 0)`,
+			sinceMs).Scan(&firstMin, &firstMinInWin, &lastMin); err != nil {
+			return nil, 0, 0, false, err
 		}
-		if minCount == 0 || sinceMs < firstMinute-60000 {
-			return nil, false, nil
+		if firstMin == 0 || sinceMs < firstMin-minuteMs {
+			return nil, 0, 0, false, nil
 		}
 	}
+
 	if maxPoints < 1 {
 		maxPoints = 500
 	}
-	bucketMs := int64(3600000)
-	if hours > int64(maxPoints) {
-		span := lastHour - firstHour
-		bucketMs = (span/int64(maxPoints)/3600000 + 1) * 3600000
+
+	firstFullBucket := sinceMs
+	if needLeadingMinutes {
+		firstFullBucket = ((sinceMs + spec.widthMs - 1) / spec.widthMs) * spec.widthMs
 	}
 
-	out := make([]SeriesRow, 0, min(int(hours), maxPoints)+1)
+	// Align anchor to the coarse bucket boundary when blending leading minutes
+	// so partial leading minutes stay in bucket 0 without pulling the first
+	// full coarse bucket into bucket 0 when bucketMs == spec.widthMs.
+	var anchor int64
+	hasLeading := needLeadingMinutes && firstMinInWin > 0 && firstMinInWin < firstFullBucket
+	if hasLeading {
+		anchor = firstFullBucket - spec.widthMs
+	} else if firstInWin > 0 {
+		anchor = firstInWin
+	} else {
+		return []SeriesRow{}, firstOverall, lastOverall, true, nil
+	}
+	endTS := lastOverall
+	if endTS < lastMin {
+		endTS = lastMin
+	}
+
+	bucketMs := spec.widthMs
+	effectiveCount := winCount
+	if hasLeading {
+		effectiveCount++
+	}
+	if effectiveCount > int64(maxPoints) {
+		span := endTS - anchor
+		if span < 0 {
+			span = 0
+		}
+		bucketMs = (span/int64(maxPoints)/spec.widthMs + 1) * spec.widthMs
+	}
+
+	out := make([]SeriesRow, 0, min(int(effectiveCount), maxPoints)+1)
 	var curIdx int64 = -1
 	var cur *seriesRollupAcc
 
-	hourStart := sinceMs
+	tierStart := sinceMs
 	if needLeadingMinutes {
-		firstFullHour := ((sinceMs + 3599999) / 3600000) * 3600000
-		mrows, err := s.db.QueryContext(ctx, `
-			SELECT minute, requests, tok_in, tok_out, tok_cache, cost, ms, err,
-			       lat_w, lat_sum, ttft_w, ttft_sum,
-			       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
-			       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
-			       models, missing_n
-			FROM snapshot_minute
-			WHERE minute >= ? AND minute < ?
-			ORDER BY minute ASC`, sinceMs, firstFullHour)
+		mrows, err := s.db.QueryContext(ctx, spec.leadingQ, sinceMs, firstFullBucket)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, 0, false, err
 		}
-		err = foldRollupRows(ctx, mrows, firstHour, bucketMs, &curIdx, &cur, &out)
+		err = foldRollupRows(ctx, mrows, anchor, bucketMs, &curIdx, &cur, &out)
 		mrows.Close()
 		if err != nil {
-			return nil, false, err
+			return nil, 0, 0, false, err
 		}
-		hourStart = firstFullHour
+		tierStart = firstFullBucket
 	}
 
-	hrows, err := s.db.QueryContext(ctx, `
-		SELECT hour, requests, tok_in, tok_out, tok_cache, cost, ms, err,
-		       lat_w, lat_sum, ttft_w, ttft_sum,
-		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
-		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
-		       models, missing_n
-		FROM snapshot_hour
-		WHERE hour >= ?
-		ORDER BY hour ASC`, hourStart)
+	rows, err := s.db.QueryContext(ctx, spec.selectQ, tierStart)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, 0, false, err
 	}
-	err = foldRollupRows(ctx, hrows, firstHour, bucketMs, &curIdx, &cur, &out)
-	hrows.Close()
+	err = foldRollupRows(ctx, rows, anchor, bucketMs, &curIdx, &cur, &out)
+	rows.Close()
 	if err != nil {
-		return nil, false, err
+		return nil, 0, 0, false, err
 	}
 	if cur != nil {
 		out = append(out, cur.finalize(bucketMs))
 	}
-	return out, true, nil
-}
-
-// seriesFromMinutes aggregates the minute rollup. ok is false when the window
-// is not fully covered by the rollup (history predating it, or the rollup has
-// not accumulated yet), in which case the caller falls back to raw ticks so no
-// window is ever silently empty.
-//
-// The rollup is bucketed in Go rather than with SQL GROUP BY on purpose: the
-// dimension maps and histograms are encoded blobs, and a bare column under
-// GROUP BY yields an arbitrary row from each group (SQLite/MySQL semantics),
-// which silently dropped all but one minute's dimensions per bucket. Reading
-// minute rows is still ~20x fewer rows than reading raw ticks (20 ticks per
-// minute at the 3s cadence), and decodeMinutesInto folds each blob directly
-// without per-row map or slice allocations.
-func (s *Store) seriesFromMinutes(ctx context.Context, sinceMs, oldestTick int64, maxPoints int) ([]SeriesRow, bool, error) {
-	var minutes, firstMinute, lastMinute int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(MIN(minute),0), COALESCE(MAX(minute),0) FROM snapshot_minute`).
-		Scan(&minutes, &firstMinute, &lastMinute); err != nil {
-		return nil, false, err
-	}
-	if minutes == 0 {
-		return nil, false, nil
-	}
-	// The rollup is only usable when it covers everything the window can see.
-	// Two ways that holds:
-	//   - the rollup starts at least as early as the oldest raw tick (it is
-	//     complete), or
-	//   - the window itself starts after the rollup's first minute, so any
-	//     uncovered older ticks are outside the window anyway.
-	// Using only the second condition made the common case (selecting a window
-	// wider than the retained history) fall back needlessly and stay slow.
-	rollupComplete := oldestTick == 0 || oldestTick >= firstMinute-60000
-	windowInsideRollup := sinceMs > 0 && sinceMs >= firstMinute-60000
-	if !rollupComplete && !windowInsideRollup {
-		return nil, false, nil
-	}
-	if maxPoints < 1 {
-		maxPoints = 500
-	}
-	bucketMs := int64(60000)
-	if minutes > int64(maxPoints) {
-		span := lastMinute - firstMinute
-		bucketMs = (span/int64(maxPoints)/60000 + 1) * 60000
-	}
-
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT minute, requests, tok_in, tok_out, tok_cache, cost, ms, err,
-		       lat_w, lat_sum, ttft_w, ttft_sum,
-		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
-		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
-		       models, missing_n
-		FROM snapshot_minute
-		WHERE minute >= ?
-		ORDER BY minute ASC`, sinceMs)
-	if err != nil {
-		return nil, false, err
-	}
-	defer rows.Close()
-
-	out := make([]SeriesRow, 0, min(int(minutes), maxPoints)+1)
-	var curIdx int64 = -1
-	var cur *seriesRollupAcc
-	if err = foldRollupRows(ctx, rows, firstMinute, bucketMs, &curIdx, &cur, &out); err != nil {
-		return nil, false, err
-	}
-	if cur != nil {
-		out = append(out, cur.finalize(bucketMs))
-	}
-	return out, true, nil
+	return out, firstOverall, lastOverall, true, nil
 }
 
 // seriesBuckets aggregates a long window in SQL. Lock-free read (WAL).
