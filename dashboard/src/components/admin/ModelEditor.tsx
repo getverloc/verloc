@@ -25,11 +25,19 @@ type ModelEditorProps = ModelEditorState & {
   deleteModel: (id: string) => void;
 };
 
+const STRATEGY_LABELS: Record<'ordered' | 'latency' | 'weighted', string> = {
+  ordered: 'Ordered (primary first)',
+  latency: 'Latency (Peak EWMA)',
+  weighted: 'Weighted (smooth WRR)',
+};
+
 export function ModelEditor({ editModel, setEditModel, originalModelID, saveModel, providers, models, busy, setBusy, setErr, deleteModel }: ModelEditorProps) {
   const modelFormRef = useRef<HTMLDivElement | null>(null);
   const editingExistingModel = !!originalModelID;
   useEffect(() => { revealForm(modelFormRef.current); }, [originalModelID]);
   if (!editModel) return null;
+  const strategy = editModel.routing_strategy || 'ordered';
+  const hasCustomRouting = strategy !== 'ordered' || Number(editModel.routing_hedge_delay_ms) > 0;
   return (
             <Card ref={modelFormRef} className="order-first min-w-0 gap-0 border-edge-600 bg-edge-900 py-0 xl:order-last">
               <CardHeader className="gap-2 border-b border-edge-700 bg-edge-950 p-5">
@@ -130,12 +138,83 @@ export function ModelEditor({ editModel, setEditModel, originalModelID, saveMode
                   Disabled (preserve route)
                 </Label>
 
-                <details className="border border-edge-700 bg-edge-950 p-4" open={(editModel.routes || []).length > 0}>
-                  <summary className="cursor-pointer text-[11px] font-medium text-chart-3">02 / Ordered fallback routes · {(editModel.routes || []).length}</summary>
+                <details className="border border-edge-700 bg-edge-950 p-4" open={(editModel.routes || []).length > 0 || hasCustomRouting}>
+                  <summary className="cursor-pointer text-[11px] font-medium text-chart-3">
+                    02 / Routing & fallback routes · {(editModel.routes || []).length}
+                    {strategy !== 'ordered' ? ` · ${strategy}` : ''}
+                    {Number(editModel.routing_hedge_delay_ms) > 0 ? ` · hedge ${editModel.routing_hedge_delay_ms}ms` : ''}
+                  </summary>
                   <div className="mt-3 space-y-4 border-t border-edge-700 pt-4">
-                    <p className="text-[11px] leading-relaxed text-muted-foreground">The primary route is tried first. Additional routes are bounded by gateway retry limits and never used after streaming begins.</p>
+                    <p className="text-[11px] leading-relaxed text-muted-foreground">
+                      Choose how primary and fallback targets are ordered. Failover is bounded by gateway retry limits and never triggers after response bytes reach the client.
+                    </p>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <Field>
+                        <FieldLabel htmlFor="em-routing-strategy">Routing strategy</FieldLabel>
+                        <Select
+                          value={strategy}
+                          onValueChange={(v) => setEditModel({
+                            ...editModel,
+                            routing_strategy: v === 'latency' || v === 'weighted' ? v : 'ordered',
+                          })}
+                        >
+                          <SelectTrigger id="em-routing-strategy" aria-label="Model routing strategy">
+                            <SelectValue>{STRATEGY_LABELS[strategy]}</SelectValue>
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="ordered">Ordered (primary first)</SelectItem>
+                            <SelectItem value="latency">Latency (Peak EWMA)</SelectItem>
+                            <SelectItem value="weighted">Weighted (smooth WRR)</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </Field>
+                      {strategy === 'weighted' && (
+                        <Field>
+                          <FieldLabel htmlFor="em-primary-weight">Primary weight</FieldLabel>
+                          <Input
+                            id="em-primary-weight"
+                            value={editModel.routing_primary_weight ?? ''}
+                            onChange={(e) => setEditModel({ ...editModel, routing_primary_weight: e.target.value })}
+                            placeholder="1 (default)"
+                            inputMode="numeric"
+                            className="font-mono"
+                          />
+                          <FieldDescription>Relative share for the primary target (1–1000).</FieldDescription>
+                        </Field>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <Field>
+                        <FieldLabel htmlFor="em-hedge-delay">Hedge delay (ms)</FieldLabel>
+                        <Input
+                          id="em-hedge-delay"
+                          value={editModel.routing_hedge_delay_ms ?? ''}
+                          onChange={(e) => setEditModel({ ...editModel, routing_hedge_delay_ms: e.target.value })}
+                          placeholder="0 (off)"
+                          inputMode="numeric"
+                          className="font-mono"
+                        />
+                        <FieldDescription>Speculatively race the next route after this delay (non-streaming).</FieldDescription>
+                      </Field>
+                      <Field>
+                        <FieldLabel htmlFor="em-max-hedges">Max hedges</FieldLabel>
+                        <Select
+                          value={editModel.routing_max_hedges || '1'}
+                          onValueChange={(v) => setEditModel({ ...editModel, routing_max_hedges: v ?? '1' })}
+                          disabled={!editModel.routing_hedge_delay_ms || Number(editModel.routing_hedge_delay_ms) <= 0}
+                        >
+                          <SelectTrigger id="em-max-hedges" aria-label="Maximum speculative hedges">
+                            <SelectValue>{editModel.routing_max_hedges === '2' ? '2 backup routes' : '1 backup route (default)'}</SelectValue>
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="1">1 backup route (default)</SelectItem>
+                            <SelectItem value="2">2 backup routes</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </Field>
+                    </div>
                     {(editModel.routes || []).map((route, index) => (
-                      <div key={index} className="grid grid-cols-1 gap-3 border-l-2 border-chart-3/40 pl-3 sm:grid-cols-2">
+                      <div key={index} className={`grid grid-cols-1 gap-3 border-l-2 border-chart-3/40 pl-3 ${strategy === 'weighted' ? 'sm:grid-cols-[1fr_1fr_96px]' : 'sm:grid-cols-2'}`}>
                         <Field>
                           <FieldLabel htmlFor={`em-fallback-${index}-provider`}>{`Route ${index + 2} / provider`}</FieldLabel>
                           <Select
@@ -154,7 +233,27 @@ export function ModelEditor({ editModel, setEditModel, originalModelID, saveMode
                           <FieldLabel htmlFor={`em-fallback-${index}-upstream`}>Upstream model ID</FieldLabel>
                           <Input id={`em-fallback-${index}-upstream`} value={route.upstream} onChange={(e) => setEditModel({ ...editModel, routes: (editModel.routes || []).map((r, i) => i === index ? { ...r, upstream: e.target.value } : r) })} className="font-mono" />
                         </Field>
-                        <div className="flex items-end sm:col-span-2">
+                        {strategy === 'weighted' && (
+                          <Field>
+                            <FieldLabel htmlFor={`em-fallback-${index}-weight`}>Weight</FieldLabel>
+                            <Input
+                              id={`em-fallback-${index}-weight`}
+                              value={route.weight ? String(route.weight) : ''}
+                              onChange={(e) => {
+                                const raw = e.target.value.trim();
+                                const parsed = raw === '' ? undefined : Number(raw);
+                                setEditModel({
+                                  ...editModel,
+                                  routes: (editModel.routes || []).map((r, i) => i === index ? { ...r, weight: Number.isFinite(parsed) ? parsed : r.weight } : r),
+                                });
+                              }}
+                              placeholder="1"
+                              inputMode="numeric"
+                              className="font-mono"
+                            />
+                          </Field>
+                        )}
+                        <div className={`flex items-end ${strategy === 'weighted' ? 'sm:col-span-3' : 'sm:col-span-2'}`}>
                           <Button variant="outline" size="sm" onClick={() => setEditModel({ ...editModel, routes: (editModel.routes || []).filter((_, i) => i !== index) })}>
                             Remove fallback
                           </Button>

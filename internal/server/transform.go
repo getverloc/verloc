@@ -8,18 +8,23 @@ import (
 	"strings"
 )
 
+func hasReasoningMarkers(raw []byte) bool {
+	return bytes.Contains(raw, reasoningMarkers[0]) || bytes.Contains(raw, reasoningMarkers[1])
+}
+
 func remapBody(raw []byte, upstreamModel string, isMistral bool, backendName string) []byte {
 	if len(raw) == 0 {
 		return raw
 	}
 	// Fast path for the overwhelming majority of traffic (every backend
-	// except Mistral/freeinference): only the model field changes, so
-	// decode the top level as raw messages and leave the messages tree —
-	// usually 99% of the body — completely untouched. No number is ever
-	// reformatted and no nested structure is rebuilt.
+	// except Mistral/freeinference): only the top-level "model" field changes,
+	// so splice it directly in raw bytes without decoding the messages tree.
 	if !isMistral && backendName != "freeinference" {
+		if out, handled := spliceTopLevelModel(raw, upstreamModel); handled {
+			return out
+		}
 		var top map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &top); err != nil {
+		if err := json.Unmarshal(raw, &top); err != nil || top == nil {
 			return raw
 		}
 		modelJSON, err := json.Marshal(upstreamModel)
@@ -33,12 +38,21 @@ func remapBody(raw []byte, upstreamModel string, isMistral bool, backendName str
 		}
 		return out
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var parsed map[string]any
-	if err := dec.Decode(&parsed); err != nil {
+	parsed, ok := decodeChunkMap(raw)
+	if !ok || parsed == nil {
 		return raw
 	}
+	applyBackendRemapMap(parsed, upstreamModel, isMistral, backendName)
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// applyBackendRemapMap mutates a decoded chat request map in place to rewrite
+// "model" and apply Mistral / freeinference compatibility normalizations.
+func applyBackendRemapMap(parsed map[string]any, upstreamModel string, isMistral bool, backendName string) {
 	parsed["model"] = upstreamModel
 	// Remap "developer" role to "system" for backends that reject it.
 	// Mistral and freeinference both 400 on role: "developer".
@@ -306,11 +320,47 @@ func remapBody(raw []byte, upstreamModel string, isMistral bool, backendName str
 			}
 		}
 	}
+}
+
+// prepareChatBody runs the full per-route chat body transform chain (model
+// remap, Mistral/freeinference normalization, reasoning strip or replay, and
+// max-token capping) in a single pass. On the common non-Mistral strip path
+// without reasoning fields it splices bytes directly with zero map decoding;
+// otherwise it decodes and re-encodes the body at most once instead of once
+// per transform stage.
+func prepareChatBody(raw []byte, scan topLevelScan, upstreamModel string, isMistral bool, backendName string, stripReasoning bool, maxTokens int, cache *reasoningCache, scope reasoningScope) ([]byte, reasoningContext) {
+	if len(raw) == 0 {
+		return raw, reasoningContext{key: reasoningKey{scope: scope}}
+	}
+	if !isMistral && backendName != "freeinference" && stripReasoning && !hasReasoningMarkers(raw) {
+		if scan.valid {
+			return spliceFromScan(raw, scan, upstreamModel, maxTokens), reasoningContext{}
+		}
+		modified := remapBody(raw, upstreamModel, false, backendName)
+		if maxTokens > 0 {
+			modified = capMaxTokens(modified, maxTokens)
+		}
+		return modified, reasoningContext{}
+	}
+	parsed, ok := decodeChunkMap(raw)
+	if !ok || parsed == nil {
+		return raw, reasoningContext{key: reasoningKey{scope: scope}}
+	}
+	applyBackendRemapMap(parsed, upstreamModel, isMistral, backendName)
+	var replay reasoningContext
+	if stripReasoning {
+		stripReasoningContentMap(parsed)
+	} else {
+		_, replay = ensureReasoningReplayMap(parsed, cache, scope)
+	}
+	if maxTokens > 0 {
+		capMaxTokensMap(parsed, maxTokens)
+	}
 	out, err := json.Marshal(parsed)
 	if err != nil {
-		return raw
+		return raw, replay
 	}
-	return out
+	return out, replay
 }
 
 // stripReasoningContent removes non-standard reasoning fields
@@ -320,24 +370,10 @@ func remapBody(raw []byte, upstreamModel string, isMistral bool, backendName str
 // turns, so the field can leak into the forwarded conversation history.
 var reasoningMarkers = [][]byte{[]byte(`"reasoning_content"`), []byte(`"reasoning"`)}
 
-func stripReasoningContent(raw []byte, strip bool) []byte {
-	if !strip || len(raw) == 0 {
-		return raw
-	}
-	// Guard: without either field name anywhere in the body there is
-	// nothing to strip — skip the full decode/re-encode entirely.
-	if !bytes.Contains(raw, reasoningMarkers[0]) && !bytes.Contains(raw, reasoningMarkers[1]) {
-		return raw
-	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var parsed map[string]any
-	if err := dec.Decode(&parsed); err != nil {
-		return raw
-	}
+func stripReasoningContentMap(parsed map[string]any) bool {
 	msgs, ok := parsed["messages"].([]any)
 	if !ok {
-		return raw
+		return false
 	}
 	changed := false
 	for _, m := range msgs {
@@ -345,14 +381,32 @@ func stripReasoningContent(raw []byte, strip bool) []byte {
 		if !ok {
 			continue
 		}
-		for _, field := range []string{"reasoning_content", "reasoning"} {
-			if _, has := mm[field]; has {
-				delete(mm, field)
-				changed = true
-			}
+		if _, has := mm["reasoning_content"]; has {
+			delete(mm, "reasoning_content")
+			changed = true
+		}
+		if _, has := mm["reasoning"]; has {
+			delete(mm, "reasoning")
+			changed = true
 		}
 	}
-	if !changed {
+	return changed
+}
+
+func stripReasoningContent(raw []byte, strip bool) []byte {
+	if !strip || len(raw) == 0 {
+		return raw
+	}
+	// Guard: without either field name anywhere in the body there is
+	// nothing to strip — skip the full decode/re-encode entirely.
+	if !hasReasoningMarkers(raw) {
+		return raw
+	}
+	parsed, ok := decodeChunkMap(raw)
+	if !ok {
+		return raw
+	}
+	if !stripReasoningContentMap(parsed) {
 		return raw
 	}
 	out, err := json.Marshal(parsed)
@@ -365,29 +419,7 @@ func stripReasoningContent(raw []byte, strip bool) []byte {
 // capMaxTokens clamps Chat and Responses output limits
 // to the backend's limit. Some upstreams enforce a lower output cap than the
 // model's nominal max (e.g. Poolside caps at 32768). limit <= 0 is a no-op.
-var maxTokenMarkers = [][]byte{[]byte(`"max_tokens"`), []byte(`"max_completion_tokens"`), []byte(`"max_output_tokens"`)}
-
-func capMaxTokens(raw []byte, limit int) []byte {
-	if limit <= 0 || len(raw) == 0 {
-		return raw
-	}
-	// Guard: no output-limit field anywhere → nothing to clamp.
-	found := false
-	for _, m := range maxTokenMarkers {
-		if bytes.Contains(raw, m) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return raw
-	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var parsed map[string]any
-	if err := dec.Decode(&parsed); err != nil {
-		return raw
-	}
+func capMaxTokensMap(parsed map[string]any, limit int) bool {
 	changed := false
 	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
 		v, ok := parsed[field]
@@ -408,7 +440,21 @@ func capMaxTokens(raw []byte, limit int) []byte {
 			changed = true
 		}
 	}
-	if !changed {
+	return changed
+}
+
+func capMaxTokens(raw []byte, limit int) []byte {
+	if limit <= 0 || len(raw) == 0 {
+		return raw
+	}
+	if out, handled := capMaxTokensFast(raw, limit); handled {
+		return out
+	}
+	parsed, ok := decodeChunkMap(raw)
+	if !ok {
+		return raw
+	}
+	if !capMaxTokensMap(parsed, limit) {
 		return raw
 	}
 	out, err := json.Marshal(parsed)
@@ -463,22 +509,35 @@ func extractUsage(u *usageJSON) (in, out, cache uint64, ok bool) {
 }
 
 func usageOf(body []byte) (in, out, cache uint64, ok bool) {
-	type usage struct {
-		Prompt        *uint64 `json:"prompt_tokens"`
-		Completion    *uint64 `json:"completion_tokens"`
-		Input         *uint64 `json:"input_tokens"`
-		Output        *uint64 `json:"output_tokens"`
-		PromptDetails struct {
-			Cached uint64 `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-		InputDetails struct {
-			Cached uint64 `json:"cached_tokens"`
-		} `json:"input_tokens_details"`
+	if len(body) == 0 {
+		return 0, 0, 0, false
+	}
+	if usageVal, respVal, scanned := findTopLevelUsageOrResponse(body); scanned {
+		if len(usageVal) > 0 && !bytes.Equal(usageVal, jsonNullBytes) {
+			var u usageJSON
+			if json.Unmarshal(usageVal, &u) == nil {
+				return extractUsage(&u)
+			}
+			return 0, 0, 0, false
+		}
+		if len(respVal) > 0 && respVal[0] == '{' {
+			if nested, nFound, nScanned := findTopLevelField(respVal, "usage"); nScanned {
+				if nFound && len(nested) > 0 && !bytes.Equal(nested, jsonNullBytes) {
+					var u usageJSON
+					if json.Unmarshal(nested, &u) == nil {
+						return extractUsage(&u)
+					}
+				}
+				return 0, 0, 0, false
+			}
+		} else {
+			return 0, 0, 0, false
+		}
 	}
 	var p struct {
-		Usage    *usage `json:"usage"`
+		Usage    *usageJSON `json:"usage"`
 		Response struct {
-			Usage *usage `json:"usage"`
+			Usage *usageJSON `json:"usage"`
 		} `json:"response"`
 	}
 	if json.Unmarshal(body, &p) != nil {
@@ -488,16 +547,7 @@ func usageOf(body []byte) (in, out, cache uint64, ok bool) {
 	if u == nil {
 		u = p.Response.Usage
 	}
-	if u == nil {
-		return 0, 0, 0, false
-	}
-	if u.Prompt != nil && u.Completion != nil {
-		return *u.Prompt, *u.Completion, u.PromptDetails.Cached, true
-	}
-	if u.Input != nil && u.Output != nil {
-		return *u.Input, *u.Output, u.InputDetails.Cached, true
-	}
-	return 0, 0, 0, false
+	return extractUsage(u)
 }
 
 // A route remains replaceable until the first stream write commits headers.

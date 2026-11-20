@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -66,6 +67,7 @@ type Security struct {
 	clientWriteMu sync.Mutex
 	mu            sync.Mutex
 	keys          map[[32]byte]*clientKeyRecord
+	keysSnap      atomic.Pointer[map[[32]byte]*clientKeyRecord]
 	clients       map[string]*clientKeyRecord
 
 	allowedHosts   []string

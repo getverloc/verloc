@@ -151,17 +151,11 @@ func reasoningPrefix(text string, limit int) string {
 	return text[:end]
 }
 
-// ensureReasoningReplay also fingerprints the request history for response
-// capture. It is only called for backends that preserve reasoning.
-func ensureReasoningReplay(raw []byte, cache *reasoningCache, scope reasoningScope) ([]byte, reasoningContext) {
+func ensureReasoningReplayMap(parsed map[string]any, cache *reasoningCache, scope reasoningScope) (bool, reasoningContext) {
 	ctx := reasoningContext{key: reasoningKey{scope: scope}}
-	parsed, ok := decodeChunkMap(raw)
-	if !ok {
-		return raw, ctx
-	}
 	msgs, ok := parsed["messages"].([]any)
 	if !ok {
-		return raw, ctx
+		return false, ctx
 	}
 	ctx.valid = scope.clientID != ""
 	var nCopy, nCache, nEmpty int
@@ -202,6 +196,21 @@ func ensureReasoningReplay(raw []byte, cache *reasoningCache, scope reasoningSco
 		}
 		changed = true
 	}
+	if changed {
+		log.Printf("[reasoning] replay copy=%d cache=%d empty=%d", nCopy, nCache, nEmpty)
+	}
+	return changed, ctx
+}
+
+// ensureReasoningReplay also fingerprints the request history for response
+// capture. It is only called for backends that preserve reasoning.
+func ensureReasoningReplay(raw []byte, cache *reasoningCache, scope reasoningScope) ([]byte, reasoningContext) {
+	ctx := reasoningContext{key: reasoningKey{scope: scope}}
+	parsed, ok := decodeChunkMap(raw)
+	if !ok {
+		return raw, ctx
+	}
+	changed, ctx := ensureReasoningReplayMap(parsed, cache, scope)
 	if !changed {
 		return raw, ctx
 	}
@@ -209,7 +218,6 @@ func ensureReasoningReplay(raw []byte, cache *reasoningCache, scope reasoningSco
 	if err != nil {
 		return raw, ctx
 	}
-	log.Printf("[reasoning] replay copy=%d cache=%d empty=%d", nCopy, nCache, nEmpty)
 	return out, ctx
 }
 
@@ -243,6 +251,192 @@ type reasoningToolCall struct {
 	id, kind, name, arguments strings.Builder
 }
 
+// Typed SSE chunk structs used by ingestBytes to avoid allocating map[string]any
+// trees on every streaming chunk when reasoning aliasing does not need to
+// rewrite the line.
+type sseIngestChunk struct {
+	Choices []sseIngestChoice `json:"choices"`
+}
+
+type sseIngestChoice struct {
+	Index   json.RawMessage `json:"index"`
+	Delta   sseIngestMsg    `json:"delta"`
+	Message sseIngestMsg    `json:"message"`
+}
+
+type sseIngestMsg struct {
+	ReasoningContent json.RawMessage   `json:"reasoning_content"`
+	Reasoning        json.RawMessage   `json:"reasoning"`
+	Content          json.RawMessage   `json:"content"`
+	ToolCalls        []json.RawMessage `json:"tool_calls"`
+}
+
+type sseIngestToolCall struct {
+	Index    json.RawMessage `json:"index"`
+	ID       json.RawMessage `json:"id"`
+	Type     json.RawMessage `json:"type"`
+	Function sseIngestFunc   `json:"function"`
+}
+
+type sseIngestFunc struct {
+	Name      json.RawMessage `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+func reasoningIndexRaw(raw json.RawMessage, fallback int) int {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return fallback
+	}
+	if v, ok := parsePureUint64(raw); ok && v < maxReasoningEntries {
+		return int(v)
+	}
+	return fallback
+}
+
+// jsonStringRawBytes returns the decoded UTF-8 bytes of a JSON string token
+// without allocating when the string is plain unescaped ASCII.
+func jsonStringRawBytes(raw json.RawMessage) ([]byte, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '"' {
+		return nil, false
+	}
+	inner := raw[1 : len(raw)-1]
+	for i := range len(inner) {
+		c := inner[i]
+		if c == '\\' || c >= 0x80 {
+			var s string
+			if json.Unmarshal(raw, &s) != nil {
+				return nil, false
+			}
+			return []byte(s), true
+		}
+	}
+	return inner, true
+}
+
+// ingestBytes decodes one SSE JSON chunk into a reusable typed struct instead
+// of a generic map[string]any tree. Any non-standard JSON shape falls back to
+// decodeChunkMap + ingestMap so semantics remain identical.
+func (a *sseReasoningAcc) ingestBytes(data []byte, scratch *sseIngestChunk) {
+	if a == nil {
+		return
+	}
+	for i := range scratch.Choices {
+		scratch.Choices[i] = sseIngestChoice{}
+	}
+	scratch.Choices = scratch.Choices[:0]
+	if err := json.Unmarshal(data, scratch); err != nil {
+		if chunk, ok := decodeChunkMap(data); ok {
+			a.ingestMap(chunk)
+		}
+		return
+	}
+	for position := range scratch.Choices {
+		c := &scratch.Choices[position]
+		index := reasoningIndexRaw(c.Index, position)
+		choice := a.getOrCreateChoice(index)
+		if choice == nil {
+			continue
+		}
+		a.ingestMsg(choice, &c.Delta)
+		a.ingestMsg(choice, &c.Message)
+	}
+}
+
+func (a *sseReasoningAcc) getOrCreateChoice(index int) *reasoningChoice {
+	if a.choices == nil {
+		a.choices = make(map[int]*reasoningChoice, 1)
+	}
+	choice := a.choices[index]
+	if choice == nil {
+		if len(a.choices) >= maxReasoningEntries {
+			return nil
+		}
+		choice = &reasoningChoice{}
+		a.choices[index] = choice
+	}
+	return choice
+}
+
+func (a *sseReasoningAcc) ingestMsg(choice *reasoningChoice, m *sseIngestMsg) {
+	text, _ := jsonStringRawBytes(m.ReasoningContent)
+	if len(text) == 0 {
+		text, _ = jsonStringRawBytes(m.Reasoning)
+	}
+	if choice.truncated {
+		text = nil
+	} else if remaining := maxReasoningBytes - a.reasoningBytes; len(text) > remaining {
+		text = reasoningPrefixBytes(text, remaining)
+		choice.truncated = true
+	}
+	if len(text) > 0 {
+		if needed := len(choice.buf) + len(text); needed > cap(choice.buf) {
+			size := min(maxReasoningBytes, max(needed, 2*cap(choice.buf)))
+			buf := make([]byte, len(choice.buf), size)
+			copy(buf, choice.buf)
+			choice.buf = buf
+		}
+		choice.buf = append(choice.buf, text...)
+		a.reasoningBytes += len(text)
+	}
+	if content := bytes.TrimSpace(m.Content); len(content) > 0 && !bytes.Equal(content, jsonNullBytes) {
+		if b, ok := jsonStringRawBytes(content); ok {
+			a.capturePayloadBytes(choice, &choice.content, b)
+		} else {
+			choice.invalid = true
+		}
+	}
+	for position, rawTC := range m.ToolCalls {
+		rawTC = bytes.TrimSpace(rawTC)
+		if len(rawTC) == 0 || rawTC[0] != '{' {
+			choice.invalid = true
+			continue
+		}
+		var tc sseIngestToolCall
+		if err := json.Unmarshal(rawTC, &tc); err != nil {
+			choice.invalid = true
+			continue
+		}
+		if choice.calls == nil {
+			choice.calls = make(map[int]*reasoningToolCall, 1)
+		}
+		index := reasoningIndexRaw(tc.Index, position)
+		call := choice.calls[index]
+		if call == nil {
+			if len(choice.calls) >= maxReasoningEntries {
+				choice.invalid = true
+				continue
+			}
+			call = &reasoningToolCall{}
+			choice.calls[index] = call
+		}
+		if b, ok := jsonStringRawBytes(tc.ID); ok {
+			a.capturePayloadBytes(choice, &call.id, b)
+		}
+		if b, ok := jsonStringRawBytes(tc.Type); ok {
+			a.capturePayloadBytes(choice, &call.kind, b)
+		}
+		if b, ok := jsonStringRawBytes(tc.Function.Name); ok {
+			a.capturePayloadBytes(choice, &call.name, b)
+		}
+		if b, ok := jsonStringRawBytes(tc.Function.Arguments); ok {
+			a.capturePayloadBytes(choice, &call.arguments, b)
+		}
+	}
+}
+
+func reasoningPrefixBytes(text []byte, limit int) []byte {
+	if len(text) <= limit {
+		return text
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end]
+}
+
 // ingestMap is ingest for an already-decoded chunk, so the streaming path
 // can decode once and share the result with the reasoning alias.
 func (a *sseReasoningAcc) ingestMap(chunk map[string]any) {
@@ -256,16 +450,9 @@ func (a *sseReasoningAcc) ingestMap(chunk map[string]any) {
 			continue
 		}
 		index := reasoningIndex(cm, position)
-		if a.choices == nil {
-			a.choices = make(map[int]*reasoningChoice)
-		}
-		choice := a.choices[index]
+		choice := a.getOrCreateChoice(index)
 		if choice == nil {
-			if len(a.choices) >= maxReasoningEntries {
-				continue
-			}
-			choice = &reasoningChoice{}
-			a.choices[index] = choice
+			continue
 		}
 		a.ingestObj(choice, cm["delta"])
 		a.ingestObj(choice, cm["message"])
@@ -355,6 +542,18 @@ func (a *sseReasoningAcc) capturePayload(choice *reasoningChoice, dst *strings.B
 	a.payloadBytes += len(text)
 }
 
+func (a *sseReasoningAcc) capturePayloadBytes(choice *reasoningChoice, dst *strings.Builder, text []byte) {
+	if choice.invalid || len(text) == 0 {
+		return
+	}
+	if len(text) > maxReasoningBytes-a.payloadBytes {
+		choice.invalid = true
+		return
+	}
+	_, _ = dst.Write(text)
+	a.payloadBytes += len(text)
+}
+
 func (a *sseReasoningAcc) store(cache *reasoningCache, ctx reasoningContext) {
 	if a == nil || !ctx.valid {
 		return
@@ -422,6 +621,9 @@ func aliasReasoningMap(chunk map[string]any) bool {
 }
 
 func rememberFromResponse(body []byte, cache *reasoningCache, ctx reasoningContext) []byte {
+	if !hasReasoningMarkers(body) {
+		return body
+	}
 	chunk, ok := decodeChunkMap(body)
 	if !ok {
 		return body

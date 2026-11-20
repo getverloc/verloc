@@ -736,19 +736,25 @@ export default function Docs() {
         </Note>
       </Section>
 
-      <Section id="failover" index="10" kicker="Reliability" title="Failover and retries"
-        description="verloc tries the primary route first, then each configured fallback in order, rotating through credentials until a response is committed.">
+      <Section id="failover" index="10" kicker="Reliability" title="Failover, circuit breaking, and retries"
+        description="verloc rotates credentials, steers proactively around upstream rate limits, protects providers with bulkheads, and fails over across routes before any response byte reaches the caller.">
         <Prose>
-          Retries are bounded by both an attempt count and a wall-clock budget. Keys that fail enter
-          a cooldown and are skipped by later requests. Failover happens before any response byte
-          reaches the client; once the first body byte is flushed, the route is committed and no
-          further fallback occurs — an interrupted stream is reported as interrupted, never merged
-          with another provider's output.
+          Retries are bounded by both an attempt count and a wall-clock budget. Failing keys use
+          error-class jittered backoff and recover through a half-open single-probe circuit breaker
+          (one probe at a time, two consecutive successes to restore full traffic) so an expiring
+          cooldown never triggers a thundering herd. Upstream rate-limit headers
+          (<code className="font-mono text-edge-200">x-ratelimit-remaining-*</code>,{' '}
+          <code className="font-mono text-edge-200">anthropic-ratelimit-*</code>) softly steer
+          multi-key pools away from exhausted keys before a 429 occurs. Failover happens strictly
+          before any response byte reaches the client; once the first byte is flushed, the route is
+          committed and an interrupted stream is never merged with another provider&apos;s output.
         </Prose>
         <Spec rows={[
           ['Retryable statuses', 'list', '401, 402, 429, 500, 502, 503, 504 — plus 400 errors that indicate balance, quota, credit, rate limit, or payment.'],
-          ['Retry order', 'sequence', 'Primary target, then model_routes[id] in declared order. Credentials within a provider rotate round-robin over healthy, non-cooling keys.'],
-          ['Cooldown', 'timing', 'A failed key cools down for base × failures (capped at 5 minutes); a Retry-After header overrides, capped at 1 hour. Success resets the key.'],
+          ['Error-class backoff', 'timing', '401/402/403 quarantine at 5m (cap 15m), 429 uses Retry-After (cap 1h) or 1.5× base, 5xx/network uses exponential jittered backoff (±10%, cap 5m).'],
+          ['Half-open recovery', 'circuit', 'After cooldown expiry, exactly one concurrent probe is admitted at a time; two consecutive successes restore full pool eligibility.'],
+          ['Proactive RL steering', 'headers', 'Zero-remaining upstream rate-limit headers soft-cool a key until its reset time so healthy sibling keys take traffic before 429s hit.'],
+          ['Provider bulkhead', 'isolation', 'Optional per-provider max_in_flight cap (0–4096). Saturated providers fail over immediately to the next route instead of queuing.'],
           ['Client flush', 'safety', 'No status line or headers are sent to the client until an upstream success is confirmed or the retry budget is exhausted.'],
         ]} />
         <Table className="min-w-[560px]">
@@ -765,10 +771,10 @@ export default function Docs() {
               ['max_attempts', '4', '32', 'Upstream attempts across all routes and keys'],
               ['retry_budget_seconds', '30', '300', 'Wall-clock failover window'],
               ['max_body_bytes', '8 MiB', '64 MiB', 'Inference request body cap'],
-              ['max_in_flight', '64', '4096', 'Global concurrent requests'],
+              ['max_in_flight', '512', '4096', 'Global concurrent requests'],
               ['max_queued', '128', '16384', 'Requests queued when at capacity'],
-              ['queue_timeout_seconds', '10', '120', 'Maximum admission wait'],
-              ['stream_idle_timeout_seconds', '60', '600', 'Idle SSE read/write deadline'],
+              ['queue_timeout_seconds', '30', '120', 'Maximum admission wait'],
+              ['stream_idle_timeout_seconds', '120', '600', 'Idle SSE read/write deadline'],
             ] as Array<[string, string, string, string]>).map(([limit, def, max, effect]) => (
               <TableRow key={limit}>
                 <TableCell className="py-3 text-[11px] whitespace-nowrap text-primary"><code>{limit}</code></TableCell>
@@ -781,13 +787,22 @@ export default function Docs() {
         </Table>
       </Section>
 
-      <Section id="model-routing" index="11" kicker="Routing" title="Model routing"
-        description="A public model ID is an alias. It resolves to a backend and an upstream model name, with optional ordered fallbacks.">
+      <Section id="model-routing" index="11" kicker="Routing" title="Model routing & hedging"
+        description="A public model ID is an alias. It resolves to a primary backend and optional fallbacks, with opt-in adaptive latency routing, smooth weighted splits, and speculative hedging.">
         <Prose>
-          Each entry in the model map either names a backend explicitly (<code className="font-mono text-edge-200">backend:upstream</code>)
-          or a bare upstream model that uses the default provider. The request's model field is
-          rewritten to the upstream name before forwarding; the public ID is never sent upstream.
+          Each entry in the model map names a backend explicitly (<code className="font-mono text-edge-200">backend:upstream</code>)
+          or uses the default provider. By default, routes are tried in declared order (<code className="font-mono text-edge-200">ordered</code>).
+          Per-model routing policies can opt into <code className="font-mono text-edge-200">latency</code> (Peak EWMA scoring
+          that adapts to real-time latency, in-flight load, and error rate), <code className="font-mono text-edge-200">weighted</code>{' '}
+          (smooth weighted round-robin with automatic unhealthy bypass), and speculative hedging
+          (<code className="font-mono text-edge-200">hedge_delay_ms</code>) for tail-latency reduction on non-streaming requests.
         </Prose>
+        <Spec rows={[
+          ['ordered (default)', 'strategy', 'Tries the primary target first, then model_routes[id] in declared order.'],
+          ['latency', 'strategy', 'Ranks healthy candidate routes by Peak EWMA latency weighted by in-flight concurrency and error penalties.'],
+          ['weighted', 'strategy', 'Distributes traffic smoothly by primary_weight and each fallback route weight (default 1); unhealthy or saturated routes are bypassed automatically.'],
+          ['hedge_delay_ms / max_hedges', 'hedging', 'Opt-in (default 0 = off). After hedge_delay_ms without headers on non-streaming calls, fires up to 1–2 backup routes; first valid response wins and losers are canceled immediately.'],
+        ]} />
         <CodeBlock label="Routing config (excerpt)" code={`{
   "default_provider": "nvidia",
   "model_map": {
@@ -796,9 +811,19 @@ export default function Docs() {
   },
   "model_routes": {
     "<model-id>": [
-      { "backend": "openrouter", "upstream": "deepseek/deepseek-chat" },
-      { "backend": "groq", "upstream": "llama-3.3-70b" }
+      { "backend": "openrouter", "upstream": "deepseek/deepseek-chat", "weight": 3 },
+      { "backend": "groq", "upstream": "llama-3.3-70b", "weight": 2 }
     ]
+  },
+  "model_meta": {
+    "<model-id>": {
+      "routing": {
+        "strategy": "latency",
+        "primary_weight": 5,
+        "hedge_delay_ms": 1500,
+        "max_hedges": 1
+      }
+    }
   },
   "disabled_models": { "<paused-id>": true }
 }`} />
@@ -810,13 +835,13 @@ export default function Docs() {
       </Section>
 
       <Section id="client-keys" index="12" kicker="Access control" title="Client key policy"
-        description="Application keys carry an optional model scope and independent rate ceilings. Manage them under API Keys.">
+        description="Application keys carry an optional model scope and independent sliding-window rate ceilings. Manage them under API Keys.">
         <Spec rows={[
           ['name', 'string (1–120)', 'Human label shown in the dashboard and audit history.'],
           ['allowed_models', 'string[] (≤256)', 'Exact model IDs this key may use. Empty means all configured models.'],
           ['expires_at', 'integer (ms)', 'Epoch-millisecond expiry; zero means never. Must be in the future when set.'],
-          ['rpm', 'integer', 'Requests per minute, rolling 60-second window. Zero disables the limit.'],
-          ['tpm', 'integer', 'Tokens per minute, rolling 60-second window. Zero disables the limit. Requires model token bounds.'],
+          ['rpm', 'integer', 'Requests per minute, sliding 60-second weighted window (eliminates 2× boundary bursts). Zero disables the limit.'],
+          ['tpm', 'integer', 'Tokens per minute, sliding 60-second weighted window with cross-boundary reconciliation. Zero disables the limit. Requires model token bounds.'],
           ['max_concurrent', 'integer', 'Maximum simultaneous in-flight requests. Zero disables the limit.'],
         ]} />
         <Prose>
@@ -840,10 +865,11 @@ export default function Docs() {
       <Section id="configuration" index="13" kicker="Operations" title="Configuration reference"
         description="configuration.json bootstraps the gateway once; SQLite is the source of truth afterwards. Most settings are applied live from the dashboard.">
         <Prose>
-          The management database holds providers, credentials, models, routes, limits, and alert
-          rules after the first import. Listener address, paths, cookie options, host allowlist
-          and trusted-proxy policy are read at startup and require a restart; managed settings
-          apply without one. Bootstrap export preserves those security policies.
+          The management database holds providers, credentials, models, routes, routing policies,
+          limits, response cache policy, and alert rules after the first import. Listener address,
+          paths, cookie options, host allowlist and trusted-proxy policy are read at startup and
+          require a restart; managed settings apply without one. Bootstrap export preserves those
+          security policies.
         </Prose>
         <Spec rows={[
           ['listen', 'string', 'Bind address. Requires restart. Default ":8080".'],
@@ -855,18 +881,21 @@ export default function Docs() {
           ['providers.<name>.api_format', 'string', '"" or "openai" for OpenAI-compatible, "systemone" for native decision APIs.'],
           ['providers.<name>.auth_header_format', 'string', 'Header template with one %s, for example "Bearer %s".'],
           ['providers.<name>.keys', 'array', 'String keys, or objects with id, account_id, and api_key.'],
-          ['providers.<name>.cooldown_seconds', 'integer', 'Per-provider key cooldown, capped at 3600.'],
+          ['providers.<name>.cooldown_seconds', 'integer', 'Per-provider base key cooldown, capped at 3600.'],
           ['providers.<name>.request_timeout_seconds', 'integer', 'Upstream response-header timeout, capped at 300.'],
-          ['providers.<name>.max_tokens', 'integer', 'Clamp output limits for this provider. Zero means no clamp.'],
+          ['providers.<name>.max_tokens', 'integer', 'Clamp output limits for this provider. Zero means no cap.'],
+          ['providers.<name>.max_in_flight', 'integer', 'Opt-in per-provider concurrency bulkhead (0–4096). Excess requests fail over immediately. Default 0 (unbounded).'],
+          ['providers.<name>.keep_warm_seconds', 'integer', 'Opt-in TLS keep-alive probe interval (0–300s) to eliminate cold connection handshakes. Default 0 (off).'],
           ['providers.<name>.strip_reasoning_content', 'boolean', 'Remove reasoning traces from assistant messages. Defaults to true.'],
           ['providers.<name>.synthesize_cli_headers', 'boolean', 'Send standardised CLI identity headers upstream.'],
           ['providers.<name>.no_auth', 'boolean', 'Keyless provider; no Authorization header is sent.'],
           ['providers.<name>.allow_private_upstreams', 'boolean', 'Explicit permission for intentionally local/LAN endpoints. Default false; exposed in provider editing and guided add.'],
           ['model_map', 'object', 'Public model ID to "backend:upstream" or bare upstream.'],
-          ['model_routes', 'object', 'Public model ID to an ordered array of { backend, upstream } fallbacks.'],
-          ['model_meta', 'object', 'Catalog overlay: name, description, owned_by, limits, tags, prices, attachment/reasoning/temperature booleans and input/output modalities. Explicit false is preserved; absent capabilities remain inherited or unknown.'],
+          ['model_routes', 'object', 'Public model ID to an array of { backend, upstream, weight? } fallbacks.'],
+          ['model_meta', 'object', 'Catalog overlay: name, description, owned_by, limits, tags, prices, capabilities, modalities, and optional routing ({ strategy, primary_weight, hedge_delay_ms, max_hedges }).'],
           ['disabled_models', 'object', 'Public IDs paused without deletion.'],
-          ['limits', 'object', 'Admission and retry bounds (see section 09).'],
+          ['limits', 'object', 'Global admission, retry, body, and stream bounds (see section 10).'],
+          ['cache.*', 'object', 'Opt-in deterministic LRU response cache: enabled (default false), ttl_seconds (300), max_entries (1024), max_bytes (64 MiB), models (empty = all). Isolated per client key; honors Cache-Control: no-store/no-cache.'],
           ['dashboard.*', 'object', 'Analytics database path, recent-request ring size, and alert rules.'],
         ]} />
         <Note>
@@ -877,17 +906,17 @@ export default function Docs() {
       </Section>
 
       <Section id="features" index="14" kicker="Platform" title="Platform features"
-        description="Beyond proxying: credential pooling, provider onboarding, a pricing catalog, durable analytics, alerts, and private backups.">
+        description="High-throughput Go engine with zero-copy SSE streaming, adaptive routing, circuit breaking, deterministic caching, durable analytics, alerts, and private backups.">
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {([
-            ['Credential pooling', 'Per-provider key pools rotate round-robin over healthy credentials, cool down failing keys, and recover automatically.'],
-            ['Ordered failover', 'Primary and fallback routes are tried in order with bounded attempts and a wall-clock retry budget.'],
-            ['Model discovery', 'Probe an upstream /models endpoint, detect chat, image, and embedding models, prefill limits and prices, then onboard transactionally. Tests call the detected endpoint; image tests require explicit credit acknowledgement.'],
-            ['Pricing catalog', 'An embedded catalog overlaid by live pricing hints; per-request cost uses the immutable request-time price.'],
-            ['Metadata-only analytics', 'Request metadata, tokens, latency, and known cost are stored. Prompts, completions, and bodies never are.'],
-            ['Alerts', 'Threshold rules over error rate, failover, cost, latency, TTFT, and key cooldown notify in the dashboard — they do not throttle paid traffic.'],
-            ['Private backups', 'Consistent server-side snapshots of the management and analytics databases, with a checksum manifest and CLI restore.'],
-            ['Reasoning replay', 'Reasoning traces are stripped or replayed per provider so tool-call follow-ups succeed against DeepSeek-style upstreams.'],
+            ['Low-overhead hot path', 'Zero-allocation model patching, zero-copy SSE streaming, lock-free atomic metrics & auth lookups, pooled gzip/buffers, and tuned HTTP/2 connection pools.'],
+            ['Smart credential pooling', 'Round-robin rotation over healthy credentials with error-class jittered backoff, proactive rate-limit header steering, and half-open single-probe recovery.'],
+            ['Adaptive routing & hedging', 'Per-model ordered failover, Peak EWMA latency routing, smooth weighted round-robin, and opt-in speculative hedging with instant loser cancellation.'],
+            ['Bulkheads & keep-warm', 'Optional per-provider max_in_flight isolation prevents slow upstreams from saturating the gateway; optional keep-warm probes keep TLS/HTTP2 sockets hot.'],
+            ['Deterministic response cache', 'Opt-in tenant-isolated in-memory LRU cache for temperature=0 chat, embeddings, and System One, reporting X-Verloc-Cache: HIT/MISS.'],
+            ['Sliding-window client limits', 'Per-key RPM, TPM, and concurrency ceilings use weighted 60-second sliding windows to prevent 2× minute-boundary traffic bursts.'],
+            ['Model discovery & catalog', 'Probe upstream /models, detect chat/image/embedding models, prefill limits and prices from live catalogs, and onboard transactionally.'],
+            ['Metadata-only analytics & backups', 'Durable SQLite analytics (never prompts or completions), live alerting, and consistent server-side backups with checksum manifests.'],
           ] as Array<[string, string]>).map(([title, body]) => (
             <div key={title} className="border border-edge-700 bg-edge-950 p-4">
               <div className="text-[11px] text-edge-100">{title}</div>
@@ -901,13 +930,12 @@ export default function Docs() {
         description="verloc is a focused single-owner gateway. Knowing its boundaries avoids surprises.">
         <ul className="space-y-3">
           {([
-            'Chat Completions, Responses, and System One are the only inference APIs. Embeddings, images, audio, and moderation are not implemented.',
-            'Responses requests are not translated to Chat Completions; the selected upstream must support the Responses API directly.',
-            'System One is non-streaming and requires uncompressed JSON. Chat and Responses support streaming.',
+            'Supported inference APIs: Chat Completions, Responses (translated to Chat Completions), Anthropic Messages (translated to Chat Completions), System One, Embeddings, and Image generations/edits. Audio, video, and moderation are not implemented.',
+            'System One is non-streaming and requires uncompressed JSON. Chat, Responses, and Anthropic Messages support SSE streaming.',
             'A single instance serves a single host with one owner. There is no clustering, RBAC, SSO, or distributed rate limiting.',
+            'Response cache, rate counters, EWMA latency scores, and alert evaluation windows are process-local and reset when the gateway restarts.',
             'Analytics history is retained indefinitely with no automatic compaction or size cap.',
-            'Rate and alert evaluation windows are process-local and reset when the gateway restarts.',
-            'Native and OpenAI-format models are not interchangeable across endpoints; an incompatible call returns 400.',
+            'Native System One and OpenAI-format models are not interchangeable across endpoints; an incompatible call returns 400.',
           ] as string[]).map((item) => (
             <li key={item} className="flex gap-3 border border-edge-700 bg-edge-950 p-4 text-[11px] leading-relaxed text-edge-300">
               <span className="mt-1.5 size-1.5 shrink-0 bg-primary" aria-hidden="true" />{item}

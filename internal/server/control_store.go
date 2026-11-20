@@ -42,14 +42,15 @@ type AuditEvent struct {
 // controlSettings is deliberately a whitelist, never a serialized Config.
 // In particular neither ProxyKey, legacy Keys nor bootstrap paths belong here.
 type controlSettings struct {
-	DefaultProvider  string        `json:"default_provider"`
-	AuthHeader       string        `json:"auth_header"`
-	AuthHeaderFormat string        `json:"auth_header_format"`
-	CooldownSeconds  int           `json:"cooldown_seconds"`
-	RequestTimeout   int           `json:"request_timeout_seconds"`
-	RecentRequests   int           `json:"recent_requests"`
-	Alerts           []AlertRule   `json:"alerts"`
-	Limits           GatewayLimits `json:"limits"`
+	DefaultProvider  string               `json:"default_provider"`
+	AuthHeader       string               `json:"auth_header"`
+	AuthHeaderFormat string               `json:"auth_header_format"`
+	CooldownSeconds  int                  `json:"cooldown_seconds"`
+	RequestTimeout   int                  `json:"request_timeout_seconds"`
+	RecentRequests   int                  `json:"recent_requests"`
+	Alerts           []AlertRule          `json:"alerts"`
+	Limits           GatewayLimits        `json:"limits"`
+	Cache            *ResponseCacheConfig `json:"cache,omitempty"`
 }
 
 func controlDSN(path string, readOnly bool) string {
@@ -300,7 +301,7 @@ func (s *ControlStore) checkKey(db *sql.DB) error {
 
 func (s *ControlStore) migrate(newDB bool) error {
 	if !newDB {
-		return nil
+		return s.ensureModelRoutesWeightColumn()
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -313,7 +314,7 @@ func (s *ControlStore) migrate(newDB bool) error {
 		`CREATE TABLE providers(id TEXT PRIMARY KEY,options TEXT NOT NULL)`,
 		`CREATE TABLE provider_credentials(id TEXT PRIMARY KEY,provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,position INTEGER NOT NULL,encrypted BLOB NOT NULL,UNIQUE(provider_id,position))`,
 		`CREATE TABLE models(id TEXT PRIMARY KEY,backend TEXT NOT NULL REFERENCES providers(id),upstream TEXT NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,metadata TEXT NOT NULL)`,
-		`CREATE TABLE model_routes(model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,position INTEGER NOT NULL,backend TEXT NOT NULL REFERENCES providers(id),upstream TEXT NOT NULL,PRIMARY KEY(model_id,position))`,
+		`CREATE TABLE model_routes(model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,position INTEGER NOT NULL,backend TEXT NOT NULL REFERENCES providers(id),upstream TEXT NOT NULL,weight INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(model_id,position))`,
 		`CREATE TABLE admin_auth(id INTEGER PRIMARY KEY CHECK(id=1),password_salt BLOB NOT NULL,password_hash BLOB NOT NULL,created_at INTEGER NOT NULL)`,
 		`CREATE TABLE admin_sessions(token_hash BLOB PRIMARY KEY,csrf_token TEXT NOT NULL,expires_at INTEGER NOT NULL)`,
 		`CREATE TABLE client_keys(id TEXT PRIMARY KEY,name TEXT NOT NULL,key_hash BLOB UNIQUE NOT NULL,prefix TEXT NOT NULL,allowed_models TEXT NOT NULL DEFAULT '[]',expires_at INTEGER NOT NULL DEFAULT 0,rpm INTEGER NOT NULL DEFAULT 0,tpm INTEGER NOT NULL DEFAULT 0,max_concurrent INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,revoked_at INTEGER NOT NULL DEFAULT 0)`,
@@ -336,6 +337,18 @@ func (s *ControlStore) migrate(newDB bool) error {
 	return tx.Commit()
 }
 
+func (s *ControlStore) ensureModelRoutesWeightColumn() error {
+	var hasWeight int
+	if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('model_routes') WHERE name='weight'`).Scan(&hasWeight); err != nil {
+		return err
+	}
+	if hasWeight > 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`ALTER TABLE model_routes ADD COLUMN weight INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
 func controlModelTarget(value, defaultProvider string) (string, string) {
 	if i := strings.IndexByte(value, ':'); i >= 0 {
 		return value[:i], value[i+1:]
@@ -354,6 +367,11 @@ func prepareControlConfig(cfg *Config, importCatalog bool) (*Config, error) {
 	if err := out.Limits.Validate(); err != nil {
 		return nil, err
 	}
+	cacheCfg, err := validateResponseCacheConfig(out.Cache)
+	if err != nil {
+		return nil, err
+	}
+	out.Cache = cacheCfg
 	out.ProxyKey = ""
 	if len(out.Providers) == 0 && (len(out.Keys) > 0 || out.UpstreamBase != "") {
 		p := &ProviderConfig{BaseURL: out.UpstreamBase, AuthHeader: out.AuthHeader, AuthHeaderFormat: out.AuthHeaderFormat, CooldownSeconds: out.CooldownSeconds, RequestTimeout: out.RequestTimeout}
@@ -383,7 +401,7 @@ func prepareControlConfig(cfg *Config, importCatalog bool) (*Config, error) {
 				return nil, fmt.Errorf("provider %q has an empty credential", name)
 			}
 		}
-		if p.CooldownSeconds < 0 || p.CooldownSeconds > 3600 || p.RequestTimeout < 0 || p.MaxTokens < 0 {
+		if p.CooldownSeconds < 0 || p.CooldownSeconds > 3600 || p.RequestTimeout < 0 || p.MaxTokens < 0 || p.MaxInFlight < 0 || p.MaxInFlight > 4096 || p.KeepWarmSeconds < 0 || p.KeepWarmSeconds > 300 {
 			return nil, fmt.Errorf("provider %q has invalid limits", name)
 		}
 	}
@@ -402,6 +420,9 @@ func prepareControlConfig(cfg *Config, importCatalog bool) (*Config, error) {
 			if out.Providers[route.Backend] == nil || strings.TrimSpace(route.Upstream) == "" {
 				return nil, fmt.Errorf("model %q references an invalid fallback", id)
 			}
+			if route.Weight < 0 || route.Weight > 1000 {
+				return nil, fmt.Errorf("model %q fallback weight must be between 0 and 1000", id)
+			}
 		}
 	}
 	for id := range out.ModelMeta {
@@ -412,6 +433,11 @@ func prepareControlConfig(cfg *Config, importCatalog bool) (*Config, error) {
 			if _, err := normalizeOperations(meta.Operations); err != nil {
 				return nil, err
 			}
+			routing, err := normalizeRoutePolicy(meta.Routing)
+			if err != nil {
+				return nil, fmt.Errorf("model %q: %w", id, err)
+			}
+			meta.Routing = routing
 			if !finitePricePtr(meta.PricingImage) || meta.PricingImage != nil && (*meta.PricingImage < 0 || *meta.PricingImage > 1e9) {
 				return nil, fmt.Errorf("invalid image price for model %q", id)
 			}
@@ -632,12 +658,12 @@ func (s *ControlStore) writeConfig(tx *sql.Tx, cfg *Config, action string) error
 			return err
 		}
 		for i, route := range cfg.ModelRoutes[id] {
-			if _, err := tx.Exec(`INSERT INTO model_routes(model_id,position,backend,upstream) VALUES(?,?,?,?)`, id, i, route.Backend, route.Upstream); err != nil {
+			if _, err := tx.Exec(`INSERT INTO model_routes(model_id,position,backend,upstream,weight) VALUES(?,?,?,?,?)`, id, i, route.Backend, route.Upstream, route.Weight); err != nil {
 				return err
 			}
 		}
 	}
-	settings := controlSettings{DefaultProvider: cfg.DefaultProvider, AuthHeader: cfg.AuthHeader, AuthHeaderFormat: cfg.AuthHeaderFormat, CooldownSeconds: cfg.CooldownSeconds, RequestTimeout: cfg.RequestTimeout, RecentRequests: cfg.Dashboard.RecentRequests, Alerts: cfg.Dashboard.Alerts, Limits: cfg.Limits}
+	settings := controlSettings{DefaultProvider: cfg.DefaultProvider, AuthHeader: cfg.AuthHeader, AuthHeaderFormat: cfg.AuthHeaderFormat, CooldownSeconds: cfg.CooldownSeconds, RequestTimeout: cfg.RequestTimeout, RecentRequests: cfg.Dashboard.RecentRequests, Alerts: cfg.Dashboard.Alerts, Limits: cfg.Limits, Cache: cfg.Cache}
 	data, err := json.Marshal(settings)
 	if err != nil {
 		return err
@@ -671,7 +697,7 @@ func (s *ControlStore) loadConfig(tx *sql.Tx, seed *Config) (*Config, error) {
 		return nil, err
 	}
 	out.DefaultProvider, out.AuthHeader, out.AuthHeaderFormat = settings.DefaultProvider, settings.AuthHeader, settings.AuthHeaderFormat
-	out.CooldownSeconds, out.RequestTimeout, out.Limits = settings.CooldownSeconds, settings.RequestTimeout, settings.Limits
+	out.CooldownSeconds, out.RequestTimeout, out.Limits, out.Cache = settings.CooldownSeconds, settings.RequestTimeout, settings.Limits, settings.Cache
 	out.Dashboard.RecentRequests, out.Dashboard.Alerts = settings.RecentRequests, settings.Alerts
 	rows, err := tx.Query(`SELECT id,options FROM providers ORDER BY id`)
 	if err != nil {
@@ -739,14 +765,14 @@ func (s *ControlStore) loadConfig(tx *sql.Tx, seed *Config) (*Config, error) {
 	if rowsErr != nil {
 		return nil, rowsErr
 	}
-	rows, err = tx.Query(`SELECT model_id,backend,upstream FROM model_routes ORDER BY model_id,position`)
+	rows, err = tx.Query(`SELECT model_id,backend,upstream,weight FROM model_routes ORDER BY model_id,position`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var id string
 		var route RouteTarget
-		if err = rows.Scan(&id, &route.Backend, &route.Upstream); err != nil {
+		if err = rows.Scan(&id, &route.Backend, &route.Upstream, &route.Weight); err != nil {
 			break
 		}
 		out.ModelRoutes[id] = append(out.ModelRoutes[id], route)

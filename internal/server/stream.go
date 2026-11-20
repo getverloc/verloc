@@ -9,7 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -25,6 +25,29 @@ const maxSSELineBytes = 8 << 20
 // stream for sending a legitimately large event.
 const maxEventBufBytes = 2 << 20
 
+const maxPooledBufCap = 64 << 10
+
+var (
+	spillChunkPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 32<<10)
+			return &b
+		},
+	}
+	sseScannerBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 16<<10)
+			return &b
+		},
+	}
+	sseEventBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 4096)
+			return &b
+		},
+	}
+)
+
 // maxPost200Duration is the absolute ceiling on a healthy upstream response
 // once a 200 is in hand. The retry budget (correctly) stops at that point
 // and the idle reader only bounds gaps between reads, so without this a
@@ -37,11 +60,19 @@ const maxPost200Duration = 10 * time.Minute
 // Matches balance / rate-limit style errors in a 400 body so we can fail over.
 type committedStreamWriter struct {
 	http.ResponseWriter
+	rc           *http.ResponseController
 	response     *http.Response
 	requestID    string
 	idle         time.Duration
 	beforeCommit func() error
 	committed    bool
+}
+
+func (w *committedStreamWriter) controller() *http.ResponseController {
+	if w.rc == nil {
+		w.rc = http.NewResponseController(w.ResponseWriter)
+	}
+	return w.rc
 }
 
 func (w *committedStreamWriter) Write(p []byte) (int, error) {
@@ -54,13 +85,14 @@ func (w *committedStreamWriter) Write(p []byte) (int, error) {
 		w.ResponseWriter.WriteHeader(http.StatusOK)
 		w.committed = true
 	}
-	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(w.idle))
+	_ = w.controller().SetWriteDeadline(time.Now().Add(w.idle))
 	return w.ResponseWriter.Write(p)
 }
 
 func (w *committedStreamWriter) FlushError() error {
-	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(w.idle))
-	err := http.NewResponseController(w.ResponseWriter).Flush()
+	rc := w.controller()
+	_ = rc.SetWriteDeadline(time.Now().Add(w.idle))
+	err := rc.Flush()
 	if errors.Is(err, http.ErrNotSupported) {
 		return nil
 	}
@@ -103,7 +135,9 @@ type spillBody struct {
 
 func readSpillBody(r io.Reader) (*spillBody, error) {
 	b := &spillBody{}
-	chunk := make([]byte, 32<<10)
+	chunkPtr := spillChunkPool.Get().(*[]byte)
+	chunk := *chunkPtr
+	defer spillChunkPool.Put(chunkPtr)
 	for {
 		n, err := r.Read(chunk)
 		if n > 0 {
@@ -112,6 +146,12 @@ func readSpillBody(r io.Reader) (*spillBody, error) {
 			if b.file == nil {
 				room := nonStreamMemLimit - int64(len(b.mem))
 				if int64(len(data)) <= room {
+					if len(b.mem) == 0 && err == io.EOF {
+						// Single-read response: allocate exact size without growth doubling.
+						b.mem = make([]byte, n)
+						copy(b.mem, data)
+						return b, nil
+					}
 					b.mem = append(b.mem, data...)
 				} else {
 					// This chunk crosses the memory limit: mem keeps the
@@ -173,7 +213,7 @@ func (b *spillBody) bytes() ([]byte, error) {
 
 func (b *spillBody) validJSON() bool {
 	if b.file == nil {
-		return json.Valid(b.mem)
+		return validateJSON(b.mem)
 	}
 	// Stream tokens instead of decoding: Decode(&any) would materialize
 	// the entire JSON tree (measured +611 MB heap on a 52 MB body),
@@ -262,11 +302,47 @@ type streamOptions struct {
 	acc *sseReasoningAcc
 }
 
-// usageMarker gates the per-chunk usage parse. Usage appears only in the final
-// chunk of a stream, so scanning for the key first avoids a full JSON decode
-// on every chunk. A false negative here only means the terminal usage chunk is
-// missed, which is caught by the same parse on the final event anyway.
-var usageMarker = []byte(`"usage"`)
+// Byte markers gating per-chunk JSON decoding on the SSE hot path.
+var (
+	usageMarker             = []byte(`"usage"`)
+	sseDataPrefix           = []byte("data:")
+	sseDonePayload          = []byte("[DONE]")
+	sseErrorMarker          = []byte(`"error"`)
+	sseResponsePrefixMarker = []byte(`"response.`)
+	sseFinishReasonMarker   = []byte(`"finish_reason"`)
+	sseReasoningAliasMarker = []byte(`"reasoning"`)
+)
+
+// hasNonNullFinishReason reports whether data contains a "finish_reason" key
+// whose JSON value is not null. Normal streaming delta chunks carry
+// "finish_reason":null on every token, so skipping null values avoids running
+// json.Unmarshal on 99%+ of chunks while catching every terminal finish_reason
+// (including multi-choice chunks where a later choice finishes).
+func hasNonNullFinishReason(data []byte) bool {
+	rem := data
+	for {
+		idx := bytes.Index(rem, sseFinishReasonMarker)
+		if idx < 0 {
+			return false
+		}
+		rem = rem[idx+len(sseFinishReasonMarker):]
+		i := skipJSONWS(rem, 0)
+		if i < len(rem) && rem[i] == ':' {
+			i = skipJSONWS(rem, i+1)
+			if i+4 <= len(rem) && rem[i] == 'n' && rem[i+1] == 'u' && rem[i+2] == 'l' && rem[i+3] == 'l' {
+				rem = rem[i+4:]
+				continue
+			}
+			return true
+		}
+	}
+}
+
+func needsSSEEventParse(data []byte) bool {
+	return bytes.Contains(data, sseErrorMarker) ||
+		bytes.Contains(data, sseResponsePrefixMarker) ||
+		hasNonNullFinishReason(data)
+}
 
 // streamCopyWithUsage reports an interrupted stream unless a protocol terminal
 // marker was observed. A 200 header alone is never evidence of completion.
@@ -277,10 +353,24 @@ var usageMarker = []byte(`"usage"`)
 // SetWriteDeadline calls for every chunk.
 func streamCopyWithUsage(w http.ResponseWriter, src io.Reader, onUsage func(in, out, cache uint64), onFirst func(), opts streamOptions) error {
 	scanner := bufio.NewScanner(src)
-	scanner.Buffer(make([]byte, 4096), maxSSELineBytes)
+	scanBufPtr := sseScannerBufPool.Get().(*[]byte)
+	scanner.Buffer(*scanBufPtr, maxSSELineBytes)
+	defer sseScannerBufPool.Put(scanBufPtr)
+
+	eventBufPtr := sseEventBufPool.Get().(*[]byte)
+	eventBuf := (*eventBufPtr)[:0]
+	defer func() {
+		if cap(eventBuf) <= maxPooledBufCap {
+			*eventBufPtr = eventBuf[:0]
+			sseEventBufPool.Put(eventBufPtr)
+		}
+	}()
+
 	terminal, finished, failed := false, false, false
+	flushErrWriter, hasFlushErr := w.(interface{ FlushError() error })
 	flusher, _ := w.(http.Flusher)
-	var eventBuf []byte
+	var ingestScratch sseIngestChunk
+
 	flushEvent := func() error {
 		if len(eventBuf) == 0 {
 			return nil
@@ -289,8 +379,8 @@ func streamCopyWithUsage(w http.ResponseWriter, src io.Reader, onUsage func(in, 
 			return &streamClientError{err}
 		}
 		eventBuf = eventBuf[:0]
-		if f, ok := w.(interface{ FlushError() error }); ok {
-			if err := f.FlushError(); err != nil {
+		if hasFlushErr {
+			if err := flushErrWriter.FlushError(); err != nil {
 				return &streamClientError{err}
 			}
 		} else if flusher != nil {
@@ -298,35 +388,38 @@ func streamCopyWithUsage(w http.ResponseWriter, src io.Reader, onUsage func(in, 
 		}
 		return nil
 	}
+
 	for scanner.Scan() {
-		line := scanner.Text()
-		outLine := line
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if payload == "[DONE]" {
+		line := scanner.Bytes()
+		isData := bytes.HasPrefix(line, sseDataPrefix)
+		var rewritten []byte
+		if isData {
+			data := bytes.TrimSpace(line[len(sseDataPrefix):])
+			if bytes.Equal(data, sseDonePayload) {
 				terminal = true
-			} else if payload != "" {
-				data := []byte(payload)
-				var event struct {
-					Type    string          `json:"type"`
-					Error   json.RawMessage `json:"error"`
-					Choices []struct {
-						Finish *string `json:"finish_reason"`
-					} `json:"choices"`
-				}
-				if json.Unmarshal(data, &event) == nil {
-					switch event.Type {
-					case "response.completed":
-						terminal = true
-					case "response.failed", "response.incomplete", "error":
-						terminal, failed = true, true
+			} else if len(data) > 0 {
+				if needsSSEEventParse(data) {
+					var event struct {
+						Type    string          `json:"type"`
+						Error   json.RawMessage `json:"error"`
+						Choices []struct {
+							Finish *string `json:"finish_reason"`
+						} `json:"choices"`
 					}
-					if len(event.Error) > 0 && string(event.Error) != "null" {
-						terminal, failed = true, true
-					}
-					for _, choice := range event.Choices {
-						if choice.Finish != nil {
-							finished = true
+					if json.Unmarshal(data, &event) == nil {
+						switch event.Type {
+						case "response.completed":
+							terminal = true
+						case "response.failed", "response.incomplete", "error":
+							terminal, failed = true, true
+						}
+						if len(event.Error) > 0 && !bytes.Equal(event.Error, jsonNullBytes) {
+							terminal, failed = true, true
+						}
+						for _, choice := range event.Choices {
+							if choice.Finish != nil {
+								finished = true
+							}
 						}
 					}
 				}
@@ -335,47 +428,53 @@ func streamCopyWithUsage(w http.ResponseWriter, src io.Reader, onUsage func(in, 
 						onUsage(in, out, cache)
 					}
 				}
-				// Reasoning backends used to decode this chunk up to
-				// three times (terminal scan, ingest, alias). Decode once
-				// into a map and share it; marshal only when the alias
-				// actually changed something.
-				if opts.acc != nil || opts.aliasReasoning {
+				// Reasoning backends: only decode into a generic map when the
+				// alias pass might actually rewrite a "reasoning" field; all
+				// other chunks use the lightweight typed ingest path.
+				if opts.aliasReasoning && bytes.Contains(data, sseReasoningAliasMarker) {
 					if chunk, ok := decodeChunkMap(data); ok {
 						if opts.acc != nil {
 							opts.acc.ingestMap(chunk)
 						}
-						if opts.aliasReasoning && aliasReasoningMap(chunk) {
-							if rewritten, err := json.Marshal(chunk); err == nil {
-								outLine = "data: " + string(rewritten)
+						if aliasReasoningMap(chunk) {
+							if b, err := json.Marshal(chunk); err == nil {
+								rewritten = b
 							}
 						}
 					}
+				} else if opts.acc != nil {
+					opts.acc.ingestBytes(data, &ingestScratch)
 				}
 			}
 		}
-		eventBuf = append(eventBuf, outLine...)
+		if rewritten != nil {
+			eventBuf = append(eventBuf, "data: "...)
+			eventBuf = append(eventBuf, rewritten...)
+		} else {
+			eventBuf = append(eventBuf, line...)
+		}
 		eventBuf = append(eventBuf, '\n')
 		if len(eventBuf) > maxEventBufBytes {
 			if err := flushEvent(); err != nil {
 				return err
 			}
 		}
-		if onFirst != nil && strings.HasPrefix(line, "data:") {
+		if onFirst != nil && isData {
 			onFirst()
 			onFirst = nil
 		}
 		// An empty line terminates an SSE event: that is the only point where
 		// the client needs the bytes, so it is the only point we flush.
-		if line == "" {
+		if len(line) == 0 {
 			if err := flushEvent(); err != nil {
 				return err
 			}
-		}
-		if terminal && line == "" {
-			if failed {
-				return errors.New("upstream stream failed")
+			if terminal {
+				if failed {
+					return errors.New("upstream stream failed")
+				}
+				return nil
 			}
-			return nil
 		}
 	}
 	// Trailing event without a blank-line terminator (truncated, or a provider

@@ -74,6 +74,18 @@ export function ProviderEditor({ editProvider, setEditProvider, originalProvider
                     <Input id="ep-max-tokens" value={editProvider.max_tokens ?? ''} onChange={(e) => setEditProvider({ ...editProvider, max_tokens: e.target.value })} inputMode="numeric" className="font-mono" />
                   </Field>
                 </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <Field>
+                    <FieldLabel htmlFor="ep-max-in-flight">Max in-flight (bulkhead)</FieldLabel>
+                    <Input id="ep-max-in-flight" value={editProvider.max_in_flight ?? ''} onChange={(e) => setEditProvider({ ...editProvider, max_in_flight: e.target.value })} placeholder="0 (unbounded)" inputMode="numeric" className="font-mono" />
+                    <FieldDescription>Per-provider concurrency cap (0–4096). Excess requests fail over immediately.</FieldDescription>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="ep-keep-warm">Keep-warm sec</FieldLabel>
+                    <Input id="ep-keep-warm" value={editProvider.keep_warm_seconds ?? ''} onChange={(e) => setEditProvider({ ...editProvider, keep_warm_seconds: e.target.value })} placeholder="0 (off)" inputMode="numeric" className="font-mono" />
+                    <FieldDescription>Periodic TLS keep-alive probe interval (1–300s) to cut cold-start latency.</FieldDescription>
+                  </Field>
+                </div>
                 <div className="grid gap-3 border border-edge-700 bg-edge-950 p-4 text-[11px]">
                   <Label className="flex cursor-pointer items-center gap-1.5 font-normal">
                     <Checkbox checked={!!editProvider.disabled} onCheckedChange={(v) => setEditProvider({ ...editProvider, disabled: v === true })} />

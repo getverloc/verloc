@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -40,6 +41,15 @@ type ProviderConfig struct {
 	// (Ollama, llama.cpp, vLLM); without it the wizard probe refuses such a
 	// host so the gateway cannot be used as a blind SSRF relay.
 	AllowPrivateUpstreams bool `json:"allow_private_upstreams"`
+	// MaxInFlight enforces a per-provider concurrency bulkhead. When a
+	// provider reaches MaxInFlight concurrent upstream requests, new traffic
+	// fails over immediately to the next configured route instead of queuing
+	// behind a slow upstream. 0 = unlimited (default).
+	MaxInFlight int `json:"max_in_flight,omitempty"`
+	// KeepWarmSeconds, when > 0, periodically issues a lightweight HEAD probe
+	// to keep TLS/HTTP2 connections warm in the provider's idle pool.
+	// 0 = disabled (default).
+	KeepWarmSeconds int `json:"keep_warm_seconds,omitempty"`
 }
 
 // KeyEntry is either a plain API key string (single-account providers like
@@ -114,11 +124,20 @@ type Config struct {
 	RequestTimeout  int                        `json:"request_timeout_seconds"`
 	Providers       map[string]*ProviderConfig `json:"providers"`
 	Dashboard       *DashboardConfig           `json:"dashboard"`
+	// Cache configures the opt-in deterministic response cache (disabled by default).
+	Cache *ResponseCacheConfig `json:"cache,omitempty"`
 }
 
 type RouteTarget struct {
 	Backend  string `json:"backend"`
 	Upstream string `json:"upstream"`
+	Weight   int    `json:"weight,omitempty"`
+}
+
+// key returns the weight-free identity of a RouteTarget for map indexing and
+// capability comparisons.
+func (t RouteTarget) key() RouteTarget {
+	return RouteTarget{Backend: t.Backend, Upstream: t.Upstream}
 }
 
 type GatewayLimits struct {
@@ -204,6 +223,8 @@ type ModelMeta struct {
 	ImagePrices   *ImagePricing `json:"image_prices,omitempty"`
 	PricingKnown  *bool         `json:"pricing_known,omitempty"`
 	PricingFields []string      `json:"pricing_fields,omitempty"`
+	// Routing configures opt-in adaptive routing / speculative hedging for this model.
+	Routing *RoutePolicy `json:"routing,omitempty"`
 }
 
 // DashboardConfig controls the embedded analytics dashboard + persistence.
@@ -244,6 +265,7 @@ type backend struct {
 	authFormat     string
 	pool           *KeyPool
 	client         *http.Client
+	route          *routeMetrics
 	stripReasoning bool
 	noAuth         bool
 	synthesizeCLI  bool
@@ -358,6 +380,7 @@ func (c *Config) resolveBackends() (map[string]*backend, error) {
 				apiFormat:     p.APIFormat,
 				authHeader:    p.AuthHeader,
 				authFormat:    p.AuthHeaderFormat,
+				route:         newRouteMetrics(p.MaxInFlight),
 				noAuth:        p.NoAuth,
 				synthesizeCLI: p.SynthesizeCLIHeaders,
 				maxTokens:     p.MaxTokens,
@@ -416,6 +439,7 @@ func (c *Config) resolveBackends() (map[string]*backend, error) {
 			authFormat: c.AuthHeaderFormat,
 			pool:       NewKeyPool(entries, time.Duration(c.CooldownSeconds)*time.Second),
 			client:     newClient(c.RequestTimeout),
+			route:      newRouteMetrics(0),
 			// Same default as the multi-provider path (strip=true unless a
 			// provider explicitly opts out); the legacy branch used to
 			// leave the zero value, so behaviour depended on config shape.
@@ -454,12 +478,20 @@ func primaryTarget(c *Config, mapped string) RouteTarget {
 }
 
 func newClient(timeoutSeconds int) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	transport := &http.Transport{
+		DialContext:           dialer.DialContext,
 		MaxIdleConns:          1000,
 		MaxIdleConnsPerHost:   1000,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		WriteBufferSize:       32 << 10,
+		ReadBufferSize:        32 << 10,
 		ForceAttemptHTTP2:     true,
 	}
 	if timeoutSeconds > 0 {
@@ -504,12 +536,15 @@ func providerFingerprint(p *ProviderConfig) string {
 		StripReasoning       *bool      `json:"strip_reasoning_content"`
 		MaxTokens            int        `json:"max_tokens"`
 		AllowPrivate         bool       `json:"allow_private_upstreams"`
+		MaxInFlight          int        `json:"max_in_flight,omitempty"`
+		KeepWarmSeconds      int        `json:"keep_warm_seconds,omitempty"`
 	}{
 		BaseURL: p.BaseURL, APIFormat: p.APIFormat, AuthHeader: p.AuthHeader, AuthHeaderFormat: p.AuthHeaderFormat,
 		Keys: p.Keys, CooldownSeconds: p.CooldownSeconds, RequestTimeout: p.RequestTimeout,
 		NoAuth: p.NoAuth, SynthesizeCLIHeaders: p.SynthesizeCLIHeaders,
 		StripReasoning: p.StripReasoningContent, MaxTokens: p.MaxTokens,
-		AllowPrivate: p.AllowPrivateUpstreams,
+		AllowPrivate: p.AllowPrivateUpstreams, MaxInFlight: p.MaxInFlight,
+		KeepWarmSeconds: p.KeepWarmSeconds,
 	})
 	return string(b)
 }

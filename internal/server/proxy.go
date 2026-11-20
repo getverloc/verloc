@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +52,7 @@ type runtimeState struct {
 	targetPrices      map[RouteTarget]requestPrice
 	mediaPrices       map[string]*MediaPriceSnapshot
 	targetMediaPrices map[RouteTarget]*MediaPriceSnapshot
+	cache             *responseCache
 }
 
 type requestPrice struct {
@@ -67,7 +69,13 @@ func (p requestPrice) cost(in, out, cache uint64) float64 {
 }
 
 func newRuntimeState(cfg *Config, backends map[string]*backend) *runtimeState {
-	rt := &runtimeState{cfg: cfg, backends: backends, modelPrices: make(map[string]requestPrice, len(cfg.ModelMap)), targetPrices: make(map[RouteTarget]requestPrice, len(cfg.ModelMap))}
+	rt := &runtimeState{
+		cfg:          cfg,
+		backends:     backends,
+		modelPrices:  make(map[string]requestPrice, len(cfg.ModelMap)),
+		targetPrices: make(map[RouteTarget]requestPrice, len(cfg.ModelMap)),
+		cache:        newResponseCache(cfg.Cache),
+	}
 	rt.mediaPrices = map[string]*MediaPriceSnapshot{}
 	rt.targetMediaPrices = map[RouteTarget]*MediaPriceSnapshot{}
 	for id, mapped := range cfg.ModelMap {
@@ -88,7 +96,7 @@ func newRuntimeState(cfg *Config, backends map[string]*backend) *runtimeState {
 		}
 		rt.modelPrices[id] = price
 		rt.mediaPrices[id] = priceSnapshot(price, image, imagePrices)
-		target := primaryTarget(cfg, mapped)
+		target := primaryTarget(cfg, mapped).key()
 		if previous, exists := rt.targetMediaPrices[target]; exists && !reflect.DeepEqual(previous, rt.mediaPrices[id]) {
 			rt.targetMediaPrices[target] = &MediaPriceSnapshot{}
 		} else if !exists {
@@ -105,23 +113,26 @@ func newRuntimeState(cfg *Config, backends map[string]*backend) *runtimeState {
 }
 
 type Server struct {
-	rt            atomic.Pointer[runtimeState]
-	metrics       *Metrics
-	recent        *RecentLog
-	store         *Store
-	hub           *Hub
-	alerts        *AlertEngine
-	ticker        *Ticker
-	hints         *hintResolver
-	reasonCache   *reasoningCache
-	control       *ControlStore
-	security      *Security
-	shuttingDown  atomic.Bool
-	admissionOnce sync.Once
-	admissionMu   sync.Mutex
-	admissionWake chan struct{}
-	active        int
-	queued        int
+	rt             atomic.Pointer[runtimeState]
+	metrics        *Metrics
+	recent         *RecentLog
+	store          *Store
+	hub            *Hub
+	alerts         *AlertEngine
+	ticker         *Ticker
+	hints          *hintResolver
+	reasonCache    *reasoningCache
+	control        *ControlStore
+	security       *Security
+	shuttingDown   atomic.Bool
+	routeRR        atomic.Uint64
+	keepWarmMu     sync.Mutex
+	keepWarmCancel context.CancelFunc
+	admissionOnce  sync.Once
+	admissionMu    sync.Mutex
+	admissionWake  chan struct{}
+	active         int
+	queued         int
 }
 
 func (s *Server) runtime() *runtimeState {
@@ -153,7 +164,7 @@ func (s *Server) wirePoolHooks(backends map[string]*backend) {
 				// up request handling behind SQLite.
 				store.QueueKeyEvent(time.Now().UnixMilli(), name, key, event, status, msg)
 			}
-			if hub != nil {
+			if hub.HasSubscribers() {
 				hub.Publish(map[string]any{
 					"type":  "key_event",
 					"event": KeyEvent{TS: time.Now().UnixMilli(), Backend: name, Key: key, Event: event, Status: status, Msg: msg},
@@ -205,6 +216,9 @@ func inferenceTarget(baseURL, apiFormat, upstream, endpoint string) (url, model 
 // Native model remapping preserves the raw JSON values of every other field,
 // including exact numeric state and arbitrary typed question/image extensions.
 func remapSystemOneBody(raw []byte, model string) []byte {
+	if out, handled := spliceTopLevelModel(raw, model); handled {
+		return out
+	}
 	var body map[string]json.RawMessage
 	if json.Unmarshal(raw, &body) != nil || body == nil {
 		return raw
@@ -526,7 +540,21 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 	}
 	var lease *ClientLease
 	var selectedPrice requestPrice
+	var heldSlot *routeMetrics
+	var heldProbePool *KeyPool
+	var heldProbeKey *KeyState
+	releaseHeld := func() {
+		if heldSlot != nil {
+			heldSlot.releaseSlot()
+			heldSlot = nil
+		}
+		if heldProbePool != nil && heldProbeKey != nil {
+			heldProbePool.ReleaseProbe(heldProbeKey)
+			heldProbePool, heldProbeKey = nil, nil
+		}
+	}
 	defer func() {
+		releaseHeld()
 		// A panic anywhere in forward() must not take down the process or
 		// lose the request record. net/http only recovers the connection, and
 		// we have no other recover on the request path (proxy_test.go covers
@@ -546,8 +574,10 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 		}
 		rec.LatMs = float64(time.Since(start).Nanoseconds()) / 1e6
 		rec.Failover = max(0, len(rec.AttemptLog)-1)
-		rec.CostKnown = rec.UsageKnown && selectedPrice.known
-		rec.Cost = selectedPrice.cost(rec.TokIn, rec.TokOut, rec.TokCache)
+		if rec.Outcome != "cache_hit" {
+			rec.CostKnown = rec.UsageKnown && selectedPrice.known
+			rec.Cost = selectedPrice.cost(rec.TokIn, rec.TokOut, rec.TokCache)
+		}
 		if lease != nil {
 			// No upstream attempt means no tokens could have been consumed.
 			lease.Finish(rec.TokIn+rec.TokOut, rec.UsageKnown || len(rec.AttemptLog) == 0)
@@ -568,7 +598,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 			// (plus a crypto/rand shortID) on every request.
 			s.recent.Add(rec)
 		}
-		if s.hub != nil {
+		if s.hub.HasSubscribers() {
 			s.hub.Publish(map[string]any{"type": "req", "req": rec})
 		}
 	}()
@@ -627,8 +657,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 		}
 		raw = adapter.body()
 	}
-	var metadata requestMetadata
-	if err := json.Unmarshal(raw, &metadata); err != nil {
+	metadata, bodyScan, err := parseRequestMetadata(raw)
+	if err != nil {
 		fail(400, "invalid_request", "invalid request JSON")
 		return
 	}
@@ -661,6 +691,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				fail(400, "invalid_request", "TPM-limited input requires known model token bounds")
 				return
 			}
+			bodyScan = topLevelScan{} // raw was rewritten by prepareTPMRequest
 		}
 		var policy *PolicyError
 		lease, policy = s.security.AcquireClient(r, rec.Model, reservation)
@@ -675,20 +706,277 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 			rec.ClientKeyID, rec.ClientName = lease.Identity.ID, lease.Identity.Name
 		}
 	}
+
+	// Opt-in deterministic response cache (disabled unless Config.Cache.Enabled).
+	cacheEligible := rt.cache != nil && rt.cache.isCacheEligible(endpoint, rec.Model, rec.Stream, raw, r.Header)
+	var cacheKey [32]byte
+	if cacheEligible {
+		cacheKey = responseCacheKey(rec.ClientKeyID, rec.Endpoint, rec.Model, primary, raw)
+		if hit, ok := rt.cache.Get(cacheKey); ok {
+			w.Header().Set("Content-Type", hit.contentType)
+			w.Header().Set("X-Request-ID", id)
+			w.Header().Set("X-Verloc-Cache", "HIT")
+			w.WriteHeader(http.StatusOK)
+			_, writeErr := w.Write(hit.body)
+			if writeErr != nil {
+				rec.Status, rec.Outcome, rec.ErrMsg = 499, "canceled", "client write failed"
+				return
+			}
+			rec.OK, rec.Status, rec.Outcome, rec.ErrMsg = true, 200, "cache_hit", ""
+			rec.Backend, rec.Upstream = "cache", primary.Upstream
+			rec.Cost, rec.CostKnown = 0, true
+			return
+		}
+	}
+
 	// Budget applies until an attempt is ready to flush, never to the whole stream.
 	deadline := time.Now().Add(time.Duration(limits.RetryBudgetSeconds) * time.Second)
-	routes := rt.cfg.ModelRoutes[rec.Model]
+	policy := modelRoutePolicy(rt.cfg, rec.Model)
+	candidates := buildCandidateRoutes(primary, rt.cfg.ModelRoutes[rec.Model], rt, policy, &s.routeRR)
 	rec.AttemptLog = make([]RequestAttempt, 0, limits.MaxAttempts)
 	attempts := 0
 	var previousBackend *backend
 	var previousKey *KeyState
 	lastStatus := http.StatusServiceUnavailable
-	for routeIndex := range len(routes) + 1 {
-		target := primary
-		if routeIndex > 0 {
-			target = routes[routeIndex-1]
+
+	// deliver200 handles an HTTP 200 upstream response (for both hedged and
+	// sequential attempts). Returns done=true when forward() should return,
+	// or done=false when the caller may fail over to another attempt.
+	deliver200 := func(
+		resp *http.Response,
+		b *backend,
+		ks *KeyState,
+		target RouteTarget,
+		isPrimary bool,
+		cloudflareEnvelope bool,
+		replay reasoningContext,
+		attemptStart time.Time,
+		ctx context.Context,
+		cancel context.CancelFunc,
+		budgetTimer *time.Timer,
+	) (done bool) {
+		rec.Backend, rec.Upstream, rec.Key = b.name, target.Upstream, ks.maskedKey()
+		selectedPrice = rt.modelPrices[rec.Model]
+		if !isPrimary {
+			selectedPrice = rt.targetPrices[target.key()]
 		}
-		if routeIndex > 0 && !targetSupportsOperation(rt.cfg, target, "chat") {
+		attempt := RequestAttempt{Backend: b.name, Upstream: target.Upstream, Outcome: "upstream_error"}
+		finishAttempt := func(status int, outcome string) {
+			attempt.Status, attempt.Outcome = status, outcome
+			attempt.LatMs = float64(time.Since(attemptStart).Nanoseconds()) / 1e6
+			rec.AttemptLog = append(rec.AttemptLog, attempt)
+		}
+
+		if rec.Stream {
+			idleTimeout := time.Duration(limits.StreamIdleTimeoutSeconds) * time.Second
+			idle := newIdleReader(resp.Body, idleTimeout, cancel)
+			streamWriter := &committedStreamWriter{ResponseWriter: w, response: resp, requestID: id, idle: idleTimeout,
+				beforeCommit: func() error {
+					if !budgetTimer.Stop() || ctx.Err() != nil {
+						return errors.New("retry budget exhausted")
+					}
+					return nil
+				}}
+			var acc *sseReasoningAcc
+			if !b.stripReasoning {
+				acc = &sseReasoningAcc{}
+			}
+			absTimer := time.AfterFunc(maxPost200Duration, cancel)
+			onUsage := func(i, o, c uint64) {
+				rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = i, o, c, true
+			}
+			onFirst := func() { rec.TTFTMs = float64(time.Since(start).Nanoseconds()) / 1e6 }
+			var err error
+			if adapter != nil {
+				err = adapter.streamCopier(streamWriter, idle, onUsage, onFirst)
+			} else {
+				err = streamCopyWithUsage(streamWriter, idle, onUsage, onFirst, streamOptions{
+					aliasReasoning: !b.stripReasoning,
+					acc:            acc,
+				})
+			}
+			budgetTimer.Stop()
+			absTimer.Stop()
+			idle.Close()
+			cancel()
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+			if err == nil {
+				acc.store(s.reasonCache, replay)
+			} else {
+				outcome := "interrupted"
+				if idle.timedOut.Load() {
+					outcome = "idle_timeout"
+				}
+				var clientErr *streamClientError
+				if streamWriter.committed && errors.As(err, &clientErr) {
+					outcome = "canceled"
+				}
+				if r.Context().Err() != nil {
+					outcome = "canceled"
+				}
+				rec.Status, rec.Outcome, rec.ErrMsg = 502, outcome, "upstream stream interrupted"
+				if outcome == "canceled" {
+					rec.Status = 499
+				}
+				if outcome == "idle_timeout" {
+					rec.Status = 504
+				}
+				if outcome != "canceled" {
+					b.route.Observe(time.Since(attemptStart), false)
+				}
+				b.pool.RecordErr(ks)
+				releaseHeld()
+				finishAttempt(rec.Status, outcome)
+				if !streamWriter.committed && r.Context().Err() == nil {
+					lastStatus = 502
+					return false
+				}
+				return true // The first client write permanently commits this route.
+			}
+		} else {
+			if !budgetTimer.Stop() || ctx.Err() != nil {
+				_ = resp.Body.Close()
+				cancel()
+				b.route.Observe(time.Since(attemptStart), false)
+				b.pool.RecordErr(ks)
+				releaseHeld()
+				finishAttempt(502, "interrupted")
+				lastStatus = 502
+				return false
+			}
+			idleTimeout := time.Duration(limits.StreamIdleTimeoutSeconds) * time.Second
+			idle := newIdleReader(resp.Body, idleTimeout, cancel)
+			absTimer := time.AfterFunc(maxPost200Duration, cancel)
+			sb, rerr := readSpillBody(io.LimitReader(idle, maxNonStreamBody+1))
+			absTimer.Stop()
+			_ = idle.Close()
+			err := rerr
+			if err == nil && (sb.size > maxNonStreamBody || !sb.validJSON()) {
+				err = errors.New("incomplete upstream response")
+			}
+			cancel()
+			var body []byte
+			spilled := sb.file != nil && endpoint != "/systemone" && b.stripReasoning
+			if err == nil && !spilled {
+				body, err = sb.bytes()
+			}
+			if err == nil && endpoint == "/systemone" {
+				body, err = systemOneResponse(body, cloudflareEnvelope)
+			}
+			if err != nil {
+				sb.close()
+				b.route.Observe(time.Since(attemptStart), false)
+				b.pool.RecordErr(ks)
+				releaseHeld()
+				finishAttempt(502, "interrupted")
+				lastStatus = 502
+				return false
+			}
+			if spilled {
+				rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = usageFromReader(sb.reader())
+			} else {
+				rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = usageOf(body)
+				if endpoint != "/systemone" && !b.stripReasoning {
+					body = rememberFromResponse(body, s.reasonCache, replay)
+				}
+			}
+			copyResponseHeaders(w, resp, false)
+			w.Header().Del("Content-Length") // Reasoning aliases can change the body length.
+			w.Header().Set("X-Request-ID", id)
+			if adapter != nil {
+				if spilled {
+					if body, err = sb.bytes(); err != nil {
+						sb.close()
+						b.route.Observe(time.Since(attemptStart), false)
+						b.pool.RecordErr(ks)
+						releaseHeld()
+						finishAttempt(502, "interrupted")
+						lastStatus = 502
+						return false
+					}
+				}
+				translated := adapter.translateResponse(body)
+				if translated == nil {
+					sb.close()
+					b.route.Observe(time.Since(attemptStart), false)
+					b.pool.RecordErr(ks)
+					releaseHeld()
+					finishAttempt(502, "upstream_error")
+					fail(502, "upstream_error", "upstream response could not be translated")
+					return true
+				}
+				body = translated
+				spilled = false
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Del("Content-Length")
+			}
+			if cacheEligible && !spilled {
+				w.Header().Set("X-Verloc-Cache", "MISS")
+				rt.cache.Put(cacheKey, body, w.Header().Get("Content-Type"), rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown)
+			}
+			w.WriteHeader(http.StatusOK)
+			if spilled {
+				_, err = w.Write(sb.mem)
+				if err == nil {
+					_, err = io.Copy(w, io.NewSectionReader(sb.file, 0, sb.fileSize))
+				}
+			} else {
+				_, err = w.Write(body)
+			}
+			sb.close()
+			if err != nil {
+				rec.Status, rec.Outcome, rec.ErrMsg = 499, "canceled", "client write failed"
+				b.pool.RecordErr(ks)
+				releaseHeld()
+				finishAttempt(499, "canceled")
+				return true
+			}
+		}
+
+		lat := time.Since(attemptStart)
+		b.route.Observe(lat, true)
+		rec.OK, rec.Status, rec.Outcome, rec.ErrMsg = true, 200, "completed", ""
+		rec.CostKnown = rec.UsageKnown && selectedPrice.known
+		rec.Cost = selectedPrice.cost(rec.TokIn, rec.TokOut, rec.TokCache)
+		b.pool.RecordSuccess(ks, rec.TokIn, rec.TokOut, rec.TokCache, rec.Cost)
+		heldProbePool, heldProbeKey = nil, nil // RecordSuccess cleared probeInFlight
+		releaseHeld()
+		finishAttempt(200, "completed")
+		return true
+	}
+
+	// Opt-in speculative hedging for chat/responses/messages when configured.
+	var skipRouteIdx map[int]bool
+	if endpoint != "/systemone" && policy != nil && policy.HedgeDelayMs > 0 && len(candidates) >= 2 && limits.MaxAttempts >= 2 && time.Until(deadline) > time.Duration(policy.HedgeDelayMs)*time.Millisecond {
+		if ho, ran := s.runHedgedChat(r, rt, candidates, endpoint, raw, bodyScan, id, &rec, deadline, policy); ran {
+			attempts += ho.attempts
+			lastStatus = ho.lastStatus
+			previousBackend, previousKey = ho.previousBackend, ho.previousKey
+			skipRouteIdx = ho.failedRoutes
+			if ho.clientCanceled {
+				return
+			}
+			if ho.nonRetry {
+				fail(ho.nonRetryStatus, "upstream_rejected", "upstream rejected request")
+				return
+			}
+			if ho.winner != nil {
+				win := ho.winner
+				heldSlot = win.b.route
+				heldProbePool, heldProbeKey = win.b.pool, win.ks
+				if deliver200(win.resp, win.b, win.ks, win.target, win.isPrimary, false, win.replay, win.attemptStart, win.ctx, win.cancel, win.budgetTimer) {
+					return
+				}
+			}
+		}
+	}
+
+	for routeIndex, cand := range candidates {
+		if skipRouteIdx != nil && skipRouteIdx[routeIndex] {
+			continue
+		}
+		target := cand.target
+		if !cand.isPrimary && !targetSupportsOperation(rt.cfg, target, "chat") {
 			continue
 		}
 		b := rt.backends[target.Backend]
@@ -705,24 +993,32 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 		var modified []byte
 		var replay reasoningContext
 		if endpoint == "/systemone" {
-			modified = remapSystemOneBody(raw, upstreamModel)
-		} else {
-			modified = remapBody(raw, upstreamModel, b.name == "mistral", b.name)
-			modified = stripReasoningContent(modified, b.stripReasoning)
-			if !b.stripReasoning {
-				modified, replay = ensureReasoningReplay(modified, s.reasonCache, reasoningScope{
-					clientID: rec.ClientKeyID, model: rec.Model, provider: b.name,
-					upstream: upstreamURL + "\x00" + upstreamModel,
-				})
+			if bodyScan.valid {
+				modified = spliceFromScan(raw, bodyScan, upstreamModel, 0)
+			} else {
+				modified = remapSystemOneBody(raw, upstreamModel)
 			}
-			modified = capMaxTokens(modified, b.maxTokens)
+		} else {
+			modified, replay = prepareChatBody(raw, bodyScan, upstreamModel, b.name == "mistral", b.name, b.stripReasoning, b.maxTokens, s.reasonCache, reasoningScope{
+				clientID: rec.ClientKeyID, model: rec.Model, provider: b.name,
+				upstream: upstreamURL + "\x00" + upstreamModel,
+			})
 		}
 		tried := make(map[credentialKey]bool, min(b.pool.Count(), limits.MaxAttempts))
 		for attempts < limits.MaxAttempts && time.Now().Before(deadline) && r.Context().Err() == nil {
-			ks := b.pool.NextUntried(tried)
-			if ks == nil {
+			// Per-provider concurrency bulkhead: if this backend is saturated,
+			// fail over immediately to the next configured route.
+			if !b.route.tryAcquireSlot() {
+				lastStatus = http.StatusServiceUnavailable
 				break
 			}
+			heldSlot = b.route
+			ks := b.pool.NextUntried(tried)
+			if ks == nil {
+				releaseHeld()
+				break
+			}
+			heldProbePool, heldProbeKey = b.pool, ks
 			tried[keyIdentity(ks)] = true
 			if previousKey != nil {
 				previousBackend.pool.RecordFailover(previousKey)
@@ -732,10 +1028,10 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 			}
 			previousBackend, previousKey = b, ks
 			attempts++
-			rec.Backend, rec.Upstream, rec.Key = b.name, target.Upstream, maskKey(ks.Key)
+			rec.Backend, rec.Upstream, rec.Key = b.name, target.Upstream, ks.maskedKey()
 			selectedPrice = rt.modelPrices[rec.Model]
-			if routeIndex > 0 {
-				selectedPrice = rt.targetPrices[target]
+			if !cand.isPrimary {
+				selectedPrice = rt.targetPrices[target.key()]
 			}
 			attemptStart := time.Now()
 			ctx, cancel := context.WithCancel(r.Context())
@@ -745,6 +1041,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 			if err != nil {
 				budgetTimer.Stop()
 				cancel()
+				releaseHeld()
 				fail(502, "upstream_error", "invalid upstream configuration")
 				return
 			}
@@ -773,14 +1070,19 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				cancel()
 				b.pool.RecordErr(ks)
 				if r.Context().Err() != nil {
+					releaseHeld()
 					finishAttempt(499, "canceled")
 					return
 				}
-				b.pool.MarkFailure(ks, 0)
+				b.route.Observe(time.Since(attemptStart), false)
+				b.pool.MarkFailureStatus(ks, 0, 0)
+				heldProbePool, heldProbeKey = nil, nil
+				releaseHeld()
 				finishAttempt(502, "upstream_error")
 				lastStatus = 502
 				continue
 			}
+			b.pool.ObserveHeaders(ks, resp.Header)
 			lastStatus = resp.StatusCode
 			if resp.StatusCode != http.StatusOK {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -792,191 +1094,19 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				b.pool.RecordErr(ks)
 				finishAttempt(resp.StatusCode, "upstream_rejected")
 				if !retryable {
+					releaseHeld()
 					fail(resp.StatusCode, "upstream_rejected", "upstream rejected request")
 					return
 				}
-				b.pool.MarkFailure(ks, retryAfterDuration(resp))
+				b.route.Observe(time.Since(attemptStart), false)
+				b.pool.MarkFailureStatus(ks, resp.StatusCode, retryAfterDuration(resp))
+				heldProbePool, heldProbeKey = nil, nil
+				releaseHeld()
 				continue
 			}
-			if rec.Stream {
-				idleTimeout := time.Duration(limits.StreamIdleTimeoutSeconds) * time.Second
-				idle := newIdleReader(resp.Body, idleTimeout, cancel)
-				streamWriter := &committedStreamWriter{ResponseWriter: w, response: resp, requestID: id, idle: idleTimeout,
-					beforeCommit: func() error {
-						if !budgetTimer.Stop() || ctx.Err() != nil {
-							return errors.New("retry budget exhausted")
-						}
-						return nil
-					}}
-				var acc *sseReasoningAcc
-				if !b.stripReasoning {
-					acc = &sseReasoningAcc{}
-				}
-				absTimer := time.AfterFunc(maxPost200Duration, cancel)
-				onUsage := func(i, o, c uint64) {
-					rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = i, o, c, true
-				}
-				onFirst := func() { rec.TTFTMs = float64(time.Since(start).Nanoseconds()) / 1e6 }
-				if adapter != nil {
-					// The adapter's SSE translator writes its own event
-					// sequence directly to the committed writer; headers
-					// commit on the first event like the passthrough path.
-					err = adapter.streamCopier(streamWriter, idle, onUsage, onFirst)
-				} else {
-					err = streamCopyWithUsage(streamWriter, idle, onUsage, onFirst, streamOptions{
-						aliasReasoning: !b.stripReasoning,
-						acc:            acc,
-					})
-				}
-				budgetTimer.Stop()
-				absTimer.Stop()
-				idle.Close()
-				cancel()
-				_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-				if err == nil {
-					acc.store(s.reasonCache, replay)
-				} else {
-					outcome := "interrupted"
-					if idle.timedOut.Load() {
-						outcome = "idle_timeout"
-					}
-					var clientErr *streamClientError
-					if streamWriter.committed && errors.As(err, &clientErr) {
-						outcome = "canceled"
-					}
-					if r.Context().Err() != nil {
-						outcome = "canceled"
-					}
-					rec.Status, rec.Outcome, rec.ErrMsg = 502, outcome, "upstream stream interrupted"
-					if outcome == "canceled" {
-						rec.Status = 499
-					}
-					if outcome == "idle_timeout" {
-						rec.Status = 504
-					}
-					b.pool.RecordErr(ks)
-					finishAttempt(rec.Status, outcome)
-					if !streamWriter.committed && r.Context().Err() == nil {
-						lastStatus = 502
-						continue
-					}
-					return // The first client write permanently commits this route.
-				}
-			} else {
-				// The retry budget bounds how long we will keep trying to find a
-				// usable upstream, NOT how long a healthy upstream may take to
-				// generate a response. Once a 200 is in hand the upstream has
-				// accepted the work, so stop the budget here — otherwise a slow
-				// reasoning model (or the sum of several retried attempts) gets
-				// its own valid response thrown away and reported as 502/504.
-				// Mirror of the streaming path's beforeCommit check.
-				if !budgetTimer.Stop() || ctx.Err() != nil {
-					_ = resp.Body.Close()
-					cancel()
-					b.pool.RecordErr(ks)
-					finishAttempt(502, "interrupted")
-					lastStatus = 502
-					continue
-				}
-				// A stall guard still applies: the upstream must keep sending.
-				// The idle reader cancels the context on inactivity so a hung
-				// connection cannot pin a request forever.
-				idleTimeout := time.Duration(limits.StreamIdleTimeoutSeconds) * time.Second
-				idle := newIdleReader(resp.Body, idleTimeout, cancel)
-				absTimer := time.AfterFunc(maxPost200Duration, cancel)
-				// The body is held whole only up to nonStreamMemLimit;
-				// past that it spills to a temp file so a huge non-stream
-				// response cannot pin tens of MB of RAM per in-flight
-				// request. The 64 MiB hard ceiling is unchanged.
-				sb, rerr := readSpillBody(io.LimitReader(idle, maxNonStreamBody+1))
-				absTimer.Stop()
-				_ = idle.Close()
-				err = rerr
-				if err == nil && (sb.size > maxNonStreamBody || !sb.validJSON()) {
-					err = errors.New("incomplete upstream response")
-				}
-				cancel()
-				var body []byte
-				spilled := sb.file != nil && endpoint != "/systemone" && b.stripReasoning
-				if err == nil && !spilled {
-					// In-memory bodies (the overwhelming majority), plus
-					// the rare paths that must rewrite bytes (SystemOne
-					// envelope, reasoning replay), materialize fully —
-					// still bounded by the 64 MiB ceiling.
-					body, err = sb.bytes()
-				}
-				if err == nil && endpoint == "/systemone" {
-					body, err = systemOneResponse(body, cloudflareEnvelope)
-				}
-				if err != nil {
-					sb.close()
-					b.pool.RecordErr(ks)
-					finishAttempt(502, "interrupted")
-					lastStatus = 502
-					continue
-				}
-				if spilled {
-					rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = usageFromReader(sb.reader())
-				} else {
-					rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown = usageOf(body)
-					if endpoint != "/systemone" && !b.stripReasoning {
-						body = rememberFromResponse(body, s.reasonCache, replay)
-					}
-				}
-				copyResponseHeaders(w, resp, false)
-				w.Header().Del("Content-Length") // Reasoning aliases can change the body length.
-				w.Header().Set("X-Request-ID", id)
-				if adapter != nil {
-					// Inbound protocol adaptation: translate the complete chat
-					// body back to the client's shape. A spilled body is
-					// materialized for this (bounded by maxNonStreamBody);
-					// emitting an untranslated chat body would hand the client
-					// the wrong protocol, which is worse than the memory cost.
-					if spilled {
-						if body, err = sb.bytes(); err != nil {
-							sb.close()
-							b.pool.RecordErr(ks)
-							finishAttempt(502, "interrupted")
-							lastStatus = 502
-							continue
-						}
-					}
-					translated := adapter.translateResponse(body)
-					if translated == nil {
-						sb.close()
-						b.pool.RecordErr(ks)
-						finishAttempt(502, "upstream_error")
-						fail(502, "upstream_error", "upstream response could not be translated")
-						return
-					}
-					body = translated
-					spilled = false
-					w.Header().Set("Content-Type", "application/json")
-					w.Header().Del("Content-Length")
-				}
-				w.WriteHeader(http.StatusOK)
-				if spilled {
-					_, err = w.Write(sb.mem)
-					if err == nil {
-						_, err = io.Copy(w, io.NewSectionReader(sb.file, 0, sb.fileSize))
-					}
-				} else {
-					_, err = w.Write(body)
-				}
-				sb.close()
-				if err != nil {
-					rec.Status, rec.Outcome, rec.ErrMsg = 499, "canceled", "client write failed"
-					b.pool.RecordErr(ks)
-					finishAttempt(499, "canceled")
-					return
-				}
+			if deliver200(resp, b, ks, target, cand.isPrimary, cloudflareEnvelope, replay, attemptStart, ctx, cancel, budgetTimer) {
+				return
 			}
-			rec.OK, rec.Status, rec.Outcome, rec.ErrMsg = true, 200, "completed", ""
-			rec.CostKnown = rec.UsageKnown && selectedPrice.known
-			rec.Cost = selectedPrice.cost(rec.TokIn, rec.TokOut, rec.TokCache)
-			b.pool.RecordSuccess(ks, rec.TokIn, rec.TokOut, rec.TokCache, rec.Cost)
-			finishAttempt(200, "completed")
-			return
 		}
 	}
 	if !time.Now().Before(deadline) {
@@ -1000,9 +1130,11 @@ func clientIP(r *http.Request) string {
 }
 
 func copyRequestHeaders(dst *http.Request, src *http.Request) {
+	connVals := src.Header.Values("Connection")
+	hasConn := len(connVals) > 0
 	for k, vals := range src.Header {
 		if hopByHop[k] || k == "Authorization" || k == "Content-Length" || k == "Accept-Encoding" ||
-			k == "Cookie" || k == "X-Api-Key" || k == "X-Csrf-Token" || connectionHeader(src.Header, k) {
+			k == "Cookie" || k == "X-Api-Key" || k == "X-Csrf-Token" || (hasConn && connectionHeaderValues(connVals, k)) {
 			continue
 		}
 		for _, v := range vals {
@@ -1011,8 +1143,8 @@ func copyRequestHeaders(dst *http.Request, src *http.Request) {
 	}
 }
 
-func connectionHeader(headers http.Header, name string) bool {
-	for _, value := range headers.Values("Connection") {
+func connectionHeaderValues(connVals []string, name string) bool {
+	for _, value := range connVals {
 		for _, nominated := range strings.Split(value, ",") {
 			if strings.EqualFold(strings.TrimSpace(nominated), name) {
 				return true
@@ -1023,8 +1155,10 @@ func connectionHeader(headers http.Header, name string) bool {
 }
 
 func copyResponseHeaders(w http.ResponseWriter, resp *http.Response, streaming bool) {
+	connVals := resp.Header.Values("Connection")
+	hasConn := len(connVals) > 0
 	for k, vals := range resp.Header {
-		if hopByHop[k] || k == "Set-Cookie" || connectionHeader(resp.Header, k) {
+		if hopByHop[k] || k == "Set-Cookie" || (hasConn && connectionHeaderValues(connVals, k)) {
 			continue
 		}
 		if streaming && k == "Content-Length" {
@@ -1051,16 +1185,30 @@ func isRetryableStatus(code int) bool {
 }
 
 func retryAfterDuration(resp *http.Response) time.Duration {
-	h := resp.Header.Get("Retry-After")
-	if h == "" {
-		return 0
+	if h := resp.Header.Get("Retry-After"); h != "" {
+		if secs, err := strconv.ParseInt(strings.TrimSpace(h), 10, 64); err == nil && secs > 0 {
+			return time.Duration(min(secs, 3600)) * time.Second
+		}
+		if t, err := http.ParseTime(h); err == nil {
+			if d := time.Until(t); d > 0 {
+				return min(d, time.Hour)
+			}
+		}
 	}
-	if secs, err := strconv.ParseInt(h, 10, 64); err == nil && secs > 0 {
-		return time.Duration(min(secs, 3600)) * time.Second
-	}
-	if t, err := http.ParseTime(h); err == nil {
-		if d := time.Until(t); d > 0 {
-			return min(d, time.Hour)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		var best time.Duration
+		for _, key := range []string{
+			"X-Ratelimit-Reset-Requests",
+			"X-Ratelimit-Reset-Tokens",
+			"Anthropic-Ratelimit-Requests-Reset",
+			"Anthropic-Ratelimit-Tokens-Reset",
+		} {
+			if d := parseRateLimitReset(resp.Header.Get(key)); d > best {
+				best = d
+			}
+		}
+		if best > 0 {
+			return min(best, time.Hour)
 		}
 	}
 	return 0
@@ -1074,13 +1222,23 @@ func maskKey(k string) string {
 }
 
 // randomUUID generates a version-4 UUID using crypto/rand. Used for
-// x-opencode-request / x-opencode-session headers that Cloudflare expects.
+// X-Request-ID and x-opencode-request / x-opencode-session headers.
 func randomUUID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	var b [16]byte
+	_, _ = rand.Read(b[:])
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+	var out [36]byte
+	hex.Encode(out[0:8], b[0:4])
+	out[8] = '-'
+	hex.Encode(out[9:13], b[4:6])
+	out[13] = '-'
+	hex.Encode(out[14:18], b[6:8])
+	out[18] = '-'
+	hex.Encode(out[19:23], b[8:10])
+	out[23] = '-'
+	hex.Encode(out[24:36], b[10:16])
+	return string(out[:])
 }
 
 func truncate(s string, n int) string {

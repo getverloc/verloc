@@ -163,10 +163,10 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_snap_ts ON snapshots(ts);`,
 		// Derived caches. `requests` and `snapshots` stay the immutable detail
 		// authority; these tables only take work OFF THE READ PATH by letting a
-		// 30-day chart aggregate minutes instead of re-reading ~864k raw ticks
-		// (measured 7.5s and 892MB per poll). They are additive-only and never
-		// used to double-count detail: for a window that predates their earliest
-		// row, the reader transparently falls back to raw ticks.
+		// 30-day chart aggregate minutes/hours instead of re-reading ~864k raw
+		// ticks (measured 7.5s and 892MB per poll). They are additive-only and
+		// never used to double-count detail: for a window that predates their
+		// earliest row, the reader transparently falls back to finer tiers.
 		`CREATE TABLE IF NOT EXISTS snapshot_minute (
 		   minute INTEGER PRIMARY KEY,
 		   requests INTEGER NOT NULL, err INTEGER NOT NULL,
@@ -176,6 +176,26 @@ func (s *Store) migrate() error {
 		   hist TEXT NOT NULL, ttft_hist TEXT NOT NULL,
 		   hist_n INTEGER NOT NULL DEFAULT 0, missing_n INTEGER NOT NULL DEFAULT 0,
 		   models TEXT NOT NULL, backends TEXT NOT NULL
+		 )`,
+		`CREATE TABLE IF NOT EXISTS snapshot_hour (
+		   hour INTEGER PRIMARY KEY,
+		   requests INTEGER NOT NULL, err INTEGER NOT NULL,
+		   tok_in INTEGER NOT NULL, tok_out INTEGER NOT NULL, tok_cache INTEGER NOT NULL,
+		   cost REAL NOT NULL, ms INTEGER NOT NULL,
+		   lat_w REAL NOT NULL, lat_sum REAL NOT NULL, ttft_w REAL NOT NULL, ttft_sum REAL NOT NULL,
+		   hist TEXT NOT NULL, ttft_hist TEXT NOT NULL,
+		   hist_n INTEGER NOT NULL DEFAULT 0, missing_n INTEGER NOT NULL DEFAULT 0,
+		   models TEXT NOT NULL, backends TEXT NOT NULL
+		 )`,
+		// Pre-aggregated hourly request analytics cache: 1 compact binary row
+		// per hour (~720 rows per 30d), keeping unfiltered Analytics() O(hours)
+		// instead of scanning raw requests on every dashboard poll.
+		`CREATE TABLE IF NOT EXISTS analytics_hour_summary (
+		   hour INTEGER PRIMARY KEY,
+		   min_ts INTEGER NOT NULL,
+		   max_ts INTEGER NOT NULL,
+		   requests INTEGER NOT NULL,
+		   blob BLOB NOT NULL
 		 )`,
 		`CREATE TABLE IF NOT EXISTS analytics_totals (
 		   id INTEGER PRIMARY KEY CHECK (id=1),
@@ -250,6 +270,27 @@ func (s *Store) migrate() error {
 	}
 	if n > 0 {
 		if _, err = tx.Exec(`INSERT INTO legacy_hourly SELECT ts/3600000*3600000,SUM(d_requests),SUM(d_err),SUM(d_tok_in),SUM(d_tok_out),SUM(d_tok_cache),SUM(d_cost) FROM snapshots GROUP BY ts/3600000`); err != nil {
+			return err
+		}
+	}
+	// Initialize request_hour_cache_ready flag once: brand-new DBs (0 existing
+	// requests) start ready and maintain analytics_hour_summary incrementally;
+	// upgraded DBs with pre-existing requests start at 0 until
+	// EnsureRollupsBackfilled completes a background RebuildRequestHourCache.
+	var hasCacheFlag int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM analytics_meta WHERE name='request_hour_cache_ready'`).Scan(&hasCacheFlag); err != nil {
+		return err
+	}
+	if hasCacheFlag == 0 {
+		var existingReqs int64
+		if err = tx.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&existingReqs); err != nil {
+			return err
+		}
+		ready := 0
+		if existingReqs == 0 {
+			ready = 1
+		}
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO analytics_meta(name,value) VALUES ('request_hour_cache_ready', ?)`, ready); err != nil {
 			return err
 		}
 	}
@@ -348,10 +389,10 @@ func (s *Store) InsertDelta(d *Delta) error {
 	if err != nil {
 		return err
 	}
-	// One transaction: the tick row, the running totals, and the minute rollup
-	// must not disagree. LifetimeTotals previously SUMmed all of snapshots on
-	// every dashboard poll (250ms at 1M ticks, holding s.mu so it blocked this
-	// very writer for 241ms) — the totals row is the fix.
+	// One transaction: the tick row, the running totals, and the minute/hour
+	// rollups must not disagree. LifetimeTotals previously SUMmed all of
+	// snapshots on every dashboard poll (250ms at 1M ticks, holding s.mu so it
+	// blocked this very writer for 241ms) — the totals row is the fix.
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.noteWrite(err)
@@ -379,7 +420,7 @@ func (s *Store) InsertDelta(d *Delta) error {
 		s.noteWrite(err)
 		return err
 	}
-	if err = s.rollMinute(tx, d); err != nil {
+	if err = s.rollTick(tx, d); err != nil {
 		s.noteWrite(err)
 		return err
 	}
@@ -572,11 +613,10 @@ type PruneFailedStats struct {
 // metadata like any other request, so this exists only as an explicit owner
 // maintenance action; nothing on the request path calls it.
 //
-// Derived state is intentionally left alone: request_hourly is an additive
-// legacy-coverage tier for pruned history, and the snapshot tick tables are
-// historical captures that cannot be re-derived from raw rows. Only
-// detail-level reads (the Requests list and attributed analytics) reflect the
-// deletion.
+// Derived state is kept consistent: analytics_hour_summary is rebuilt inside
+// the same transaction so Analytics() reflects the deletion immediately;
+// request_hourly (legacy-coverage tier for pruned history) and the snapshot
+// tick tables are intentionally left alone.
 //
 // One committed transaction; with dryRun nothing is written and only the
 // counts are reported.
@@ -603,6 +643,9 @@ func (s *Store) PruneFailedRequests(dryRun bool) (PruneFailedStats, error) {
 	}
 	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		stats.Failed = n
+	}
+	if _, err := rebuildRequestHourCacheTx(context.Background(), tx); err != nil {
+		return stats, err
 	}
 	return stats, tx.Commit()
 }
@@ -872,15 +915,22 @@ func (s *Store) insertRequests(batch []ReqRecord) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
 	for _, r := range batch {
 		raw, err := json.Marshal(r)
 		if err != nil {
+			stmt.Close()
 			return err
 		}
 		if _, err = stmt.Exec(r.TS, r.ID, r.Model, r.Upstream, r.Backend, r.ClientKeyID, r.ClientName, r.Status, r.OK, r.Outcome, r.UsageKnown, r.CostKnown, r.TokIn, r.TokOut, r.TokCache, r.Cost, r.LatMs, r.TTFTMs, string(raw)); err != nil {
+			stmt.Close()
 			return err
 		}
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+	if err := s.rollRequestBatch(tx, batch); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err

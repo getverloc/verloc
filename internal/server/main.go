@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -36,6 +38,7 @@ func NewServer(cfg *Config) (*Server, error) {
 	s := &Server{metrics: NewMetrics(), reasonCache: newReasoningCache(maxReasoningEntries), hints: newHintResolver()}
 	s.rt.Store(newRuntimeState(cfg, backends))
 	s.initGateway()
+	s.syncKeepWarm()
 	return s, nil
 }
 
@@ -430,6 +433,14 @@ var gzipSkipPaths = map[string]bool{
 	"/v1/images/edits": true, "/images/edits": true,
 }
 
+// gzipWriterPool reuses *gzip.Writer instances (~800 KB deflate state each)
+// across compressed responses instead of allocating per request.
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		return gzip.NewWriter(io.Discard)
+	},
+}
+
 // gzipMiddleware compresses text responses (dashboard JSON, /v1/models, …)
 // when the client accepts gzip. Precompressed dashboard assets already carry
 // Content-Encoding and pass through untouched. It uses only the standard
@@ -477,7 +488,9 @@ func (g *gzipResponseWriter) decide() {
 		if g.status == http.StatusOK && g.acceptsGzip {
 			h.Set("Content-Encoding", "gzip")
 			h.Del("Content-Length")
-			g.gz = gzip.NewWriter(g.ResponseWriter)
+			gz := gzipWriterPool.Get().(*gzip.Writer)
+			gz.Reset(g.ResponseWriter)
+			g.gz = gz
 			g.active = true
 		}
 	}
@@ -509,12 +522,26 @@ func (g *gzipResponseWriter) Flush() {
 
 func (g *gzipResponseWriter) finish() {
 	if !g.decided {
-		// Handler wrote nothing (e.g. a bare 204): forward the status as-is.
-		g.decide()
+		// Handler wrote nothing (e.g. a bare 204 or HEAD): forward the status
+		// as-is without acquiring a gzip writer or advertising gzip encoding.
+		g.decided = true
+		if g.status == 0 {
+			g.status = http.StatusOK
+		}
+		h := g.Header()
+		if h.Get("Content-Encoding") == "" && compressibleType(h.Get("Content-Type")) {
+			varyAcceptEncoding(h)
+		}
+		g.ResponseWriter.WriteHeader(g.status)
+		g.sent = true
 		return
 	}
-	if g.active {
+	if g.active && g.gz != nil {
 		_ = g.gz.Close()
+		g.gz.Reset(io.Discard)
+		gzipWriterPool.Put(g.gz)
+		g.gz = nil
+		g.active = false
 	}
 }
 

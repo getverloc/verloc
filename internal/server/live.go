@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,9 +12,10 @@ import (
 // alert toasts). A single background goroutine per subscriber keeps
 // broadcast overhead off the request hot path.
 type Hub struct {
-	mu     sync.Mutex
-	subs   map[chan map[string]any]bool
-	closed bool
+	mu       sync.Mutex
+	subs     map[chan map[string]any]bool
+	subCount atomic.Int32
+	closed   bool
 }
 
 func NewHub() *Hub {
@@ -27,6 +29,13 @@ func NewHub() *Hub {
 // owner and a handful of tabs, so 64 is far above real use.
 const maxHubSubscribers = 64
 
+// HasSubscribers reports whether at least one SSE client is connected without
+// acquiring a lock. Callers on the request hot path check this before
+// allocating event payload maps.
+func (h *Hub) HasSubscribers() bool {
+	return h != nil && h.subCount.Load() > 0
+}
+
 // Subscribe registers a subscriber and returns its channel (buffered so a
 // slow client drops messages instead of blocking the gateway). At the cap
 // (or after Close) the returned channel is already closed.
@@ -37,6 +46,7 @@ func (h *Hub) Subscribe() chan map[string]any {
 		close(ch)
 	} else {
 		h.subs[ch] = true
+		h.subCount.Store(int32(len(h.subs)))
 	}
 	h.mu.Unlock()
 	return ch
@@ -53,13 +63,17 @@ func (h *Hub) registered(ch chan map[string]any) bool {
 func (h *Hub) Unsubscribe(ch chan map[string]any) {
 	h.mu.Lock()
 	delete(h.subs, ch)
+	h.subCount.Store(int32(len(h.subs)))
 	h.mu.Unlock()
 }
 
 // Publish sends one event to all subscribers, non-blocking. With no
-// subscribers it returns before doing any sanitizing work — the common
-// case on the request hot path.
+// subscribers it returns before taking the lock or doing any sanitizing work —
+// the common case on the request hot path.
 func (h *Hub) Publish(msg map[string]any) {
+	if h == nil || h.subCount.Load() == 0 {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if len(h.subs) == 0 {
@@ -93,13 +107,15 @@ func (h *Hub) Close() {
 		close(ch)
 		delete(h.subs, ch)
 	}
+	h.subCount.Store(0)
 }
 
 // SubCount is the number of active SSE clients (for /dash/api/state).
 func (h *Hub) SubCount() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.subs)
+	if h == nil {
+		return 0
+	}
+	return int(h.subCount.Load())
 }
 
 // ServeSSE upgrades the request to a text/event-stream and streams hub

@@ -4,10 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"math"
 	"sort"
-	"strings"
 )
 
 type usageAccumulator struct {
@@ -15,41 +13,6 @@ type usageAccumulator struct {
 	latSum, ttftSum   float64
 	ttftN             int64
 	latHist, ttftHist [len(latBuckets) + 1]uint64
-}
-
-// analyticsAggColumns is the SELECT list (in scanAgg's scan order) that
-// computes one usageAccumulator entirely in SQL: counts, token/cost sums,
-// unknown counters, latency/TTFT sums, and both histograms as CASE sums
-// matching bucketOf (first edge >= ms; TTFT only for ttft_ms > 0).
-func analyticsAggColumns() string {
-	var sb strings.Builder
-	sb.WriteString(`COUNT(*),
-		COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(tok_in),0), COALESCE(SUM(tok_out),0), COALESCE(SUM(tok_cache),0),
-		COALESCE(SUM(cost),0),
-		COALESCE(SUM(CASE WHEN usage_known=0 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN cost_known=0 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(lat_ms),0),
-		COALESCE(SUM(CASE WHEN ttft_ms>0 THEN ttft_ms ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN ttft_ms>0 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN images_known=1 THEN images ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN endpoint IN ('images','images/generations','images/edits') AND images_known=0 THEN 1 ELSE 0 END),0)`)
-	for i := range len(latBuckets) + 1 {
-		var latCond, ttftCond string
-		if i < len(latBuckets) {
-			latCond = fmt.Sprintf("lat_ms<=%v", latBuckets[i])
-			ttftCond = fmt.Sprintf("ttft_ms>0 AND ttft_ms<=%v", latBuckets[i])
-			if i > 0 {
-				latCond += fmt.Sprintf(" AND lat_ms>%v", latBuckets[i-1])
-				ttftCond += fmt.Sprintf(" AND ttft_ms>%v", latBuckets[i-1])
-			}
-		} else {
-			latCond = fmt.Sprintf("lat_ms>%v", latBuckets[len(latBuckets)-1])
-			ttftCond = fmt.Sprintf("ttft_ms>%v", latBuckets[len(latBuckets)-1])
-		}
-		fmt.Fprintf(&sb, ", COALESCE(SUM(CASE WHEN %s THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN %s THEN 1 ELSE 0 END),0)", latCond, ttftCond)
-	}
-	return sb.String()
 }
 
 func (a *usageAccumulator) merge(b *usageAccumulator) {
@@ -141,6 +104,149 @@ type AnalyticsResult struct {
 	Coverage  AnalyticsCoverage `json:"coverage"`
 }
 
+// foldRequestsWhere scans matching detail rows from `requests` in ONE pass
+// (eliminating the previous 7-query GROUP BY / ROW_NUMBER fan-out that caused
+// SQLite's planner to pick covering scans or full sorts on filtered queries).
+func foldRequestsWhere(
+	ctx context.Context,
+	tx *sql.Tx,
+	where string,
+	args []any,
+	detOld, detNew *int64,
+	total *usageAccumulator,
+	models, providers, clients, endpoints map[string]*usageAccumulator,
+	names map[string]string,
+	nameTS map[string]int64,
+	statuses map[int]int64,
+) error {
+	rows, err := tx.QueryContext(ctx, `SELECT ts, model, backend, client_key_id, client_name, endpoint, status, ok,
+		usage_known, cost_known, tok_in, tok_out, tok_cache, cost, images, images_known, lat_ms, ttft_ms
+		FROM requests WHERE `+where, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var (
+		ts, images                    int64
+		model, backend, cid, cname    string
+		endpoint                      string
+		status                        int
+		okI, usageKI, costKI, imgsKI  int
+		tokIn, tokOut, tokCache       uint64
+		cost, latMs, ttftMs           float64
+	)
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := rows.Scan(&ts, &model, &backend, &cid, &cname, &endpoint, &status, &okI,
+			&usageKI, &costKI, &tokIn, &tokOut, &tokCache, &cost, &images, &imgsKI, &latMs, &ttftMs); err != nil {
+			return err
+		}
+		if *detOld == 0 || ts < *detOld {
+			*detOld = ts
+		}
+		if ts > *detNew {
+			*detNew = ts
+		}
+		if endpoint == "" {
+			endpoint = "unknown"
+		}
+		var errN, unkUsage, unkCost, imgs, unkImgs int64
+		if okI == 0 {
+			errN = 1
+		}
+		if usageKI == 0 {
+			unkUsage = 1
+		}
+		if costKI == 0 {
+			unkCost = 1
+		}
+		if imgsKI != 0 {
+			imgs = images
+		} else if endpoint == "images" || endpoint == "images/generations" || endpoint == "images/edits" {
+			unkImgs = 1
+		}
+		latB := bucketOf(latMs)
+		ttftB := -1
+		if ttftMs > 0 {
+			ttftB = bucketOf(ttftMs)
+		}
+		addOne := func(a *usageAccumulator) {
+			a.Requests++
+			a.Errors += errN
+			a.TokIn += tokIn
+			a.TokOut += tokOut
+			a.TokCache += tokCache
+			a.Cost += cost
+			a.UnknownUsage += unkUsage
+			a.UnknownCost += unkCost
+			a.Images += imgs
+			a.UnknownImages += unkImgs
+			a.latSum += latMs
+			a.latHist[latB]++
+			if ttftB >= 0 {
+				a.ttftSum += ttftMs
+				a.ttftN++
+				a.ttftHist[ttftB]++
+			}
+		}
+		addOne(total)
+		for _, pair := range [4]struct {
+			m map[string]*usageAccumulator
+			k string
+		}{{models, model}, {providers, backend}, {clients, cid}, {endpoints, endpoint}} {
+			a := pair.m[pair.k]
+			if a == nil {
+				a = &usageAccumulator{}
+				pair.m[pair.k] = a
+			}
+			addOne(a)
+		}
+		if curTS, exists := nameTS[cid]; !exists || ts > curTS || (ts == curTS && cname > names[cid]) {
+			names[cid] = cname
+			nameTS[cid] = ts
+		}
+		statuses[status]++
+	}
+	return rows.Err()
+}
+
+// foldHourCacheWhere reads pre-aggregated hourly summary blobs from
+// analytics_hour_summary directly into the caller's accumulators.
+func foldHourCacheWhere(
+	ctx context.Context,
+	tx *sql.Tx,
+	where string,
+	args []any,
+	detOld, detNew *int64,
+	total *usageAccumulator,
+	models, providers, clients, endpoints map[string]*usageAccumulator,
+	names map[string]string,
+	nameTS map[string]int64,
+	statuses map[int]int64,
+) error {
+	rows, err := tx.QueryContext(ctx, `SELECT blob FROM analytics_hour_summary WHERE `+where+` ORDER BY hour ASC`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var blob sql.RawBytes
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := rows.Scan(&blob); err != nil {
+			return err
+		}
+		if err := decodeHourAnalyticsInto(blob, detOld, detNew, total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 func (s *Store) Analytics(ctx context.Context, f RequestFilter) (AnalyticsResult, error) {
 	out := AnalyticsResult{Models: []UsageGroup{}, Providers: []UsageGroup{}, Clients: []UsageGroup{}, Status: []StatusGroup{}, Coverage: AnalyticsCoverage{AggregateBucketMs: 3600000, PartialBucketsExcluded: true, LegacyDistributionsUnavailable: true}}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -173,7 +279,7 @@ func (s *Store) Analytics(ctx context.Context, f RequestFilter) (AnalyticsResult
 			}
 			x.merge(a)
 		}
-		if ts > nameTS[client] || (ts == nameTS[client] && name > names[client]) {
+		if curTS, exists := nameTS[client]; !exists || ts > curTS || (ts == curTS && name > names[client]) {
 			names[client] = name
 			nameTS[client] = ts
 		}
@@ -187,129 +293,99 @@ func (s *Store) Analytics(ctx context.Context, f RequestFilter) (AnalyticsResult
 			out.Coverage.NewestTS = ts
 		}
 	}
-	// Aggregate IN SQL instead of folding every row in Go. The previous
-	// column projection removed the JSON decode (262MB / 3.2M allocs at
-	// 200k rows), but the driver still scanned one row per request
-	// (~25 allocs each). Every accumulator field is a SUM or a histogram
-	// CASE, so the database returns one row per GROUP — the per-request
-	// cost is gone rather than shaved. The hourly tier below still folds
-	// in Go (it is tiny) through the same add(), keeping one merge path.
-	where, args := f.where(false)
-	aggCols := analyticsAggColumns()
-	// scanAgg reads one aggregate row (optionally keyed) in aggCols order.
-	scanAgg := func(scan func(...any) error, key *string) (*usageAccumulator, int64, int64, error) {
-		a := &usageAccumulator{}
-		var latH, ttftH [len(latBuckets) + 1]int64
-		dest := []any{}
-		if key != nil {
-			dest = append(dest, key)
-		}
-		dest = append(dest, &a.Requests, &a.Errors, &a.TokIn, &a.TokOut, &a.TokCache, &a.Cost,
-			&a.UnknownUsage, &a.UnknownCost, &a.latSum, &a.ttftSum, &a.ttftN, &a.Images, &a.UnknownImages)
-		for i := range latH {
-			dest = append(dest, &latH[i], &ttftH[i])
-		}
-		var oldest, newest int64
-		dest = append(dest, &oldest, &newest)
-		if err := scan(dest...); err != nil {
-			return nil, 0, 0, err
-		}
-		for i := range latH {
-			a.latHist[i] = uint64(latH[i])
-			a.ttftHist[i] = uint64(ttftH[i])
-		}
-		return a, oldest, newest, nil
-	}
-	mergeInto := func(m map[string]*usageAccumulator, key string, a *usageAccumulator) {
-		x := m[key]
-		if x == nil {
-			x = &usageAccumulator{}
-			m[key] = x
-		}
-		x.merge(a)
+
+	var detOld, detNew int64
+	unfiltered := f.Model == "" && f.Backend == "" && f.ClientKeyID == "" && f.Endpoint == "" && f.Status == "" && f.Q == ""
+	var cacheReady int64
+	if unfiltered {
+		_ = tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT value FROM analytics_meta WHERE name='request_hour_cache_ready'), 0)`).Scan(&cacheReady)
 	}
 
-	totalAgg, detOld, detNew, err := scanAgg(tx.QueryRowContext(ctx,
-		`SELECT `+aggCols+`, COALESCE(MIN(ts),0), COALESCE(MAX(ts),0) FROM requests WHERE `+where, args...).Scan, nil)
-	if err != nil {
-		return out, err
+	if unfiltered && cacheReady == 1 {
+		// Unfiltered time-range query: read complete interior hours from
+		// analytics_hour_summary (O(hours), ~720 rows/30d) and fold at most
+		// two partial boundary hours from raw `requests`.
+		switch {
+		case f.Since <= 0 && f.Until <= 0:
+			if err = foldHourCacheWhere(ctx, tx, "1=1", nil, &detOld, &detNew,
+				total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+				return out, err
+			}
+		case f.Since > 0 && f.Until <= 0:
+			fullStart := ((f.Since + 3599999) / 3600000) * 3600000
+			if f.Since < fullStart {
+				if err = foldRequestsWhere(ctx, tx, "ts>=? AND ts<?", []any{f.Since, fullStart}, &detOld, &detNew,
+					total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+					return out, err
+				}
+			}
+			if err = foldHourCacheWhere(ctx, tx, "hour>=?", []any{fullStart}, &detOld, &detNew,
+				total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+				return out, err
+			}
+		case f.Since <= 0 && f.Until > 0:
+			fullEnd := ((f.Until + 1) / 3600000) * 3600000
+			if fullEnd > 0 {
+				if err = foldHourCacheWhere(ctx, tx, "hour<?", []any{fullEnd}, &detOld, &detNew,
+					total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+					return out, err
+				}
+				if fullEnd <= f.Until {
+					if err = foldRequestsWhere(ctx, tx, "ts>=? AND ts<=?", []any{fullEnd, f.Until}, &detOld, &detNew,
+						total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+						return out, err
+					}
+				}
+			} else {
+				if err = foldRequestsWhere(ctx, tx, "ts<=?", []any{f.Until}, &detOld, &detNew,
+					total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+					return out, err
+				}
+			}
+		default: // f.Since > 0 && f.Until > 0
+			if f.Until >= f.Since {
+				fullStart := ((f.Since + 3599999) / 3600000) * 3600000
+				fullEnd := ((f.Until + 1) / 3600000) * 3600000
+				if fullStart < fullEnd {
+					if f.Since < fullStart {
+						if err = foldRequestsWhere(ctx, tx, "ts>=? AND ts<?", []any{f.Since, fullStart}, &detOld, &detNew,
+							total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+							return out, err
+						}
+					}
+					if err = foldHourCacheWhere(ctx, tx, "hour>=? AND hour<?", []any{fullStart, fullEnd}, &detOld, &detNew,
+						total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+						return out, err
+					}
+					if fullEnd <= f.Until {
+						if err = foldRequestsWhere(ctx, tx, "ts>=? AND ts<=?", []any{fullEnd, f.Until}, &detOld, &detNew,
+							total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+							return out, err
+						}
+					}
+				} else {
+					if err = foldRequestsWhere(ctx, tx, "ts>=? AND ts<=?", []any{f.Since, f.Until}, &detOld, &detNew,
+						total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+						return out, err
+					}
+				}
+			}
+		}
+	} else {
+		where, args := f.where(false)
+		if err = foldRequestsWhere(ctx, tx, where, args, &detOld, &detNew,
+			total, models, providers, clients, endpoints, names, nameTS, statuses); err != nil {
+			return out, err
+		}
 	}
-	if totalAgg.Requests > 0 {
-		total.merge(totalAgg)
+
+	if total.Requests > 0 {
 		cover(detOld)
 		cover(detNew)
 		out.Coverage.DetailOldestTS = detOld
 		out.Coverage.DetailNewestTS = detNew
-
-		groupQueries := []struct {
-			col string
-			m   map[string]*usageAccumulator
-		}{{"model", models}, {"backend", providers}, {"client_key_id", clients}, {"endpoint", endpoints}}
-		for _, gq := range groupQueries {
-			grows, gerr := tx.QueryContext(ctx,
-				`SELECT `+gq.col+`, `+aggCols+`, 0, 0 FROM requests WHERE `+where+` GROUP BY `+gq.col, args...)
-			if gerr != nil {
-				return out, gerr
-			}
-			for grows.Next() {
-				var key string
-				a2, _, _, serr := scanAgg(grows.Scan, &key)
-				if serr != nil {
-					grows.Close()
-					return out, serr
-				}
-				mergeInto(gq.m, key, a2)
-			}
-			if gerr = grows.Err(); gerr != nil {
-				grows.Close()
-				return out, gerr
-			}
-			grows.Close()
-		}
-		// Latest client display name per key (max ts, name breaks ties) —
-		// the same rule the Go fold applied per row.
-		nameRows, nerr := tx.QueryContext(ctx,
-			`SELECT client_key_id, client_name FROM (
-			   SELECT client_key_id, client_name,
-			          ROW_NUMBER() OVER (PARTITION BY client_key_id ORDER BY ts DESC, client_name DESC) AS rn
-			   FROM requests WHERE `+where+`) WHERE rn = 1`, args...)
-		if nerr != nil {
-			return out, nerr
-		}
-		for nameRows.Next() {
-			var id, name string
-			if err = nameRows.Scan(&id, &name); err != nil {
-				nameRows.Close()
-				return out, err
-			}
-			names[id] = name
-			nameTS[id] = detNew // hourly fold may only override with newer data
-		}
-		if err = nameRows.Err(); err != nil {
-			nameRows.Close()
-			return out, err
-		}
-		nameRows.Close()
-		// Status counts.
-		statusRows, serr := tx.QueryContext(ctx,
-			`SELECT status, COUNT(*) FROM requests WHERE `+where+` GROUP BY status`, args...)
-		if serr != nil {
-			return out, serr
-		}
-		for statusRows.Next() {
-			var st, n int64
-			if err = statusRows.Scan(&st, &n); err != nil {
-				statusRows.Close()
-				return out, err
-			}
-			statuses[int(st)] = n
-		}
-		if err = statusRows.Err(); err != nil {
-			statusRows.Close()
-			return out, err
-		}
-		statusRows.Close()
 	}
+
 	// request_hourly is a COVERAGE TIER whose rows are aggregates of detail that
 	// was PRUNED, so they are additive with any surviving detail for the same
 	// hour (the documented legacy behaviour, and covered by

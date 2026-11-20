@@ -198,6 +198,201 @@ func decodeMinutes(blob []byte, models *map[string]deltaModel, backends *map[str
 	return nil
 }
 
+// decodeMinutesInto folds a binary rollup blob directly into destination maps
+// and histogram arrays without allocating per-row maps, slices, or key strings
+// for already-seen keys. Returns (gotHist, gotTTFT, err). Legacy JSON blobs
+// fall back to decodeMinutes transparently.
+func decodeMinutesInto(
+	blob []byte,
+	models map[string]deltaModel,
+	backends map[string]deltaBackend,
+	hist, ttftHist *[len(latBuckets) + 1]uint64,
+) (bool, bool, error) {
+	if len(blob) == 0 {
+		return false, false, nil
+	}
+	if blob[0] != dimCodecVersion {
+		var mm map[string]deltaModel
+		var bb map[string]deltaBackend
+		var h, th []uint64
+		if err := decodeMinutesJSON(blob, &mm, &bb, &h, &th); err != nil {
+			return false, false, err
+		}
+		for k, v := range mm {
+			g := models[k]
+			g.Requests += v.Requests
+			g.TokIn += v.TokIn
+			g.TokOut += v.TokOut
+			g.TokCache += v.TokCache
+			g.Cost += v.Cost
+			models[k] = g
+		}
+		for k, v := range bb {
+			g := backends[k]
+			g.Requests += v.Requests
+			g.TokIn += v.TokIn
+			g.TokOut += v.TokOut
+			g.TokCache += v.TokCache
+			g.Err += v.Err
+			g.Cost += v.Cost
+			backends[k] = g
+		}
+		gotH := len(h) == len(latBuckets)+1
+		if gotH {
+			for i, v := range h {
+				hist[i] += v
+			}
+		}
+		gotTH := len(th) == len(latBuckets)+1
+		if gotTH {
+			for i, v := range th {
+				ttftHist[i] += v
+			}
+		}
+		return gotH, gotTH, nil
+	}
+
+	b := blob[1:]
+	readU := func() (uint64, bool) {
+		v, n := binary.Uvarint(b)
+		if n <= 0 {
+			return 0, false
+		}
+		b = b[n:]
+		return v, true
+	}
+	readF := func() (float64, bool) {
+		if len(b) < 8 {
+			return 0, false
+		}
+		f := math.Float64frombits(binary.LittleEndian.Uint64(b[:8]))
+		b = b[8:]
+		return f, true
+	}
+	readN := func() ([]byte, bool) {
+		n, ok := readU()
+		if !ok || n > uint64(len(b)) {
+			return nil, false
+		}
+		s := b[:n]
+		b = b[n:]
+		return s, true
+	}
+
+	nModels, ok := readU()
+	if !ok || nModels > uint64(len(b)) {
+		return false, false, errDimDecode
+	}
+	for range nModels {
+		nameB, ok := readN()
+		if !ok {
+			return false, false, errDimDecode
+		}
+		reqs, ok1 := readU()
+		tin, ok2 := readU()
+		tout, ok3 := readU()
+		tcache, ok4 := readU()
+		cost, ok5 := readF()
+		if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 {
+			return false, false, errDimDecode
+		}
+		if g, exists := models[string(nameB)]; exists {
+			g.Requests += int64(reqs)
+			g.TokIn += int64(tin)
+			g.TokOut += int64(tout)
+			g.TokCache += int64(tcache)
+			g.Cost += cost
+			models[string(nameB)] = g
+		} else {
+			models[string(nameB)] = deltaModel{
+				Requests: int64(reqs), TokIn: int64(tin), TokOut: int64(tout), TokCache: int64(tcache), Cost: cost,
+			}
+		}
+	}
+
+	nBackends, ok := readU()
+	if !ok || nBackends > uint64(len(b)) {
+		return false, false, errDimDecode
+	}
+	for range nBackends {
+		nameB, ok := readN()
+		if !ok {
+			return false, false, errDimDecode
+		}
+		reqs, ok1 := readU()
+		tin, ok2 := readU()
+		tout, ok3 := readU()
+		tcache, ok4 := readU()
+		errN, ok5 := readU()
+		cost, ok6 := readF()
+		if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 {
+			return false, false, errDimDecode
+		}
+		if g, exists := backends[string(nameB)]; exists {
+			g.Requests += int64(reqs)
+			g.TokIn += int64(tin)
+			g.TokOut += int64(tout)
+			g.TokCache += int64(tcache)
+			g.Err += int64(errN)
+			g.Cost += cost
+			backends[string(nameB)] = g
+		} else {
+			backends[string(nameB)] = deltaBackend{
+				Requests: int64(reqs), TokIn: int64(tin), TokOut: int64(tout), TokCache: int64(tcache), Err: int64(errN), Cost: cost,
+			}
+		}
+	}
+
+	gotH, gotTH := false, false
+	if nh, ok := readU(); ok {
+		if nh == uint64(len(latBuckets)+1) {
+			var tmp [len(latBuckets) + 1]uint64
+			allOK := true
+			for i := range tmp {
+				v, vok := readU()
+				if !vok {
+					allOK = false
+					break
+				}
+				tmp[i] = v
+			}
+			if allOK {
+				for i := range tmp {
+					hist[i] += tmp[i]
+				}
+				gotH = true
+			}
+		} else {
+			for range nh {
+				if _, vok := readU(); !vok {
+					break
+				}
+			}
+		}
+	}
+	if nth, ok := readU(); ok {
+		if nth == uint64(len(latBuckets)+1) {
+			var tmp [len(latBuckets) + 1]uint64
+			allOK := true
+			for i := range tmp {
+				v, vok := readU()
+				if !vok {
+					allOK = false
+					break
+				}
+				tmp[i] = v
+			}
+			if allOK {
+				for i := range tmp {
+					ttftHist[i] += tmp[i]
+				}
+				gotTH = true
+			}
+		}
+	}
+	return gotH, gotTH, nil
+}
+
 func decodeMinutesJSON(blob []byte, models *map[string]deltaModel, backends *map[string]deltaBackend, hist, ttftHist *[]uint64) error {
 	if len(blob) > 0 && blob[0] == '[' {
 		// Histogram column.
@@ -293,7 +488,7 @@ func putF64(b *bytes.Buffer, f float64) {
 func readF64(r *bytes.Reader) (float64, error) {
 	var t [8]byte
 	if _, err := r.Read(t[:]); err != nil {
-		return 0, err
+		return 0, errDimDecode
 	}
 	return math.Float64frombits(binary.LittleEndian.Uint64(t[:])), nil
 }

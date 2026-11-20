@@ -54,6 +54,7 @@ func (s *Server) applyLive(newCfg *Config) error {
 		if ob, ok := old.backends[name]; ok && providerFingerprint(op) == providerFingerprint(np) {
 			nb.pool = ob.pool
 			nb.client = ob.client
+			nb.route = ob.route
 		}
 	}
 	if err := s.control.SaveConfig(newCfg); err != nil {
@@ -81,6 +82,7 @@ func (s *Server) applyLive(newCfg *Config) error {
 		catalog.SyncFromConfig(newCfg)
 		s.rt.Store(newRuntimeState(newCfg, backends))
 		s.gatewayConfigChanged()
+		s.syncKeepWarm()
 		if err := s.updateTelemetrySettings(newCfg); err != nil {
 			log.Printf("[admin] telemetry settings not applied after commit: %v", err)
 		}
@@ -112,6 +114,8 @@ type adminProviderView struct {
 	AllowPrivateUpstreams bool           `json:"allow_private_upstreams"`
 	StripReasoning        *bool          `json:"strip_reasoning_content"`
 	MaxTokens             int            `json:"max_tokens"`
+	MaxInFlight           int            `json:"max_in_flight"`
+	KeepWarmSeconds       int            `json:"keep_warm_seconds"`
 	Keys                  []adminKeyView `json:"keys"`
 	Disabled              bool           `json:"disabled"`
 	ModelCount            int            `json:"model_count"`
@@ -135,6 +139,8 @@ type providerUpsertReq struct {
 	SynthesizeCLIHeaders bool   `json:"synthesize_cli_headers"`
 	StripReasoning       *bool  `json:"strip_reasoning_content"`
 	MaxTokens            int    `json:"max_tokens"`
+	MaxInFlight          int    `json:"max_in_flight"`
+	KeepWarmSeconds      int    `json:"keep_warm_seconds"`
 	// AllowPrivateUpstreams opts this provider into targeting a loopback /
 	// link-local / private address (see the wizard probe guard).
 	AllowPrivateUpstreams bool `json:"allow_private_upstreams"`
@@ -180,6 +186,7 @@ func (s *Server) providerView(name string, p *ProviderConfig, cfg *Config) admin
 		NoAuth: p.NoAuth, SynthesizeCLIHeaders: p.SynthesizeCLIHeaders,
 		AllowPrivateUpstreams: p.AllowPrivateUpstreams,
 		StripReasoning:        p.StripReasoningContent, MaxTokens: p.MaxTokens,
+		MaxInFlight: p.MaxInFlight, KeepWarmSeconds: p.KeepWarmSeconds,
 		Keys: keys, ModelCount: nModels, Disabled: p.Disabled,
 	}
 }
@@ -331,6 +338,7 @@ type adminModelView struct {
 	Embedded      bool           `json:"embedded"`
 	Disabled      bool           `json:"disabled"`
 	Routes        []RouteTarget  `json:"routes"`
+	Routing       *RoutePolicy   `json:"routing,omitempty"`
 }
 
 type modelUpsertReq struct {
@@ -356,6 +364,7 @@ type modelUpsertReq struct {
 	ImagePrices     *ImagePricing  `json:"image_prices,omitempty"`
 	Disabled        bool           `json:"disabled"`
 	Routes          []RouteTarget  `json:"routes"`
+	Routing         *RoutePolicy   `json:"routing,omitempty"`
 	Overwrite       bool           `json:"overwrite"`
 	ClearImagePrice bool           `json:"clear_image_price,omitempty"`
 }
@@ -409,6 +418,7 @@ func (s *Server) modelView(id string, cfg *Config) adminModelView {
 		v.ImagePrices = meta.ImagePrices
 		v.PricingKnown = meta.PricingKnown == nil || *meta.PricingKnown
 		v.PricingFields = meta.PricingFields
+		v.Routing = meta.Routing
 		if meta.Upstream != "" {
 			v.Upstream = meta.Upstream
 		}

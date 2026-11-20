@@ -200,6 +200,8 @@ export interface AdminProvider {
   allow_private_upstreams: boolean;
   strip_reasoning_content: boolean | null;
   max_tokens: number;
+  max_in_flight?: number;
+  keep_warm_seconds?: number;
   keys: AdminKey[];
   model_count: number;
 }
@@ -211,10 +213,18 @@ export interface ImagePricing {
   unsupported_conditions?: boolean;
 }
 
+export interface RoutePolicy {
+  strategy?: 'ordered' | 'latency' | 'weighted' | '';
+  primary_weight?: number;
+  hedge_delay_ms?: number;
+  max_hedges?: number;
+}
+
 export interface AdminModel {
   id: string;
   disabled?: boolean;
   routes?: RouteTarget[];
+  routing?: RoutePolicy;
   pricing_known: boolean;
   pricing_fields?: string[];
   backend: string;
@@ -381,7 +391,7 @@ export const setup = (setup_token: string, password: string) => adminJSON<Sessio
 export const changePassword = (current_password: string, new_password: string) => adminJSON<Session>('/dash/api/auth/password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) }).then(rememberSession);
 export const logout = async () => { await adminJSON('/dash/api/auth/logout', { method: 'POST' }); csrfToken = ''; };
 
-export interface RouteTarget { backend: string; upstream: string }
+export interface RouteTarget { backend: string; upstream: string; weight?: number }
 export const onboard = (body: { provider?: Record<string, unknown>; models: Record<string, unknown>[]; overwrite?: boolean }) =>
   adminJSON<{ ok: boolean; providers: number; models: number }>('/dash/api/admin/onboard', { method: 'POST', body: JSON.stringify(body) }, 60000);
 export const bulkModels = (ids: string[], action: 'enable' | 'disable' | 'delete') =>
@@ -419,13 +429,27 @@ export interface GatewayLimits {
   max_body_bytes: number; max_attempts: number; retry_budget_seconds: number; queue_timeout_seconds: number;
   max_in_flight: number; max_queued: number; stream_idle_timeout_seconds: number;
 }
+export interface ResponseCacheConfig {
+  enabled: boolean;
+  max_entries: number;
+  max_bytes: number;
+  ttl_seconds: number;
+  models: string[];
+}
+export interface ResponseCacheStats {
+  hits: number;
+  misses: number;
+  entries: number;
+  bytes: number;
+}
 export interface Settings {
-  limits: GatewayLimits; secure_cookies: boolean; management_db: string;
+  limits: GatewayLimits; cache?: ResponseCacheConfig; cache_stats?: ResponseCacheStats;
+  secure_cookies: boolean; management_db: string;
   analytics_db: string; model_count: number; provider_count: number;
 }
 export interface AuditEvent { id: number; ts: number; action: string; subject: string }
 export const getSettings = () => adminJSON<Settings>('/dash/api/admin/settings');
-export const saveSettings = (body: { limits?: GatewayLimits; alerts?: AlertRule[] }) => adminJSON<{ ok: boolean }>('/dash/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) });
+export const saveSettings = (body: { limits?: GatewayLimits; alerts?: AlertRule[]; cache?: ResponseCacheConfig }) => adminJSON<{ ok: boolean }>('/dash/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) });
 export const getAudit = () => adminJSON<{ events: AuditEvent[] }>('/dash/api/admin/audit');
 export const createBackup = () => adminJSON<{ ok: boolean; backup: string }>('/dash/api/admin/backup', { method: 'POST' }, 120000);
 

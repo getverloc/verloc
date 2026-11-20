@@ -24,6 +24,7 @@ type backupManifest struct {
 // metadata, then management state. Each subsystem's close is idempotent.
 func (s *Server) Close() error {
 	s.shuttingDown.Store(true)
+	s.stopKeepWarm()
 	if s.hub != nil {
 		s.hub.Close()
 	}

@@ -2,9 +2,10 @@ import { useState, type Dispatch, type SetStateAction } from 'react';
 import { upsertAdminProvider, type AdminProvider } from '../../api';
 import { parseKeyLine, type EditorActions } from './shared';
 
-type ProviderDraft = Partial<Omit<AdminProvider, 'cooldown_seconds' | 'request_timeout_seconds' | 'max_tokens'>> & {
+type ProviderDraft = Partial<Omit<AdminProvider, 'cooldown_seconds' | 'request_timeout_seconds' | 'max_tokens' | 'max_in_flight' | 'keep_warm_seconds'>> & {
   name: string; keys_text?: string; append_key?: string;
   cooldown_seconds?: string; request_timeout_seconds?: string; max_tokens?: string;
+  max_in_flight?: string; keep_warm_seconds?: string;
 };
 
 export type ProviderEditorState = {
@@ -31,6 +32,16 @@ export function useProviderEditor({ providers, run, setErr, setConfirm }: Editor
       setErr('name and base_url required');
       return;
     }
+    const maxInFlight = editProvider.max_in_flight?.trim() ? Number(editProvider.max_in_flight) : 0;
+    if (!Number.isInteger(maxInFlight) || maxInFlight < 0 || maxInFlight > 4096) {
+      setErr('max_in_flight must be an integer between 0 and 4096');
+      return;
+    }
+    const keepWarmSeconds = editProvider.keep_warm_seconds?.trim() ? Number(editProvider.keep_warm_seconds) : 0;
+    if (!Number.isInteger(keepWarmSeconds) || keepWarmSeconds < 0 || keepWarmSeconds > 300) {
+      setErr('keep_warm_seconds must be an integer between 0 and 300');
+      return;
+    }
     const existing = providers.find((p) => p.name === editProvider.name.trim());
     const connChanged = existing && (
       existing.base_url !== editProvider.base_url.trim() ||
@@ -53,6 +64,8 @@ export function useProviderEditor({ providers, run, setErr, setConfirm }: Editor
       allow_private_upstreams: !!editProvider.allow_private_upstreams,
       strip_reasoning_content: editProvider.strip_reasoning_content ?? null,
       max_tokens: Number(editProvider.max_tokens) || 0,
+      max_in_flight: maxInFlight,
+      keep_warm_seconds: keepWarmSeconds,
     };
     if ((!existing || !originalProviderName) && editProvider.keys_text !== undefined) {
       body.keys = editProvider.keys_text
@@ -89,6 +102,7 @@ export function useProviderEditor({ providers, run, setErr, setConfirm }: Editor
     setEditProvider({
       name: '', base_url: '', keys_text: '', no_auth: false,
       synthesize_cli_headers: false, max_tokens: '', cooldown_seconds: '30',
+      max_in_flight: '', keep_warm_seconds: '',
     });
   };
   const edit = (provider: AdminProvider) => {
@@ -98,6 +112,8 @@ export function useProviderEditor({ providers, run, setErr, setConfirm }: Editor
       cooldown_seconds: provider.cooldown_seconds ? String(provider.cooldown_seconds) : '',
       request_timeout_seconds: provider.request_timeout_seconds ? String(provider.request_timeout_seconds) : '',
       max_tokens: provider.max_tokens ? String(provider.max_tokens) : '',
+      max_in_flight: provider.max_in_flight ? String(provider.max_in_flight) : '',
+      keep_warm_seconds: provider.keep_warm_seconds ? String(provider.keep_warm_seconds) : '',
     });
   };
   return { editProvider, setEditProvider, originalProviderName, saveProvider, startNew, edit };

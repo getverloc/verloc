@@ -2,8 +2,8 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { toast } from 'sonner';
 import { Database, History, Plus, RefreshCw } from 'lucide-react';
 import {
-  changePassword, createBackup, fmtDateTime, getAudit, getSettings, saveSettings,
-  type AlertRule, type AuditEvent, type GatewayLimits, type Settings as GatewaySettings,
+  changePassword, createBackup, fmtDateTime, fmtInt, getAudit, getSettings, saveSettings,
+  type AlertRule, type AuditEvent, type GatewayLimits, type ResponseCacheConfig, type Settings as GatewaySettings,
   type TabProps,
 } from '../api';
 import { Badge } from '../components/ui/badge';
@@ -60,8 +60,37 @@ const METRICS: Record<string, { help: string; threshold: number }> = {
 
 const SEVERITIES = ['info', 'warning', 'critical'];
 
+const MIB = 1024 * 1024;
+
+interface CacheDraft {
+  enabled: boolean;
+  ttl_seconds: string;
+  max_entries: string;
+  max_mib: string;
+  models_text: string;
+}
+
+function cacheDraftFrom(cfg?: ResponseCacheConfig): CacheDraft {
+  return {
+    enabled: !!cfg?.enabled,
+    ttl_seconds: String(cfg?.ttl_seconds || 300),
+    max_entries: String(cfg?.max_entries || 1024),
+    max_mib: String(Math.max(1, Math.round((cfg?.max_bytes || 64 * MIB) / MIB))),
+    models_text: (cfg?.models || []).join(', '),
+  };
+}
+
+function fmtBytes(n: number): string {
+  if (!n || n <= 0) return '0 B';
+  if (n >= MIB) return `${(n / MIB).toFixed(1)} MiB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  return `${n} B`;
+}
+
 export default function Settings({ state }: TabProps) {
   const [settings, setSettings] = useState<GatewaySettings | null>(null);
+  const [cacheDraft, setCacheDraft] = useState<CacheDraft>(() => cacheDraftFrom());
+  const [cacheError, setCacheError] = useState('');
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -88,6 +117,7 @@ export default function Settings({ state }: TabProps) {
       .then(([s, a]) => {
         if (active) {
           setSettings(s);
+          setCacheDraft(cacheDraftFrom(s.cache));
           setEvents(a.events || []);
           setLoadError('');
         }
@@ -112,7 +142,11 @@ export default function Settings({ state }: TabProps) {
     setLoading(true);
     setLoadError('');
     Promise.all([getSettings(), getAudit()])
-      .then(([s, a]) => { setSettings(s); setEvents(a.events || []); })
+      .then(([s, a]) => {
+        setSettings(s);
+        setCacheDraft(cacheDraftFrom(s.cache));
+        setEvents(a.events || []);
+      })
       .catch((e) => setLoadError(e instanceof Error ? e.message : 'Could not load settings'))
       .finally(() => setLoading(false));
   };
@@ -154,6 +188,47 @@ export default function Settings({ state }: TabProps) {
       void refreshAudit();
     } catch (e) {
       setLimitsError(e instanceof Error ? e.message : 'Save failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitCache = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setCacheError('');
+    try {
+      const ttl = Number(cacheDraft.ttl_seconds);
+      const maxEntries = Number(cacheDraft.max_entries);
+      const maxMib = Number(cacheDraft.max_mib);
+      if (!Number.isInteger(ttl) || ttl < 1 || ttl > 86400) {
+        throw new Error('TTL must be an integer between 1 and 86400 seconds.');
+      }
+      if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > 100000) {
+        throw new Error('Max entries must be an integer between 1 and 100000.');
+      }
+      if (!Number.isInteger(maxMib) || maxMib < 1 || maxMib > 1024) {
+        throw new Error('Max memory must be an integer between 1 and 1024 MiB.');
+      }
+      const models = cacheDraft.models_text
+        .split(/[\n,]/)
+        .map((m) => m.trim())
+        .filter(Boolean);
+      const cache: ResponseCacheConfig = {
+        enabled: cacheDraft.enabled,
+        ttl_seconds: ttl,
+        max_entries: maxEntries,
+        max_bytes: maxMib * MIB,
+        models,
+      };
+      await saveSettings({ cache });
+      const fresh = await getSettings();
+      setSettings(fresh);
+      setCacheDraft(cacheDraftFrom(fresh.cache));
+      toast.success(cache.enabled ? 'Response cache enabled · live apply.' : 'Response cache disabled · live apply.');
+      void refreshAudit();
+    } catch (e) {
+      setCacheError(e instanceof Error ? e.message : 'Could not save cache settings');
     } finally {
       setBusy(false);
     }
@@ -229,16 +304,21 @@ export default function Settings({ state }: TabProps) {
     }
   };
 
+  const cacheStats = settings?.cache_stats;
+  const cacheTotal = (cacheStats?.hits || 0) + (cacheStats?.misses || 0);
+  const cacheHitRate = cacheTotal > 0 ? `${(((cacheStats?.hits || 0) / cacheTotal) * 100).toFixed(1)}%` : '—';
+
   return (
     <div className="space-y-5">
       <nav aria-label="Settings sections" className="flex flex-wrap border border-edge-700 bg-edge-900">
         {[
           ['01', 'Owner access', 'owner-access'],
           ['02', 'Gateway limits', 'gateway-limits'],
-          ['03', 'Alert rules', 'alert-rules'],
-          ['04', 'Backups', 'backups'],
-          ['05', 'Connection', 'connection'],
-          ['06', 'Audit', 'audit'],
+          ['03', 'Response cache', 'response-cache'],
+          ['04', 'Alert rules', 'alert-rules'],
+          ['05', 'Backups', 'backups'],
+          ['06', 'Connection', 'connection'],
+          ['07', 'Audit', 'audit'],
         ].map(([index, label, id]) => (
           <a key={id} href={`#${id}`} className="flex items-center gap-2 border-r border-edge-700 px-4 py-3 text-[10px] transition-colors hover:bg-edge-800 hover:text-primary">
             <span className="text-primary">{index}</span><span className="text-muted-foreground">{label}</span>
@@ -337,9 +417,123 @@ export default function Settings({ state }: TabProps) {
             </CardContent>
           </Card>
 
+          <Card id="response-cache" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900 py-0 lg:grid lg:grid-cols-[240px_minmax(0,1fr)]">
+            <CardHeader className="flex flex-col items-start gap-3 border-b border-edge-700 bg-edge-950/40 p-6 lg:border-r lg:border-b-0">
+              <span className="text-[10px] tracking-[0.16em] text-chart-3 uppercase">03 / Deterministic cache</span>
+              <CardTitle>Response cache</CardTitle>
+              <CardDescription>
+                Opt-in in-memory LRU cache, strictly isolated per client API key. Caches non-streaming
+                chat requests with temperature 0, embeddings, and System One decisions; honors
+                Cache-Control: no-store / no-cache.
+              </CardDescription>
+              <div className="flex flex-wrap gap-1.5">
+                <Badge variant="outline" className={settings.cache?.enabled ? 'border-primary/40 text-primary' : ''}>
+                  {settings.cache?.enabled ? 'Enabled' : 'Disabled'}
+                </Badge>
+                {cacheStats && (
+                  <Badge variant="outline">
+                    {fmtInt(cacheStats.entries)} entries · {fmtBytes(cacheStats.bytes)}
+                  </Badge>
+                )}
+              </div>
+            </CardHeader>
+            <CardContent className="p-6">
+              <form className="space-y-5" onSubmit={(e) => void submitCache(e)}>
+                {cacheError && <p role="alert" className="text-sm text-destructive">{cacheError}</p>}
+                <div className="flex items-center justify-between gap-3 border border-edge-700 bg-edge-950/40 p-4">
+                  <div>
+                    <Label htmlFor="cache-enabled">Enable deterministic response cache</Label>
+                    <FieldDescription>Responses carry X-Verloc-Cache: HIT or MISS. Saving rebuilds the in-memory cache.</FieldDescription>
+                  </div>
+                  <Switch
+                    id="cache-enabled"
+                    checked={cacheDraft.enabled}
+                    onCheckedChange={(v) => setCacheDraft({ ...cacheDraft, enabled: v === true })}
+                  />
+                </div>
+                {cacheStats && (
+                  <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 sm:grid-cols-4">
+                    {[
+                      { label: 'Hits', value: fmtInt(cacheStats.hits) },
+                      { label: 'Misses', value: fmtInt(cacheStats.misses) },
+                      { label: 'Hit rate', value: cacheHitRate },
+                      { label: 'Memory', value: fmtBytes(cacheStats.bytes) },
+                    ].map(({ label, value }) => (
+                      <div key={label} className="bg-edge-950 p-3">
+                        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{label}</div>
+                        <div className="mt-1 font-mono text-sm tabular-nums text-foreground">{value}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                  <Field>
+                    <FieldLabel htmlFor="cache-ttl">TTL (seconds)</FieldLabel>
+                    <Input
+                      id="cache-ttl"
+                      type="number"
+                      min={1}
+                      max={86400}
+                      step={1}
+                      value={cacheDraft.ttl_seconds}
+                      onChange={(e) => setCacheDraft({ ...cacheDraft, ttl_seconds: e.target.value })}
+                      className="font-mono"
+                    />
+                    <FieldDescription>Entry lifetime (1–86400s). Default 300s.</FieldDescription>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="cache-max-entries">Max entries</FieldLabel>
+                    <Input
+                      id="cache-max-entries"
+                      type="number"
+                      min={1}
+                      max={100000}
+                      step={1}
+                      value={cacheDraft.max_entries}
+                      onChange={(e) => setCacheDraft({ ...cacheDraft, max_entries: e.target.value })}
+                      className="font-mono"
+                    />
+                    <FieldDescription>LRU entry ceiling (1–100000). Default 1024.</FieldDescription>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="cache-max-mib">Max memory (MiB)</FieldLabel>
+                    <Input
+                      id="cache-max-mib"
+                      type="number"
+                      min={1}
+                      max={1024}
+                      step={1}
+                      value={cacheDraft.max_mib}
+                      onChange={(e) => setCacheDraft({ ...cacheDraft, max_mib: e.target.value })}
+                      className="font-mono"
+                    />
+                    <FieldDescription>Total byte budget (1–1024 MiB). Default 64 MiB.</FieldDescription>
+                  </Field>
+                </div>
+                <Field>
+                  <FieldLabel htmlFor="cache-models">Allowed models (optional)</FieldLabel>
+                  <Input
+                    id="cache-models"
+                    value={cacheDraft.models_text}
+                    onChange={(e) => setCacheDraft({ ...cacheDraft, models_text: e.target.value })}
+                    placeholder="Leave blank for all models, or comma-separated model IDs"
+                    className="font-mono"
+                  />
+                  <FieldDescription>Restrict caching to specific public Verloc model IDs. Empty allows every eligible model.</FieldDescription>
+                </Field>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="submit" disabled={busy}>{busy ? 'Saving…' : 'Save cache policy'}</Button>
+                  <Button type="button" variant="outline" size="sm" disabled={busy || loading} onClick={reload}>
+                    <RefreshCw className="size-3.5" />Refresh stats
+                  </Button>
+                </div>
+              </form>
+            </CardContent>
+          </Card>
+
           <Card id="alert-rules" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900 py-0 lg:grid lg:grid-cols-[240px_minmax(0,1fr)]">
             <CardHeader className="flex flex-col items-start gap-3 border-b border-edge-700 bg-edge-950/40 p-6 lg:border-r lg:border-b-0">
-              <span className="text-[10px] tracking-[0.16em] text-chart-2 uppercase">03 / Notifications</span>
+              <span className="text-[10px] tracking-[0.16em] text-chart-2 uppercase">04 / Notifications</span>
               <CardTitle>Alert policy</CardTitle>
               <CardDescription>
                 Rules persist with gateway settings. Spend thresholds notify but do not enforce a
@@ -425,7 +619,7 @@ export default function Settings({ state }: TabProps) {
           <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-2">
             <Card id="backups" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900">
               <CardHeader className="border-b border-edge-700 pb-5">
-                <span className="text-[10px] tracking-[0.16em] text-chart-3 uppercase">04 / Recovery</span>
+                <span className="text-[10px] tracking-[0.16em] text-chart-3 uppercase">05 / Recovery</span>
                 <CardTitle className="flex items-center gap-2"><Database className="size-4 text-chart-3" />Private backups</CardTitle>
                 <CardDescription>
                   Consistent server-side snapshot of management and analytics data. Backups contain
@@ -450,7 +644,7 @@ export default function Settings({ state }: TabProps) {
 
             <Card id="connection" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900">
               <CardHeader className="border-b border-edge-700 pb-5">
-                <span className="text-[10px] tracking-[0.16em] text-chart-2 uppercase">05 / Infrastructure</span>
+                <span className="text-[10px] tracking-[0.16em] text-chart-2 uppercase">06 / Infrastructure</span>
                 <CardTitle>Connection & storage</CardTitle>
                 <CardDescription>How applications reach this gateway and where its data lives.</CardDescription>
               </CardHeader>
@@ -479,7 +673,7 @@ export default function Settings({ state }: TabProps) {
 
       <Card id="audit" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900 py-0 lg:grid lg:grid-cols-[240px_minmax(0,1fr)]">
         <CardHeader className="flex flex-col items-start gap-3 border-b border-edge-700 bg-edge-950/40 p-6 lg:border-r lg:border-b-0">
-          <span className="text-[10px] tracking-[0.16em] text-primary uppercase">06 / Accountability</span>
+          <span className="text-[10px] tracking-[0.16em] text-primary uppercase">07 / Accountability</span>
           <CardTitle className="flex items-center gap-2"><History className="size-4" />Audit history</CardTitle>
           <CardDescription>Recorded management actions and their subjects.</CardDescription>
           <CardAction className="mt-2 self-start">

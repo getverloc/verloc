@@ -2,13 +2,14 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 )
 
 // SeriesSince returns snapshots in [sinceMs, +∞) oldest-first. When the
-// result exceeds maxPoints it is downsampled in SQL into equal-width
-// buckets. Per-model and per-backend JSON is folded in only from ticks
-// that had traffic, so a year of idle 3s rows does not have to be parsed.
+// result exceeds maxPoints it is downsampled into equal-width buckets, using
+// the coarsest pre-aggregated rollup tier (snapshot_hour -> snapshot_minute ->
+// raw snapshots) whose resolution fits the requested bucket width.
 // ctx cancels the scan so a newer window can take the DB lock.
 func (s *Store) SeriesSince(ctx context.Context, sinceMs int64, maxPoints int) ([]SeriesRow, error) {
 	if maxPoints < 1 {
@@ -34,6 +35,13 @@ func (s *Store) SeriesSince(ctx context.Context, sinceMs int64, maxPoints int) (
 	}
 	if n <= maxPoints {
 		return s.seriesScan(ctx, sinceMs)
+	}
+	// Prefer the hourly rollup when each output bucket spans >= 1 hour (~60x
+	// fewer rows than snapshot_minute, ~1200x fewer than raw ticks).
+	if (maxTs-minTs)/int64(maxPoints) >= 3600000 {
+		if rows, ok, err := s.seriesFromHours(ctx, sinceMs, minTs, maxPoints); ok {
+			return rows, err
+		}
 	}
 	// Prefer the minute rollup: re-reading every raw tick to produce 500 points
 	// cost 7.5s and 892MB at 1M ticks, and it re-read the whole table on every
@@ -91,17 +99,210 @@ func (s *Store) seriesScan(ctx context.Context, sinceMs int64) ([]SeriesRow, err
 	return all, nil
 }
 
+type seriesRollupAcc struct {
+	row                          SeriesRow
+	latW, latSum, ttftW, ttftSum float64
+	hist, ttftHist               [len(latBuckets) + 1]uint64
+	missingN                     int64
+	models                       map[string]deltaModel
+	backends                     map[string]deltaBackend
+}
+
+func (a *seriesRollupAcc) finalize(bucketMs int64) SeriesRow {
+	a.row.Models = a.models
+	a.row.Backends = a.backends
+	a.row.AggregateBucketMs = bucketMs
+	a.row.DistributionsUnavailable = a.missingN > 0
+	a.row.DistributionsApproximate = a.missingN == 0
+	if a.latW > 0 {
+		a.row.LatAvg = a.latSum / a.latW
+	}
+	if a.ttftW > 0 {
+		a.row.TTFTAvg = a.ttftSum / a.ttftW
+	}
+	if !a.row.DistributionsUnavailable {
+		a.row.LatP50 = histogramPercentile(a.hist, 50)
+		a.row.LatP95 = histogramPercentile(a.hist, 95)
+		a.row.LatP99 = histogramPercentile(a.hist, 99)
+	}
+	return a.row
+}
+
+// foldRollupRows streams ordered rollup rows (from snapshot_minute or
+// snapshot_hour) into equal-width SeriesRow buckets using zero-alloc
+// decodeMinutesInto. Rows must arrive in ascending timestamp order.
+func foldRollupRows(
+	ctx context.Context,
+	rows *sql.Rows,
+	anchor, bucketMs int64,
+	curIdx *int64,
+	cur **seriesRollupAcc,
+	out *[]SeriesRow,
+) error {
+	var (
+		rowTS, req, tin, tout, tcache, ms, errN, missingN int64
+		cost, latW, latSum, ttftW, ttftSum                float64
+		hj, thj, mj                                       sql.RawBytes
+	)
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := rows.Scan(&rowTS, &req, &tin, &tout, &tcache, &cost, &ms, &errN,
+			&latW, &latSum, &ttftW, &ttftSum, &hj, &thj, &mj, &missingN); err != nil {
+			return err
+		}
+		idx := (rowTS - anchor) / bucketMs
+		if *cur == nil || idx != *curIdx {
+			if *cur != nil {
+				*out = append(*out, (*cur).finalize(bucketMs))
+			}
+			a := &seriesRollupAcc{
+				models:   make(map[string]deltaModel, 8),
+				backends: make(map[string]deltaBackend, 8),
+			}
+			a.row.TS = rowTS
+			*cur = a
+			*curIdx = idx
+		}
+		a := *cur
+		a.row.Requests += req
+		a.row.TokIn += tin
+		a.row.TokOut += tout
+		a.row.TokCache += tcache
+		a.row.Cost += cost
+		a.row.MS += ms
+		a.row.Err += errN
+		a.latW += latW
+		a.latSum += latSum
+		a.ttftW += ttftW
+		a.ttftSum += ttftSum
+		a.missingN += missingN
+
+		gotH, gotTH, _ := decodeMinutesInto(mj, a.models, a.backends, &a.hist, &a.ttftHist)
+		// Legacy JSON-era rows keep their histograms in the separate hist
+		// columns, not in the dimension blob: fall back to them so those
+		// buckets do not silently report zeroed percentiles.
+		if !gotH && len(hj) > 0 {
+			var h []uint64
+			if json.Unmarshal(hj, &h) == nil && len(h) == len(latBuckets)+1 {
+				for i, v := range h {
+					a.hist[i] += v
+				}
+			}
+		}
+		if !gotTH && len(thj) > 0 {
+			var th []uint64
+			if json.Unmarshal(thj, &th) == nil && len(th) == len(latBuckets)+1 {
+				for i, v := range th {
+					a.ttftHist[i] += v
+				}
+			}
+		}
+	}
+	return rows.Err()
+}
+
+// seriesFromHours aggregates the hourly rollup tier (with optional minute-tier
+// prefix for a partial leading hour when sinceMs falls mid-hour).
+func (s *Store) seriesFromHours(ctx context.Context, sinceMs, oldestTick int64, maxPoints int) ([]SeriesRow, bool, error) {
+	var hours, firstHour, lastHour int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MIN(hour),0), COALESCE(MAX(hour),0) FROM snapshot_hour`).
+		Scan(&hours, &firstHour, &lastHour); err != nil {
+		return nil, false, err
+	}
+	if hours == 0 {
+		return nil, false, nil
+	}
+	rollupComplete := oldestTick == 0 || oldestTick >= firstHour-3600000
+	windowInsideRollup := sinceMs > 0 && sinceMs >= firstHour-3600000
+	if !rollupComplete && !windowInsideRollup {
+		return nil, false, nil
+	}
+	needLeadingMinutes := sinceMs > firstHour && sinceMs%3600000 != 0
+	if needLeadingMinutes {
+		var minCount, firstMinute int64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*), COALESCE(MIN(minute),0) FROM snapshot_minute`).
+			Scan(&minCount, &firstMinute); err != nil {
+			return nil, false, err
+		}
+		if minCount == 0 || sinceMs < firstMinute-60000 {
+			return nil, false, nil
+		}
+	}
+	if maxPoints < 1 {
+		maxPoints = 500
+	}
+	bucketMs := int64(3600000)
+	if hours > int64(maxPoints) {
+		span := lastHour - firstHour
+		bucketMs = (span/int64(maxPoints)/3600000 + 1) * 3600000
+	}
+
+	out := make([]SeriesRow, 0, min(int(hours), maxPoints)+1)
+	var curIdx int64 = -1
+	var cur *seriesRollupAcc
+
+	hourStart := sinceMs
+	if needLeadingMinutes {
+		firstFullHour := ((sinceMs + 3599999) / 3600000) * 3600000
+		mrows, err := s.db.QueryContext(ctx, `
+			SELECT minute, requests, tok_in, tok_out, tok_cache, cost, ms, err,
+			       lat_w, lat_sum, ttft_w, ttft_sum,
+			       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
+			       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
+			       models, missing_n
+			FROM snapshot_minute
+			WHERE minute >= ? AND minute < ?
+			ORDER BY minute ASC`, sinceMs, firstFullHour)
+		if err != nil {
+			return nil, false, err
+		}
+		err = foldRollupRows(ctx, mrows, firstHour, bucketMs, &curIdx, &cur, &out)
+		mrows.Close()
+		if err != nil {
+			return nil, false, err
+		}
+		hourStart = firstFullHour
+	}
+
+	hrows, err := s.db.QueryContext(ctx, `
+		SELECT hour, requests, tok_in, tok_out, tok_cache, cost, ms, err,
+		       lat_w, lat_sum, ttft_w, ttft_sum,
+		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
+		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
+		       models, missing_n
+		FROM snapshot_hour
+		WHERE hour >= ?
+		ORDER BY hour ASC`, hourStart)
+	if err != nil {
+		return nil, false, err
+	}
+	err = foldRollupRows(ctx, hrows, firstHour, bucketMs, &curIdx, &cur, &out)
+	hrows.Close()
+	if err != nil {
+		return nil, false, err
+	}
+	if cur != nil {
+		out = append(out, cur.finalize(bucketMs))
+	}
+	return out, true, nil
+}
+
 // seriesFromMinutes aggregates the minute rollup. ok is false when the window
 // is not fully covered by the rollup (history predating it, or the rollup has
 // not accumulated yet), in which case the caller falls back to raw ticks so no
 // window is ever silently empty.
 //
 // The rollup is bucketed in Go rather than with SQL GROUP BY on purpose: the
-// dimension maps and histograms are JSON columns, and a bare column under
+// dimension maps and histograms are encoded blobs, and a bare column under
 // GROUP BY yields an arbitrary row from each group (SQLite/MySQL semantics),
 // which silently dropped all but one minute's dimensions per bucket. Reading
 // minute rows is still ~20x fewer rows than reading raw ticks (20 ticks per
-// minute at the 3s cadence), which is where the win comes from.
+// minute at the 3s cadence), and decodeMinutesInto folds each blob directly
+// without per-row map or slice allocations.
 func (s *Store) seriesFromMinutes(ctx context.Context, sinceMs, oldestTick int64, maxPoints int) ([]SeriesRow, bool, error) {
 	var minutes, firstMinute, lastMinute int64
 	if err := s.db.QueryRowContext(ctx,
@@ -136,7 +337,10 @@ func (s *Store) seriesFromMinutes(ctx context.Context, sinceMs, oldestTick int64
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT minute, requests, tok_in, tok_out, tok_cache, cost, ms, err,
-		       lat_w, lat_sum, ttft_w, ttft_sum, hist, ttft_hist, models, backends, missing_n
+		       lat_w, lat_sum, ttft_w, ttft_sum,
+		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE hist END,
+		       CASE WHEN substr(models,1,1)=X'7F' THEN '' ELSE ttft_hist END,
+		       models, missing_n
 		FROM snapshot_minute
 		WHERE minute >= ?
 		ORDER BY minute ASC`, sinceMs)
@@ -145,123 +349,14 @@ func (s *Store) seriesFromMinutes(ctx context.Context, sinceMs, oldestTick int64
 	}
 	defer rows.Close()
 
-	type acc struct {
-		row                          SeriesRow
-		latW, latSum, ttftW, ttftSum float64
-		hist, ttftHist               [len(latBuckets) + 1]uint64
-		missingN                     int64
-		models                       map[string]deltaModel
-		backends                     map[string]deltaBackend
-	}
-	buckets := map[int64]*acc{}
-	var order []int64
-	for rows.Next() {
-		if err := ctx.Err(); err != nil {
-			return nil, false, err
-		}
-		var minute, req, tin, tout, tcache, ms, errN, missingN int64
-		var cost, latW, latSum, ttftW, ttftSum float64
-		var hj, thj, mj, bj string
-		if err = rows.Scan(&minute, &req, &tin, &tout, &tcache, &cost, &ms, &errN,
-			&latW, &latSum, &ttftW, &ttftSum, &hj, &thj, &mj, &bj, &missingN); err != nil {
-			return nil, false, err
-		}
-		_ = hj
-		_ = thj
-		idx := (minute - firstMinute) / bucketMs
-		a := buckets[idx]
-		if a == nil {
-			a = &acc{models: map[string]deltaModel{}, backends: map[string]deltaBackend{}}
-			buckets[idx] = a
-			order = append(order, idx)
-			a.row.TS = minute
-		}
-		a.row.Requests += req
-		a.row.TokIn += tin
-		a.row.TokOut += tout
-		a.row.TokCache += tcache
-		a.row.Cost += cost
-		a.row.MS += ms
-		a.row.Err += errN
-		a.latW += latW
-		a.latSum += latSum
-		a.ttftW += ttftW
-		a.ttftSum += ttftSum
-		a.missingN += missingN
-
-		// One codec call replaces three json.Unmarshal calls per minute row,
-		// which was the dominant remaining cost of this endpoint. Legacy JSON
-		// rows are decoded transparently by the codec.
-		var h, th []uint64
-		var mm map[string]deltaModel
-		var bb map[string]deltaBackend
-		_ = decodeMinutes([]byte(mj), &mm, &bb, &h, &th)
-		// Legacy JSON-era rows keep their histograms in the separate hist
-		// columns, not in the dimension blob: fall back to them so those
-		// minutes do not silently report zeroed percentiles.
-		if len(h) == 0 && hj != "" {
-			_ = json.Unmarshal([]byte(hj), &h)
-		}
-		if len(th) == 0 && thj != "" {
-			_ = json.Unmarshal([]byte(thj), &th)
-		}
-		if len(h) == len(latBuckets)+1 {
-			for i, v := range h {
-				a.hist[i] += v
-			}
-		}
-		if len(th) == len(latBuckets)+1 {
-			for i, v := range th {
-				a.ttftHist[i] += v
-			}
-		}
-		for k, v := range mm {
-			g := a.models[k]
-			g.Requests += v.Requests
-			g.TokIn += v.TokIn
-			g.TokOut += v.TokOut
-			g.TokCache += v.TokCache
-			g.Cost += v.Cost
-			a.models[k] = g
-		}
-		for k, v := range bb {
-			g := a.backends[k]
-			g.Requests += v.Requests
-			g.TokIn += v.TokIn
-			g.TokOut += v.TokOut
-			g.TokCache += v.TokCache
-			g.Err += v.Err
-			g.Cost += v.Cost
-			a.backends[k] = g
-		}
-	}
-	if err = rows.Err(); err != nil {
+	out := make([]SeriesRow, 0, min(int(minutes), maxPoints)+1)
+	var curIdx int64 = -1
+	var cur *seriesRollupAcc
+	if err = foldRollupRows(ctx, rows, firstMinute, bucketMs, &curIdx, &cur, &out); err != nil {
 		return nil, false, err
 	}
-	if len(order) == 0 {
-		return []SeriesRow{}, true, nil
-	}
-	// order is already ascending because rows are ordered by minute.
-	out := make([]SeriesRow, 0, len(order))
-	for _, idx := range order {
-		a := buckets[idx]
-		a.row.Models = a.models
-		a.row.Backends = a.backends
-		a.row.AggregateBucketMs = bucketMs
-		a.row.DistributionsUnavailable = a.missingN > 0
-		a.row.DistributionsApproximate = a.missingN == 0
-		if a.latW > 0 {
-			a.row.LatAvg = a.latSum / a.latW
-		}
-		if a.ttftW > 0 {
-			a.row.TTFTAvg = a.ttftSum / a.ttftW
-		}
-		if !a.row.DistributionsUnavailable {
-			a.row.LatP50 = histogramPercentile(a.hist, 50)
-			a.row.LatP95 = histogramPercentile(a.hist, 95)
-			a.row.LatP99 = histogramPercentile(a.hist, 99)
-		}
-		out = append(out, a.row)
+	if cur != nil {
+		out = append(out, cur.finalize(bucketMs))
 	}
 	return out, true, nil
 }
@@ -428,7 +523,3 @@ type SeriesRow struct {
 	DistributionsApproximate bool                    `json:"distributions_approximate"`
 	AggregateBucketMs        int64                   `json:"aggregate_bucket_ms,omitempty"`
 }
-
-// Range reports the retained snapshot window from the maintained totals row
-// instead of scanning every tick (MIN/MAX/COUNT over 1M rows cost 108ms and
-// grew forever on a table that gains a row every 3s).

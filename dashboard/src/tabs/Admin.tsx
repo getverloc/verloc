@@ -99,7 +99,7 @@ export default function Admin({ state, section }: TabProps & { section: Section 
     const q = mq.trim().toLowerCase();
     if (!q) return models;
     return models.filter((m) =>
-      `${m.id} ${m.name} ${m.backend} ${m.upstream} ${m.kind || ''} ${(m.operations || []).join(' ')} ${(m.tags || []).join(' ')}`.toLowerCase().includes(q));
+      `${m.id} ${m.name} ${m.backend} ${m.upstream} ${m.kind || ''} ${(m.operations || []).join(' ')} ${(m.tags || []).join(' ')} ${m.routing?.strategy || ''}`.toLowerCase().includes(q));
   }, [models, mq]);
 
 
@@ -268,6 +268,8 @@ export default function Admin({ state, section }: TabProps & { section: Section 
                                 {p.api_format === 'systemone' && <Badge variant="outline">System One</Badge>}
                                 {p.no_auth && <Badge variant="outline" className="border-chart-2/40 text-chart-2">keyless</Badge>}
                                 {p.max_tokens > 0 && <Badge variant="outline">cap {p.max_tokens}</Badge>}
+                                {p.max_in_flight && p.max_in_flight > 0 ? <Badge variant="outline" className="border-chart-3/40 text-chart-3">bulkhead {p.max_in_flight}</Badge> : null}
+                                {p.keep_warm_seconds && p.keep_warm_seconds > 0 ? <Badge variant="outline" className="border-chart-2/40 text-chart-2">warm {p.keep_warm_seconds}s</Badge> : null}
                               </div>
                             </div>
                           </TableCell>
@@ -336,7 +338,7 @@ export default function Admin({ state, section }: TabProps & { section: Section 
               <div className="min-w-0">
                 <p className="mb-2 text-[10px] uppercase tracking-[0.16em] text-primary">01 / Routing directory</p>
                 <CardTitle className="text-sm">Model catalog <span className="ml-2 text-muted-foreground">{filteredModels.length}{mq ? ` / ${models.length}` : ''}</span></CardTitle>
-                <CardDescription className="mt-2 text-[11px]">Application IDs, primary targets, and ordered fallback routes.</CardDescription>
+                <CardDescription className="mt-2 text-[11px]">Application IDs, primary targets, adaptive routing, and fallback routes.</CardDescription>
               </div>
               <div className="flex min-w-0 flex-1 basis-full flex-wrap items-center gap-2 sm:basis-auto sm:justify-end">
                   <div className="relative min-w-0 flex-1 sm:max-w-60">
@@ -411,6 +413,7 @@ export default function Admin({ state, section }: TabProps & { section: Section 
                     {filteredModels.map((m) => {
                       const routes: RouteTarget[] = [{ backend: m.backend, upstream: m.upstream }, ...(m.routes || [])];
                       const fallbacks = routes.slice(1);
+                      const weighted = m.routing?.strategy === 'weighted';
                       const priceBits: string[] = [];
                       if (m.pricing_known) priceBits.push(m.kind === 'embeddings' ? `${m.pricing_input} in · $/1M tokens` : `${m.pricing_input} in / ${m.pricing_output} out · $/1M tokens`);
                       if (m.pricing_image != null) priceBits.push(`$${m.pricing_image} / image`);
@@ -441,12 +444,18 @@ export default function Admin({ state, section }: TabProps & { section: Section 
                                   {priceLabel}
                                 </Badge>
                                 {m.has_meta && <Badge variant="outline" className="border-chart-2/40 text-chart-2">metadata</Badge>}
+                                {m.routing?.strategy && m.routing.strategy !== 'ordered' && (
+                                  <Badge variant="outline" className="border-chart-3/40 text-chart-3">{m.routing.strategy}</Badge>
+                                )}
+                                {m.routing?.hedge_delay_ms && m.routing.hedge_delay_ms > 0 ? (
+                                  <Badge variant="outline" className="border-chart-3/40 text-chart-3">hedge {m.routing.hedge_delay_ms}ms</Badge>
+                                ) : null}
                               </div>
                             </div>
                           </TableCell>
                           <TableCell className="py-5 align-top">
                             <div className="min-w-0 max-w-xs whitespace-normal text-[11px]">
-                              <div className="text-chart-2">{m.backend}</div>
+                              <div className="text-chart-2">{m.backend}{weighted ? ` · w:${m.routing?.primary_weight || 1}` : ''}</div>
                               <div className="mt-1 break-all leading-relaxed text-muted-foreground">{m.upstream}</div>
                               {fallbacks.length > 0 && (
                                 <Tooltip>
@@ -457,7 +466,12 @@ export default function Admin({ state, section }: TabProps & { section: Section 
                                   </TooltipTrigger>
                                   <TooltipContent>
                                     <div className="max-w-sm space-y-2 break-all text-[11px]">
-                                      {fallbacks.map((r, i) => <div key={i}>{String(i + 2).padStart(2, '0')} / {r.backend}:{r.upstream}</div>)}
+                                      {fallbacks.map((r, i) => (
+                                        <div key={i}>
+                                          {String(i + 2).padStart(2, '0')} / {r.backend}:{r.upstream}
+                                          {weighted ? ` (w:${r.weight || 1})` : ''}
+                                        </div>
+                                      ))}
                                     </div>
                                   </TooltipContent>
                                 </Tooltip>

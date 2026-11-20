@@ -53,10 +53,9 @@ func mergeMinuteAcc(a, b *minuteAcc) *minuteAcc {
 	return a
 }
 
-// RebuildRollups rebuilds snapshot_minute from the raw tick table. This is the
-// migration for history that predates the rollup (and the repair path if the
-// rollup is ever lost). It streams ticks in time order and writes once per
-// minute, so it is O(minutes) writes rather than one read-merge-write per tick.
+// RebuildRollups rebuilds snapshot_minute and snapshot_hour from the raw tick
+// table in a single ascending pass. This is the migration for history that
+// predates the rollups (and the repair path if a rollup is ever lost).
 func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -75,21 +74,44 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 	if _, err = tx.Exec(`DELETE FROM snapshot_minute`); err != nil {
 		return 0, err
 	}
+	if _, err = tx.Exec(`DELETE FROM snapshot_hour`); err != nil {
+		return 0, err
+	}
 
 	var (
 		curMinute int64 = -1
-		acc             = newMinuteAcc()
+		curHour   int64 = -1
+		minAcc          = newMinuteAcc()
+		hourAcc         = newMinuteAcc()
 		written   int
 	)
-	flush := func() error {
+	flushHour := func() error {
+		if curHour < 0 {
+			return nil
+		}
+		if err := hourAcc.insertDirect(tx, "snapshot_hour", "hour", curHour); err != nil {
+			return err
+		}
+		hourAcc = newMinuteAcc()
+		return nil
+	}
+	flushMinute := func() error {
 		if curMinute < 0 {
 			return nil
 		}
-		if err := acc.write(tx, curMinute); err != nil {
+		hr := curMinute / 3600000 * 3600000
+		if hr != curHour {
+			if err := flushHour(); err != nil {
+				return err
+			}
+			curHour = hr
+		}
+		mergeMinuteAcc(hourAcc, minAcc)
+		if err := minAcc.insertDirect(tx, "snapshot_minute", "minute", curMinute); err != nil {
 			return err
 		}
 		written++
-		acc = newMinuteAcc()
+		minAcc = newMinuteAcc()
 		return nil
 	}
 	for rows.Next() {
@@ -113,17 +135,20 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 		}
 		minute := d.TS / 60000 * 60000
 		if minute != curMinute {
-			if err := flush(); err != nil {
+			if err := flushMinute(); err != nil {
 				return 0, err
 			}
 			curMinute = minute
 		}
-		acc.addDelta(&d)
+		minAcc.addDelta(&d)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
-	if err := flush(); err != nil {
+	if err := flushMinute(); err != nil {
+		return 0, err
+	}
+	if err := flushHour(); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -137,10 +162,13 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 // startup is never blocked by a large rebuild.
 func (s *Store) EnsureRollupsBackfilled(ctx context.Context) {
 	s.mu.Lock()
-	var minutes, ticks, totalTicks int64
+	var minutes, hours, ticks, totalTicks, reqCount, reqCacheReady int64
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshot_minute`).Scan(&minutes)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshot_hour`).Scan(&hours)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&ticks)
 	_ = s.db.QueryRow(`SELECT ticks FROM analytics_totals WHERE id=1`).Scan(&totalTicks)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&reqCount)
+	_ = s.db.QueryRow(`SELECT COALESCE((SELECT value FROM analytics_meta WHERE name='request_hour_cache_ready'), 0)`).Scan(&reqCacheReady)
 	s.mu.Unlock()
 	// A database upgraded from a schema without analytics_totals (or one that
 	// briefly ran a build that never seeded it) has ticks but an empty/partial
@@ -150,14 +178,14 @@ func (s *Store) EnsureRollupsBackfilled(ctx context.Context) {
 	// unseeded. RebuildTotals takes s.mu like every tick insert, so it cannot
 	// interleave with the live writer.
 	needsTotals := ticks > 0 && totalTicks != ticks
-	if !needsTotals && (minutes > 0 || ticks == 0) {
+	needsRollups := ticks > 0 && (minutes == 0 || hours == 0)
+	needsReqCache := reqCount > 0 && reqCacheReady == 0
+	if !needsTotals && !needsRollups && !needsReqCache {
 		return
 	}
-	// Both rebuilds are whole-history scans (RebuildTotals measured ~331ms
-	// at 1M ticks, holding s.mu). They used to run synchronously on the
-	// startup path; LifetimeTotals already self-heals lazily on read, so
-	// deferring the repair to this goroutine cannot serve wrong data — it
-	// only removes the boot-time stall.
+	// All rebuilds are whole-history scans. Deferring the repair to this
+	// goroutine removes any boot-time stall while keeping reads correct via
+	// transparent fallback until each derived table is populated.
 	go func() {
 		if needsTotals {
 			if err := s.RebuildTotals(); err != nil {
@@ -166,30 +194,55 @@ func (s *Store) EnsureRollupsBackfilled(ctx context.Context) {
 				log.Printf("[analytics] totals backfill complete: %d ticks", ticks)
 			}
 		}
-		if minutes > 0 || ticks == 0 {
-			return
+		if needsRollups {
+			start := time.Now()
+			n, err := s.RebuildRollups(ctx)
+			if err != nil {
+				log.Printf("[analytics] rollup backfill failed: %v", err)
+			} else {
+				log.Printf("[analytics] rollup backfill complete: %d minutes in %v", n, time.Since(start).Round(time.Millisecond))
+			}
 		}
-		start := time.Now()
-		n, err := s.RebuildRollups(ctx)
-		if err != nil {
-			log.Printf("[analytics] rollup backfill failed: %v", err)
-			return
+		if needsReqCache {
+			start := time.Now()
+			n, err := s.RebuildRequestHourCache(ctx)
+			if err != nil {
+				log.Printf("[analytics] request hour cache backfill failed: %v", err)
+			} else {
+				log.Printf("[analytics] request hour cache backfill complete: %d hours in %v", n, time.Since(start).Round(time.Millisecond))
+			}
 		}
-		log.Printf("[analytics] rollup backfill complete: %d minutes in %v", n, time.Since(start).Round(time.Millisecond))
 	}()
 }
 
-// rollMinute folds one tick into its minute bucket. The merge itself lives in
-// minuteAcc.write so the per-tick path and the rebuild path share one
-// implementation and cannot drift.
+// rollTick folds one tick into both its minute and hour rollup buckets inside
+// the caller's transaction, parsing d.Payload only once.
+func (s *Store) rollTick(tx *sql.Tx, d *Delta) error {
+	acc := newMinuteAcc()
+	acc.addDelta(d)
+	if err := acc.writeTable(tx, "snapshot_minute", "minute", d.TS/60000*60000); err != nil {
+		return err
+	}
+	return acc.writeTable(tx, "snapshot_hour", "hour", d.TS/3600000*3600000)
+}
+
+// rollMinute folds one tick into its minute bucket.
 func (s *Store) rollMinute(tx *sql.Tx, d *Delta) error {
 	acc := newMinuteAcc()
 	acc.addDelta(d)
-	return acc.write(tx, d.TS/60000*60000)
+	return acc.writeTable(tx, "snapshot_minute", "minute", d.TS/60000*60000)
 }
 
-// minuteAcc accumulates one minute of ticks. Both the live per-tick rollup and
-// the one-time backfill fold through this type, so the two paths cannot drift.
+// rollHour folds one tick into its hour bucket.
+func (s *Store) rollHour(tx *sql.Tx, d *Delta) error {
+	acc := newMinuteAcc()
+	acc.addDelta(d)
+	return acc.writeTable(tx, "snapshot_hour", "hour", d.TS/3600000*3600000)
+}
+
+// minuteAcc accumulates one minute (or hour) of ticks. Both the live per-tick
+// rollup and the one-time backfill fold through this type, so the two paths
+// cannot drift.
 type minuteAcc struct {
 	blobBuf                          bytes.Buffer
 	req, errN, tin, tout, tcache, ms int64
@@ -206,7 +259,7 @@ func newMinuteAcc() *minuteAcc {
 }
 
 // addDelta folds one tick. A tick that carried traffic but no usable histogram
-// marks the minute unavailable: snapshot percentiles are averages over the tick
+// marks the bucket unavailable: snapshot percentiles are averages over the tick
 // and must never be folded into a window distribution, matching the raw path.
 func (a *minuteAcc) addDelta(d *Delta) {
 	a.req += d.Requests
@@ -260,10 +313,23 @@ func (a *minuteAcc) addDelta(d *Delta) {
 	}
 }
 
-func (a *minuteAcc) write(tx *sql.Tx, minute int64) error {
+func (a *minuteAcc) insertDirect(tx *sql.Tx, table, keyCol string, keyVal int64) error {
+	blob := encodeMinutes(&a.blobBuf, a.models, a.backends, a.hist[:], a.ttftHist[:])
+	hj, _ := json.Marshal(a.hist[:])
+	thj, _ := json.Marshal(a.ttftHist[:])
+	_, err := tx.Exec(`INSERT INTO `+table+`
+	   (`+keyCol+`,requests,err,tok_in,tok_out,tok_cache,cost,ms,lat_w,lat_sum,ttft_w,ttft_sum,hist,ttft_hist,models,backends,hist_n,missing_n)
+	   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		keyVal, a.req, a.errN, a.tin, a.tout, a.tcache, a.cost, a.ms,
+		a.latW, a.latSum, a.ttftW, a.ttftSum, string(hj), string(thj), blob, blob,
+		a.histN, a.missingN)
+	return err
+}
+
+func (a *minuteAcc) writeTable(tx *sql.Tx, table, keyCol string, keyVal int64) error {
 	// Read-merge-write in the caller's transaction. ALL scalar columns are
 	// loaded, not just the dimensions: omitting them silently dropped every
-	// previous tick in the minute (caught by the rebuild-equivalence test).
+	// previous tick in the bucket (caught by the rebuild-equivalence test).
 	var (
 		pReq, pErr, pIn, pOut, pCache, pMS int64
 		pCost                              float64
@@ -272,12 +338,13 @@ func (a *minuteAcc) write(tx *sql.Tx, minute int64) error {
 		pHistN, pMissingN                  int64
 	)
 	err := tx.QueryRow(`SELECT requests,err,tok_in,tok_out,tok_cache,cost,ms,lat_w,lat_sum,ttft_w,ttft_sum,hist,ttft_hist,models,backends,hist_n,missing_n
-	                    FROM snapshot_minute WHERE minute=?`, minute).Scan(
+	                    FROM `+table+` WHERE `+keyCol+`=?`, keyVal).Scan(
 		&pReq, &pErr, &pIn, &pOut, &pCache, &pCost, &pMS, &pLatW, &pLatSum, &pTTFTW, &pTTFTSum,
 		&pHist, &pTTFTHist, &pModels, &pBack, &pHistN, &pMissingN)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	target := a
 	if err == nil {
 		prev := newMinuteAcc()
 		prev.req, prev.errN, prev.tin, prev.tout, prev.tcache = pReq, pErr, pIn, pOut, pCache
@@ -306,23 +373,23 @@ func (a *minuteAcc) write(tx *sql.Tx, minute int64) error {
 				prev.ttftHist[i] = th[i]
 			}
 		}
-		a = mergeMinuteAcc(prev, a)
+		target = mergeMinuteAcc(prev, a)
 	}
-	blob := encodeMinutes(&a.blobBuf, a.models, a.backends, a.hist[:], a.ttftHist[:])
-	hj, _ := json.Marshal(a.hist[:])
-	thj, _ := json.Marshal(a.ttftHist[:])
-	_, err = tx.Exec(`INSERT INTO snapshot_minute
-	   (minute,requests,err,tok_in,tok_out,tok_cache,cost,ms,lat_w,lat_sum,ttft_w,ttft_sum,hist,ttft_hist,models,backends,hist_n,missing_n)
+	blob := encodeMinutes(&target.blobBuf, target.models, target.backends, target.hist[:], target.ttftHist[:])
+	hj, _ := json.Marshal(target.hist[:])
+	thj, _ := json.Marshal(target.ttftHist[:])
+	_, err = tx.Exec(`INSERT INTO `+table+`
+	   (`+keyCol+`,requests,err,tok_in,tok_out,tok_cache,cost,ms,lat_w,lat_sum,ttft_w,ttft_sum,hist,ttft_hist,models,backends,hist_n,missing_n)
 	   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-	   ON CONFLICT(minute) DO UPDATE SET
+	   ON CONFLICT(`+keyCol+`) DO UPDATE SET
 	     requests=excluded.requests, err=excluded.err, tok_in=excluded.tok_in, tok_out=excluded.tok_out,
 	     tok_cache=excluded.tok_cache, cost=excluded.cost, ms=excluded.ms,
 	     lat_w=excluded.lat_w, lat_sum=excluded.lat_sum, ttft_w=excluded.ttft_w, ttft_sum=excluded.ttft_sum,
 	     hist=excluded.hist, ttft_hist=excluded.ttft_hist, models=excluded.models, backends=excluded.backends,
 	     hist_n=excluded.hist_n, missing_n=excluded.missing_n`,
-		minute, a.req, a.errN, a.tin, a.tout, a.tcache, a.cost, a.ms,
-		a.latW, a.latSum, a.ttftW, a.ttftSum, string(hj), string(thj), blob, blob,
-		a.histN, a.missingN)
+		keyVal, target.req, target.errN, target.tin, target.tout, target.tcache, target.cost, target.ms,
+		target.latW, target.latSum, target.ttftW, target.ttftSum, string(hj), string(thj), blob, blob,
+		target.histN, target.missingN)
 	return err
 }
 
@@ -365,5 +432,3 @@ func (s *Store) LifetimeTotals() (cost float64, requests, tokIn, tokOut, tokCach
 	_ = row.Scan(&cost, &requests, &tokIn, &tokOut, &tokCache, &errN)
 	return
 }
-
-// RecentAlerts returns the last n alert events, newest first.

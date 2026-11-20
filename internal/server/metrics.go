@@ -12,23 +12,61 @@ import (
 // latBuckets are the histogram bucket edges in ms (last bucket is >60000).
 var latBuckets = [...]float64{50, 100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000}
 
+// hotStatusCodes are tracked with lock-free atomic counters on metricSet so
+// concurrent completions do not serialize on a per-set mutex. Uncommon status
+// codes fall back to the metricSet.status map.
+var hotStatusCodes = [...]int{200, 400, 401, 403, 404, 413, 429, 499, 500, 502, 503, 504}
+var hotStatusLabels = [...]string{"200", "400", "401", "403", "404", "413", "429", "499", "500", "502", "503", "504"}
+
+func hotStatusIndex(code int) int {
+	switch code {
+	case 200:
+		return 0
+	case 400:
+		return 1
+	case 401:
+		return 2
+	case 403:
+		return 3
+	case 404:
+		return 4
+	case 413:
+		return 5
+	case 429:
+		return 6
+	case 499:
+		return 7
+	case 500:
+		return 8
+	case 502:
+		return 9
+	case 503:
+		return 10
+	case 504:
+		return 11
+	default:
+		return -1
+	}
+}
+
 // metricSet holds cumulative counters for a single dimension (model or backend).
 type metricSet struct {
-	requests atomic.Uint64
-	ok       atomic.Uint64
-	err      atomic.Uint64
-	stream   atomic.Uint64
-	tokIn    atomic.Uint64
-	tokOut   atomic.Uint64
-	tokCache atomic.Uint64
-	latSumNs atomic.Uint64
-	failover atomic.Uint64
-	ttftSum  atomic.Uint64 // stream: time-to-first-token, ns
-	ttftN    atomic.Uint64
-	costBits atomic.Uint64 // float64 bits, USD (session scope)
-	hist     [len(latBuckets) + 1]atomic.Uint64
-	mu       sync.Mutex
-	status   map[int]uint64
+	requests  atomic.Uint64
+	ok        atomic.Uint64
+	err       atomic.Uint64
+	stream    atomic.Uint64
+	tokIn     atomic.Uint64
+	tokOut    atomic.Uint64
+	tokCache  atomic.Uint64
+	latSumNs  atomic.Uint64
+	failover  atomic.Uint64
+	ttftSum   atomic.Uint64 // stream: time-to-first-token, ns
+	ttftN     atomic.Uint64
+	costBits  atomic.Uint64 // float64 bits, USD (session scope)
+	hist      [len(latBuckets) + 1]atomic.Uint64
+	hotStatus [len(hotStatusCodes)]atomic.Uint64
+	mu        sync.Mutex
+	status    map[int]uint64
 	// Delta counters, drained by DrainDelta for the 3s ticker. The ticker
 	// diffs cumulative counters today, which forces a full Snapshot (with its
 	// map-of-any allocations) twice per tick just to subtract numbers.
@@ -101,7 +139,7 @@ type TickDelta struct {
 // (Snapshot, Snapshot, computeDelta) on the ticker path: no map-of-any, no
 // per-set status/histogram copies, no JSON-typed intermediate.
 func (mt *Metrics) DrainDelta() TickDelta {
-	mt.mu.Lock()
+	mt.mu.RLock()
 	models := make(map[string]setDelta, len(mt.models))
 	backends := make(map[string]setDelta, len(mt.backends))
 	for k, v := range mt.models {
@@ -116,7 +154,7 @@ func (mt *Metrics) DrainDelta() TickDelta {
 			backends[k] = d
 		}
 	}
-	mt.mu.Unlock()
+	mt.mu.RUnlock()
 
 	out := TickDelta{Models: models, Backends: backends}
 	for _, d := range models {
@@ -171,9 +209,13 @@ func (m *metricSet) add(reqs, okc, errc uint64, stream bool, tin, tout, tcache, 
 		m.dFailover.Add(1)
 	}
 	if status > 0 {
-		m.mu.Lock()
-		m.status[status]++
-		m.mu.Unlock()
+		if idx := hotStatusIndex(status); idx >= 0 {
+			m.hotStatus[idx].Add(1)
+		} else {
+			m.mu.Lock()
+			m.status[status]++
+			m.mu.Unlock()
+		}
 	}
 }
 
@@ -197,11 +239,16 @@ func (m *metricSet) histPercentile(p int) float64 {
 
 func (m *metricSet) snap() map[string]any {
 	m.mu.Lock()
-	st := make(map[string]uint64, len(m.status))
+	st := make(map[string]uint64, len(m.status)+4)
 	for k, v := range m.status {
 		st[strconv.Itoa(k)] = v
 	}
 	m.mu.Unlock()
+	for i := range m.hotStatus {
+		if v := m.hotStatus[i].Load(); v > 0 {
+			st[hotStatusLabels[i]] += v
+		}
+	}
 	n := m.ok.Load() + m.err.Load()
 	var avg float64
 	if n > 0 {
@@ -238,7 +285,7 @@ func (m *metricSet) snap() map[string]any {
 // Metrics is the global, thread-safe metrics registry.
 type Metrics struct {
 	start    time.Time
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	models   map[string]*metricSet
 	backends map[string]*metricSet
 	rMu      sync.Mutex
@@ -260,24 +307,36 @@ func NewMetrics() *Metrics {
 }
 
 func (mt *Metrics) model(name string) *metricSet {
-	mt.mu.Lock()
-	defer mt.mu.Unlock()
+	mt.mu.RLock()
 	s, ok := mt.models[name]
+	mt.mu.RUnlock()
+	if ok {
+		return s
+	}
+	mt.mu.Lock()
+	s, ok = mt.models[name]
 	if !ok {
 		s = newMetricSet()
 		mt.models[name] = s
 	}
+	mt.mu.Unlock()
 	return s
 }
 
 func (mt *Metrics) backend(name string) *metricSet {
-	mt.mu.Lock()
-	defer mt.mu.Unlock()
+	mt.mu.RLock()
 	s, ok := mt.backends[name]
+	mt.mu.RUnlock()
+	if ok {
+		return s
+	}
+	mt.mu.Lock()
+	s, ok = mt.backends[name]
 	if !ok {
 		s = newMetricSet()
 		mt.backends[name] = s
 	}
+	mt.mu.Unlock()
 	return s
 }
 
@@ -451,20 +510,20 @@ func toF64(v any) float64 {
 
 // Snapshot returns a JSON-serializable view of all metrics.
 func (mt *Metrics) Snapshot(backends map[string]*backend) map[string]any {
-	mt.mu.Lock()
-	models := map[string]any{}
+	mt.mu.RLock()
+	models := make(map[string]any, len(mt.models))
 	for k, v := range mt.models {
 		models[k] = v.snap()
 	}
-	bs := map[string]any{}
+	bs := make(map[string]any, len(mt.backends))
 	for k, v := range mt.backends {
 		bs[k] = v.snap()
 	}
-	mt.mu.Unlock()
+	mt.mu.RUnlock()
 
 	p50, p95, p99 := mt.percentiles()
 
-	keys := map[string]any{}
+	keys := make(map[string]any, len(backends))
 	for name, b := range backends {
 		keys[name] = b.pool.Stats()
 	}

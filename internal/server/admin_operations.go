@@ -73,13 +73,25 @@ func applyProviderRequest(cfg *Config, req providerUpsertReq) error {
 	if req.CooldownSeconds < 0 || req.CooldownSeconds > 3600 || req.RequestTimeout < 0 || req.RequestTimeout > 3600 || req.MaxTokens < 0 || req.MaxTokens > 16_777_216 {
 		return fmt.Errorf("provider timeout, cooldown, or output limit is out of range")
 	}
+	if req.MaxInFlight < 0 || req.MaxInFlight > 4096 {
+		return fmt.Errorf("provider max_in_flight must be between 0 and 4096")
+	}
+	if req.KeepWarmSeconds < 0 || req.KeepWarmSeconds > 300 {
+		return fmt.Errorf("provider keep_warm_seconds must be between 0 and 300")
+	}
 	// The SSRF guard must hold on PERSIST, not only on the wizard probe:
 	// otherwise a provider aimed at a private/loopback host is committed
 	// even with allow_private_upstreams unset and only the probe refuses.
 	if err := guardProbeHost(context.Background(), strings.ReplaceAll(base, "%ACCOUNT%", "account"), req.AllowPrivateUpstreams); err != nil {
 		return err
 	}
-	p := &ProviderConfig{BaseURL: base, APIFormat: req.APIFormat, AuthHeader: req.AuthHeader, AuthHeaderFormat: req.AuthHeaderFormat, CooldownSeconds: req.CooldownSeconds, RequestTimeout: req.RequestTimeout, NoAuth: req.NoAuth, SynthesizeCLIHeaders: req.SynthesizeCLIHeaders, StripReasoningContent: req.StripReasoning, MaxTokens: req.MaxTokens, AllowPrivateUpstreams: req.AllowPrivateUpstreams, Disabled: req.Disabled}
+	p := &ProviderConfig{
+		BaseURL: base, APIFormat: req.APIFormat, AuthHeader: req.AuthHeader, AuthHeaderFormat: req.AuthHeaderFormat,
+		CooldownSeconds: req.CooldownSeconds, RequestTimeout: req.RequestTimeout, NoAuth: req.NoAuth,
+		SynthesizeCLIHeaders: req.SynthesizeCLIHeaders, StripReasoningContent: req.StripReasoning,
+		MaxTokens: req.MaxTokens, MaxInFlight: req.MaxInFlight, KeepWarmSeconds: req.KeepWarmSeconds,
+		AllowPrivateUpstreams: req.AllowPrivateUpstreams, Disabled: req.Disabled,
+	}
 	if req.Keys != nil {
 		p.Keys = append([]KeyEntry(nil), (*req.Keys)...)
 	} else if old := cfg.Providers[req.Name]; old != nil {
@@ -197,6 +209,10 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 	if err != nil {
 		return err
 	}
+	routing, err := normalizeRoutePolicy(req.Routing)
+	if err != nil {
+		return err
+	}
 	if req.Kind != "" {
 		if req.Kind != "systemone" && operationsForKind(req.Kind) == nil {
 			return fmt.Errorf("unsupported model kind %q", req.Kind)
@@ -219,6 +235,9 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 	for _, target := range req.Routes {
 		if cfg.Providers[target.Backend] == nil || strings.TrimSpace(target.Upstream) == "" || strings.ContainsAny(target.Upstream, "\r\n") {
 			return fmt.Errorf("each fallback must reference an existing provider and upstream model")
+		}
+		if target.Weight < 0 || target.Weight > 1000 {
+			return fmt.Errorf("fallback route weight must be between 0 and 1000")
 		}
 		name := target.Backend + ":" + target.Upstream
 		if seen[name] {
@@ -247,7 +266,7 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 	if !finitePricePtr(req.PricingInput) || !finitePricePtr(req.PricingOutput) || !finitePricePtr(req.PricingCache) {
 		return fmt.Errorf("model %q pricing must be a finite number", req.ID)
 	}
-	meta := &ModelMeta{Name: req.Name, Description: req.Description, OwnedBy: req.OwnedBy, Upstream: req.Upstream, ContextWindow: req.ContextWindow, MaxTokens: req.MaxTokens, Tags: req.Tags, Attachment: req.Attachment, Reasoning: req.Reasoning, Temperature: req.Temperature, Modalities: req.Modalities, Operations: operations, PricingInput: price(req.PricingInput), PricingOutput: price(req.PricingOutput), PricingCache: price(cachePrice), PricingImage: req.PricingImage, ImagePrices: req.ImagePrices, PricingKnown: &pricingKnown}
+	meta := &ModelMeta{Name: req.Name, Description: req.Description, OwnedBy: req.OwnedBy, Upstream: req.Upstream, ContextWindow: req.ContextWindow, MaxTokens: req.MaxTokens, Tags: req.Tags, Attachment: req.Attachment, Reasoning: req.Reasoning, Temperature: req.Temperature, Modalities: req.Modalities, Operations: operations, PricingInput: price(req.PricingInput), PricingOutput: price(req.PricingOutput), PricingCache: price(cachePrice), PricingImage: req.PricingImage, ImagePrices: req.ImagePrices, PricingKnown: &pricingKnown, Routing: routing}
 	for _, field := range []struct {
 		key   string
 		value *float64
@@ -278,6 +297,9 @@ func applyModelRequest(cfg *Config, req modelUpsertReq, overwrite bool) error {
 		}
 		if req.ImagePrices == nil {
 			meta.ImagePrices = previous.ImagePrices
+		}
+		if req.Routing == nil {
+			meta.Routing = previous.Routing
 		}
 	}
 	cfg.ModelMeta[req.ID] = meta
@@ -391,8 +413,9 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodPut {
 		var req struct {
-			Limits *GatewayLimits `json:"limits"`
-			Alerts *[]AlertRule   `json:"alerts"`
+			Limits *GatewayLimits       `json:"limits"`
+			Alerts *[]AlertRule         `json:"alerts"`
+			Cache  *ResponseCacheConfig `json:"cache"`
 		}
 		if !decodeAdminJSON(w, r, &req) {
 			return
@@ -414,13 +437,31 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			cfg.Dashboard.Alerts = *req.Alerts
 		}
+		if req.Cache != nil {
+			normalized, err := validateResponseCacheConfig(req.Cache)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			cfg.Cache = normalized
+		}
 		if err := s.applyLive(cfg); err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	cfg := s.runtime().cfg
-	writeJSON(w, http.StatusOK, map[string]any{"limits": cfg.Limits, "secure_cookies": cfg.SecureCookies, "management_db": cfg.ManagementDB, "analytics_db": cfg.Dashboard.DBPath, "provider_count": len(cfg.Providers), "model_count": len(cfg.ModelMap)})
+	rt := s.runtime()
+	cfg := rt.cfg
+	writeJSON(w, http.StatusOK, map[string]any{
+		"limits":         cfg.Limits,
+		"cache":          effectiveResponseCacheConfig(cfg.Cache),
+		"cache_stats":    rt.cache.Stats(),
+		"secure_cookies": cfg.SecureCookies,
+		"management_db":  cfg.ManagementDB,
+		"analytics_db":   cfg.Dashboard.DBPath,
+		"provider_count": len(cfg.Providers),
+		"model_count":    len(cfg.ModelMap),
+	})
 }
 
 func validateAlertRules(rules []AlertRule, cfg *Config) error {

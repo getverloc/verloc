@@ -56,8 +56,9 @@ func modelSupportsOperation(cfg *Config, model, operation string) bool {
 // Every explicit alias of a target must allow the requested operation. An
 // incompatible fallback cannot be made eligible by its public caller's flags.
 func targetSupportsOperation(cfg *Config, target RouteTarget, operation string) bool {
+	tk := target.key()
 	for id, mapping := range cfg.ModelMap {
-		if primaryTarget(cfg, mapping) == target && !modelSupportsOperation(cfg, id, operation) {
+		if primaryTarget(cfg, mapping).key() == tk && !modelSupportsOperation(cfg, id, operation) {
 			return false
 		}
 	}
@@ -241,7 +242,21 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 	}
 	var lease *ClientLease
 	var selectedPrice *MediaPriceSnapshot
+	var heldSlot *routeMetrics
+	var heldProbePool *KeyPool
+	var heldProbeKey *KeyState
+	releaseHeld := func() {
+		if heldSlot != nil {
+			heldSlot.releaseSlot()
+			heldSlot = nil
+		}
+		if heldProbePool != nil && heldProbeKey != nil {
+			heldProbePool.ReleaseProbe(heldProbeKey)
+			heldProbePool, heldProbeKey = nil, nil
+		}
+	}
 	defer func() {
+		releaseHeld()
 		if p := recover(); p != nil {
 			rec.OK, rec.Status, rec.Outcome = false, 500, "internal_error"
 			rec.ErrMsg = "gateway internal error"
@@ -270,7 +285,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 		} else if s.recent != nil {
 			s.recent.Add(rec)
 		}
-		if s.hub != nil {
+		if s.hub.HasSubscribers() {
 			s.hub.Publish(map[string]any{"type": "req", "req": rec})
 		}
 	}()
@@ -366,18 +381,39 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			rec.ClientKeyID, rec.ClientName = lease.Identity.ID, lease.Identity.Name
 		}
 	}
+
+	// Opt-in deterministic response cache (applies to /embeddings only).
+	cacheEligible := rt.cache != nil && rt.cache.isCacheEligible(endpoint, rec.Model, false, raw, r.Header)
+	var cacheKey [32]byte
+	if cacheEligible {
+		cacheKey = responseCacheKey(rec.ClientKeyID, rec.Endpoint, rec.Model, primary, raw)
+		if hit, ok := rt.cache.Get(cacheKey); ok {
+			w.Header().Set("Content-Type", hit.contentType)
+			w.Header().Set("X-Request-ID", id)
+			w.Header().Set("X-Verloc-Cache", "HIT")
+			w.WriteHeader(http.StatusOK)
+			_, writeErr := w.Write(hit.body)
+			if writeErr != nil {
+				rec.Status, rec.Outcome, rec.ErrMsg = 499, "canceled", "client write failed"
+				return
+			}
+			rec.OK, rec.Status, rec.Outcome, rec.ErrMsg = true, 200, "cache_hit", ""
+			rec.Backend, rec.Upstream = "cache", primary.Upstream
+			rec.Cost, rec.CostKnown = 0, true
+			return
+		}
+	}
+
 	deadline := time.Now().Add(time.Duration(limits.RetryBudgetSeconds) * time.Second)
-	routes := rt.cfg.ModelRoutes[rec.Model]
+	policy := modelRoutePolicy(rt.cfg, rec.Model)
+	candidates := buildCandidateRoutes(primary, rt.cfg.ModelRoutes[rec.Model], rt, policy, &s.routeRR)
 	rec.AttemptLog = make([]RequestAttempt, 0, limits.MaxAttempts)
 	attempts := 0
 	var previousBackend *backend
 	var previousKey *KeyState
 	lastStatus := http.StatusServiceUnavailable
-	for routeIndex := range len(routes) + 1 {
-		target := primary
-		if routeIndex > 0 {
-			target = routes[routeIndex-1]
-		}
+	for _, cand := range candidates {
+		target := cand.target
 		b := rt.backends[target.Backend]
 		if b == nil || target.Upstream == "" {
 			continue
@@ -385,7 +421,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 		if p := rt.cfg.Providers[target.Backend]; p != nil && p.Disabled {
 			continue
 		}
-		if routeIndex > 0 && !targetSupportsOperation(rt.cfg, target, operation) {
+		if !cand.isPrimary && !targetSupportsOperation(rt.cfg, target, operation) {
 			continue
 		}
 		upstreamURL, upstreamModel, _, routeErr := inferenceTarget(b.baseURL, b.apiFormat, target.Upstream, endpoint)
@@ -399,10 +435,17 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 		}
 		tried := make(map[credentialKey]bool, min(b.pool.Count(), limits.MaxAttempts))
 		for attempts < limits.MaxAttempts && time.Now().Before(deadline) && r.Context().Err() == nil {
-			ks := b.pool.NextUntried(tried)
-			if ks == nil {
+			if !b.route.tryAcquireSlot() {
+				lastStatus = http.StatusServiceUnavailable
 				break
 			}
+			heldSlot = b.route
+			ks := b.pool.NextUntried(tried)
+			if ks == nil {
+				releaseHeld()
+				break
+			}
+			heldProbePool, heldProbeKey = b.pool, ks
 			tried[keyIdentity(ks)] = true
 			if previousKey != nil {
 				previousBackend.pool.RecordFailover(previousKey)
@@ -412,10 +455,10 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			}
 			previousBackend, previousKey = b, ks
 			attempts++
-			rec.Backend, rec.Upstream, rec.Key = b.name, target.Upstream, maskKey(ks.Key)
+			rec.Backend, rec.Upstream, rec.Key = b.name, target.Upstream, ks.maskedKey()
 			selectedPrice = rt.mediaPrices[rec.Model]
-			if routeIndex > 0 {
-				selectedPrice = rt.targetMediaPrices[target]
+			if !cand.isPrimary {
+				selectedPrice = rt.targetMediaPrices[target.key()]
 			}
 			if selectedPrice == nil {
 				selectedPrice = &MediaPriceSnapshot{}
@@ -432,6 +475,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			if err != nil {
 				budgetTimer.Stop()
 				cancel()
+				releaseHeld()
 				fail(502, "upstream_error", "invalid upstream configuration")
 				return
 			}
@@ -453,10 +497,14 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 				cancel()
 				b.pool.RecordErr(ks)
 				if r.Context().Err() != nil {
+					releaseHeld()
 					finishAttempt(499, "canceled")
 					return
 				}
-				b.pool.MarkFailure(ks, 0)
+				b.route.Observe(time.Since(attemptStart), false)
+				b.pool.MarkFailureStatus(ks, 0, 0)
+				heldProbePool, heldProbeKey = nil, nil
+				releaseHeld()
 				finishAttempt(502, "upstream_error")
 				lastStatus = 502
 				if operation == "images" {
@@ -467,6 +515,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 				}
 				continue
 			}
+			b.pool.ObserveHeaders(ks, resp.Header)
 			lastStatus = resp.StatusCode
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -477,16 +526,22 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 				b.pool.RecordErr(ks)
 				finishAttempt(resp.StatusCode, "upstream_rejected")
 				if !retryable {
+					releaseHeld()
 					fail(resp.StatusCode, "upstream_rejected", "upstream rejected request")
 					return
 				}
-				b.pool.MarkFailure(ks, retryAfterDuration(resp))
+				b.route.Observe(time.Since(attemptStart), false)
+				b.pool.MarkFailureStatus(ks, resp.StatusCode, retryAfterDuration(resp))
+				heldProbePool, heldProbeKey = nil, nil
+				releaseHeld()
 				continue
 			}
 			if !budgetTimer.Stop() || ctx.Err() != nil {
 				_ = resp.Body.Close()
 				cancel()
+				b.route.Observe(time.Since(attemptStart), false)
 				b.pool.RecordErr(ks)
+				releaseHeld()
 				finishAttempt(502, "interrupted")
 				lastStatus = 502
 				if operation == "images" {
@@ -511,7 +566,9 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			}
 			if rerr != nil {
 				sb.close()
+				b.route.Observe(time.Since(attemptStart), false)
 				b.pool.RecordErr(ks)
+				releaseHeld()
 				finishAttempt(502, "interrupted")
 				lastStatus = 502
 				if operation == "images" {
@@ -520,6 +577,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 				}
 				continue
 			}
+			b.route.Observe(time.Since(attemptStart), true)
 			rec.TokIn, rec.TokOut, rec.TokCache = usage.Input, usage.Output, usage.Cache
 			rec.Images, rec.ImagesKnown, rec.UsageKnown = usage.Images, usage.ImagesKnown, usage.TokensKnown
 			if usage.BreakdownKnown {
@@ -528,12 +586,18 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			rec.Cost, rec.CostKnown, rec.CostSource = selectedPrice.cost(usage, media, operation)
 			// The upstream completed even if the client disconnects during delivery.
 			b.pool.RecordSuccess(ks, rec.TokIn, rec.TokOut, rec.TokCache, rec.Cost)
+			heldProbePool, heldProbeKey = nil, nil
+			releaseHeld()
 			if upstreamID := resp.Header.Get("X-Request-ID"); len(upstreamID) <= 128 && !strings.ContainsAny(upstreamID, "\r\n") {
 				rec.UpstreamRequestID = upstreamID
 			}
 			copyResponseHeaders(w, resp, false)
 			w.Header().Del("Content-Length")
 			w.Header().Set("X-Request-ID", id)
+			if cacheEligible && sb.file == nil {
+				w.Header().Set("X-Verloc-Cache", "MISS")
+				rt.cache.Put(cacheKey, sb.mem, w.Header().Get("Content-Type"), rec.TokIn, rec.TokOut, rec.TokCache, rec.UsageKnown)
+			}
 			w.WriteHeader(resp.StatusCode)
 			_ = controller.SetWriteDeadline(time.Now().Add(time.Duration(limits.StreamIdleTimeoutSeconds) * time.Second))
 			_, writeErr := io.Copy(w, sb.reader())

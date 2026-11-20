@@ -8,12 +8,13 @@ verloc runs as a single Go binary. SQLite stores management state and analytics;
 
 ## Capabilities
 
-- **Routing:** public model aliases, ordered provider fallbacks, credential rotation, and per-provider cooldowns.
-- **Inference:** Chat Completions and Responses with JSON/SSE, plus native System One typed questions for TypeSafe Jev and Cloudflare Clef. Failover happens before response bytes reach the client; interrupted streams are not silently resumed.
-- **Access control:** one owner account for administration; separate application API keys with model scopes, expiry, rotation, revocation, and request/token/concurrency limits.
-- **Live management:** add providers, discover/test upstream models, edit pricing and routes, and change gateway limits without restarting.
-- **Analytics:** durable request metadata, provider/model/client breakdowns, input/output/cache tokens, known cost, errors, latency and time-to-first-token, request attempts, and operational alerts.
-- **Persistence:** encrypted upstream credentials, hashed application keys, management audit events, and database backup/restore commands.
+- **Low-overhead engine:** zero-allocation model patching, zero-copy SSE streaming, lock-free atomic auth/metrics hot paths, pooled gzip/buffers, and tuned HTTP/2 connection pooling.
+- **Adaptive routing & resilience:** public model aliases, ordered/Peak-EWMA latency/smooth-weighted routing, opt-in speculative hedging, per-provider concurrency bulkheads, TLS keep-warm probes, proactive rate-limit header steering, error-class jittered backoff, and half-open single-probe circuit recovery.
+- **Inference:** Chat Completions, Responses, Anthropic Messages, Embeddings, Image generations/edits, and native System One typed questions for TypeSafe Jev and Cloudflare Clef. Failover happens strictly before response bytes reach the client; interrupted streams are not silently resumed.
+- **Deterministic caching:** opt-in, tenant-isolated in-memory LRU response cache for `temperature=0` non-streaming chat, embeddings, and System One decisions, honoring `Cache-Control: no-store`/`no-cache`.
+- **Access control:** one owner account for administration; separate application API keys with model scopes, expiry, rotation, revocation, and sliding-window RPM/TPM plus concurrency limits.
+- **Live management:** add providers, discover/test upstream models, tune routing/bulkheads/caching, edit pricing and routes, and change gateway limits without restarting.
+- **Analytics & persistence:** durable metadata-only SQLite analytics, operational alerts, encrypted upstream credentials, hashed application keys, audit history, and consistent backup/restore commands.
 
 ## Deployment scope
 
@@ -222,10 +223,10 @@ The same binary serves all nine screens; there is no separate analytics service.
 | **Requests** | Time/model/provider/client/status/search filters; cursor-paginated durable history; per-request usage, cost, outcome, client attribution, and upstream-attempt details |
 | **Analytics** | Client/model/provider comparisons and full ledgers, status breakdown, latency distribution, p50/p95/p99 latency and TTFT, cache usage, cost history, and data-coverage notes |
 | **Alerts** | Configured thresholds/scopes/windows/cooldowns and a bounded recent history of persisted/live triggers |
-| **Providers** | Connection management, discovery/testing, credentials, provider health, cooldowns, and expandable process-session diagnostics |
-| **Models** | Model metadata and capabilities, upstream mappings, pricing, ordered fallback routes, and bulk enable/disable/delete |
-| **API Keys** | Application key lifecycle, model access, expiry, RPM/TPM limits, and concurrency limits |
-| **Settings** | Owner password, global admission/retry/body/stream limits, alert rules, server-side backups, database paths, connection details, and recent management audit events |
+| **Providers** | Connection management, discovery/testing, credentials, provider health, cooldowns, per-provider concurrency bulkheads, TLS keep-warm intervals, and live diagnostics |
+| **Models** | Model metadata and capabilities, upstream mappings, pricing, routing strategies (`ordered` / `latency` / `weighted`), speculative hedging, weighted fallbacks, and bulk actions |
+| **API Keys** | Application key lifecycle, model access, expiry, sliding-window RPM/TPM limits, and concurrency limits |
+| **Settings** | Owner password, global admission/retry/body/stream limits, deterministic response cache policy & live stats, alert rules, server-side backups, connection details, and audit events |
 | **Docs** | In-app gateway API reference: endpoints, schemas, errors, routing, and configuration |
 
 **Allow private / LAN upstream** is an explicit provider-editor and guided-add
@@ -283,6 +284,33 @@ cannot be reset to unknown in the editor.
 - Snapshot traffic/cost charts and filtered request analytics are different sources. The dashboard labels their windows; dimensional request filters do not apply to the separate snapshot panels.
 - New history is retained indefinitely. There is **no automatic expiry or compaction**. Legacy aggregate-only history remains readable, but deleted detail and missing historical attribution cannot be recovered.
 - The analytics writer uses a bounded queue. Under overload or storage failures, metadata can be dropped. Queue pressure, dropped records, and write errors are surfaced in the dashboard. Analytics is not a lossless financial ledger.
+
+## Performance, adaptive routing, and resilience
+
+verloc pairs a low-overhead Go hot path with opt-in traffic controls designed to stay 100% backwards-compatible by default.
+
+### Always-on engine optimizations
+
+- **Hot-path efficiency:** in-place JSON field patching without full-body `map[string]any` unmarshaling, zero-copy SSE pass-through streaming, lock-free atomic auth/metrics/histogram paths, pooled gzip writers and I/O buffers, and tuned HTTP/2 upstream transports.
+- **Smart key pools & circuit recovery:** error-class jittered backoff (auth errors quarantined at 5m, 429s honoring `Retry-After`, transient 5xx using exponential jitter), proactive soft-steering from upstream `x-ratelimit-remaining-*` / `anthropic-ratelimit-*` headers, and half-open single-probe recovery (one probe at a time; two consecutive successes restore full traffic) to prevent thundering herds.
+- **Sliding-window client limits:** per-key RPM and TPM ceilings use weighted 60-second sliding windows with cross-boundary token reconciliation, eliminating 2× minute-boundary bursts.
+
+### Opt-in controls (Dashboard & JSON)
+
+All controls below default to off/`ordered` and live-apply immediately when saved in the dashboard (or via bootstrap `config.json`):
+
+| Feature | Dashboard location | JSON key | Default |
+| --- | --- | --- | --- |
+| Per-provider bulkhead | **Providers → Edit → Limits** | `providers.<name>.max_in_flight` (`0–4096`) | `0` (unbounded) |
+| TLS keep-warm probes | **Providers → Edit → Limits** | `providers.<name>.keep_warm_seconds` (`0–300`) | `0` (off) |
+| Adaptive / weighted routing | **Models → Edit → Routing** | `model_meta.<id>.routing.strategy` (`ordered` \| `latency` \| `weighted`), `primary_weight`, `model_routes.<id>[].weight` | `ordered` |
+| Speculative hedging | **Models → Edit → Routing** | `model_meta.<id>.routing.hedge_delay_ms` (`0–10000`), `max_hedges` (`1–2`) | `0` (off) |
+| Deterministic response cache | **Settings → Response cache** | `cache.{enabled, ttl_seconds, max_entries, max_bytes, models}` | `enabled: false` |
+
+- **`latency` routing** uses Peak EWMA latency weighted by live in-flight concurrency and error penalties to steer toward the fastest healthy route.
+- **`weighted` routing** uses smooth weighted round-robin across primary and fallback targets and automatically bypasses unhealthy or bulkhead-saturated providers.
+- **Speculative hedging** applies to non-streaming requests only: if the primary route has not returned headers within `hedge_delay_ms`, verloc races backup routes and cancels losers immediately once a winner commits.
+- **Response cache** is strictly isolated per client API key, caches only non-streaming `temperature=0` chat, `/v1/embeddings`, and `/v1/systemone`, sets `X-Verloc-Cache: HIT|MISS`, and bypasses whenever a request sends `Cache-Control: no-store` or `no-cache`.
 
 ## State and configuration
 

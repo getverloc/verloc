@@ -62,13 +62,27 @@ type ClientKeyView struct {
 	RevokedAt     int64    `json:"revoked_at"`
 }
 
+// clientUsage holds per-key sliding-window quota accounting protected by its
+// own mutex so concurrent requests from different client keys never contend on
+// a global security lock. mu is a pointer so callers/tests that snapshot *usage
+// by value after quiescence never copy a sync.Mutex value.
 type clientUsage struct {
-	window   time.Time
-	requests uint64
-	tokens   uint64
-	active   uint64
+	mu           *sync.Mutex
+	window       time.Time
+	requests     uint64 // current 1-minute window requests
+	tokens       uint64 // current 1-minute window tokens
+	prevRequests uint64 // previous 1-minute window requests (weighted into sliding count)
+	prevTokens   uint64 // previous 1-minute window tokens (weighted into sliding count)
+	active       uint64
 }
 
+func newClientUsage() *clientUsage {
+	return &clientUsage{mu: &sync.Mutex{}}
+}
+
+// clientKeyRecord is immutable once published in keysSnap (except
+// revocationPersisted, which is only accessed under s.mu on admin routes, and
+// the usage struct's interior, which is guarded by usage.mu).
 type clientKeyRecord struct {
 	view                ClientKeyView
 	hash                [32]byte
@@ -84,6 +98,17 @@ type clientKeyRequest struct {
 	RPM           int      `json:"rpm"`
 	TPM           int      `json:"tpm"`
 	MaxConcurrent int      `json:"max_concurrent"`
+}
+
+// publishKeysLocked copies s.keys into a fresh immutable map and swaps it into
+// s.keysSnap so ClientMiddleware and acquireClient perform lock-free lookups.
+// Caller must hold s.mu.
+func (s *Security) publishKeysLocked() {
+	snap := make(map[[32]byte]*clientKeyRecord, len(s.keys))
+	for k, v := range s.keys {
+		snap[k] = v
+	}
+	s.keysSnap.Store(&snap)
 }
 
 func (s *Security) loadClientKeys() error {
@@ -114,7 +139,7 @@ func (s *Security) loadClientKeys() error {
 			view.AllowedModels = []string{"*"}
 			migrated = append(migrated, view.ID)
 		}
-		record := &clientKeyRecord{view: view, usage: &clientUsage{}, revocationPersisted: view.RevokedAt != 0}
+		record := &clientKeyRecord{view: view, usage: newClientUsage(), revocationPersisted: view.RevokedAt != 0}
 		copy(record.hash[:], hash)
 		record.identity = &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: record.hash}
 		s.clients[view.ID] = record
@@ -122,7 +147,11 @@ func (s *Security) loadClientKeys() error {
 			s.keys[record.hash] = record
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	s.publishKeysLocked()
+	return nil
 }
 
 // clientCredential extracts the presented client key. Anthropic-protocol
@@ -162,13 +191,12 @@ func (s *Security) ClientMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		hash := sha256.Sum256([]byte(key))
-		s.mu.Lock()
-		record := s.keys[hash]
 		var identity *ClientIdentity
-		if record != nil && subtle.ConstantTimeCompare(record.hash[:], hash[:]) == 1 && record.view.RevokedAt == 0 && (record.view.ExpiresAt == 0 || record.view.ExpiresAt > time.Now().UnixMilli()) {
-			identity = record.identity
+		if snap := s.keysSnap.Load(); snap != nil {
+			if record := (*snap)[hash]; record != nil && subtle.ConstantTimeCompare(record.hash[:], hash[:]) == 1 && record.view.RevokedAt == 0 && (record.view.ExpiresAt == 0 || record.view.ExpiresAt > time.Now().UnixMilli()) {
+				identity = record.identity
+			}
 		}
-		s.mu.Unlock()
 		if identity == nil {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, "valid client API key required")
@@ -290,10 +318,11 @@ func (s *Security) handleClientKeyCreate(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 500, "client key creation failed")
 		return
 	}
-	record := &clientKeyRecord{view: view, hash: hash, usage: &clientUsage{}, identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: hash}}
+	record := &clientKeyRecord{view: view, hash: hash, usage: newClientUsage(), identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: hash}}
 	s.mu.Lock()
 	s.clients[view.ID] = record
 	s.keys[hash] = record
+	s.publishKeysLocked()
 	s.mu.Unlock()
 	writeJSON(w, http.StatusCreated, map[string]any{"key": key, "client": view})
 }
@@ -352,6 +381,7 @@ func (s *Security) handleClientKeyEdit(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	record := &clientKeyRecord{view: view, hash: old.hash, usage: old.usage, identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: old.hash}}
 	s.clients[view.ID], s.keys[record.hash] = record, record
+	s.publishKeysLocked()
 	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"client": view})
 }
@@ -404,6 +434,7 @@ func (s *Security) handleClientKeyRotate(w http.ResponseWriter, r *http.Request)
 	record := &clientKeyRecord{view: view, hash: hash, usage: old.usage, identity: &ClientIdentity{ID: view.ID, Name: view.Name, AllowedModels: view.AllowedModels, TPM: view.TPM, authHash: hash}}
 	delete(s.keys, old.hash)
 	s.keys[hash], s.clients[view.ID] = record, record
+	s.publishKeysLocked()
 	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"key": key, "client": view})
 }
@@ -415,10 +446,11 @@ func (s *Security) handleClientKeyRevoke(w http.ResponseWriter, r *http.Request)
 	s.clientWriteMu.Lock()
 	defer s.clientWriteMu.Unlock()
 	// Revocation must take effect immediately: publish the in-memory revocation
-	// (drop the hash from s.keys, stamp RevokedAt) BEFORE the DB write, so inference
-	// traffic is denied the moment the owner clicks. If the DB write then fails the
-	// in-memory revocation stands (fail-closed) and can be retried — a failed write
-	// must never silently re-enable a revoked key.
+	// (drop the hash from s.keys / keysSnap, stamp RevokedAt on a cloned record)
+	// BEFORE the DB write, so inference traffic is denied the moment the owner
+	// clicks. Published records in prior snapshots are never mutated in place.
+	// If the DB write fails the in-memory revocation stands (fail-closed) and
+	// can be retried — a failed write must never silently re-enable a revoked key.
 	id := r.PathValue("id")
 	s.mu.Lock()
 	record := s.clients[id]
@@ -435,9 +467,13 @@ func (s *Security) handleClientKeyRevoke(w http.ResponseWriter, r *http.Request)
 	revoked := record.view.RevokedAt
 	if revoked == 0 {
 		revoked = time.Now().UnixMilli()
-		record.view.RevokedAt = revoked
+		cloned := *record
+		cloned.view.RevokedAt = revoked
+		s.clients[id] = &cloned
+		record = &cloned
 	}
 	delete(s.keys, record.hash)
+	s.publishKeysLocked()
 	s.mu.Unlock()
 	tx, err := s.control.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -476,15 +512,15 @@ var _ error = (*PolicyError)(nil)
 type ClientLease struct {
 	Identity *ClientIdentity
 	once     sync.Once
-	security *Security
 	usage    *clientUsage
 	window   time.Time
 	reserved uint64
 }
 
-// AcquireClient performs the policy check and all quota reservations under one
-// lock. Usage belongs to the stable database ID, not the rotatable secret or
-// policy snapshot; editing a policy cannot refill its current window.
+// AcquireClient performs the policy check and all quota reservations under the
+// key's own usage lock after a lock-free snapshot lookup. Usage belongs to the
+// stable database ID, not the rotatable secret or policy snapshot; editing a
+// policy cannot refill its current window.
 func (s *Security) AcquireClient(r *http.Request, model string, tokenReservation uint64) (*ClientLease, *PolicyError) {
 	return s.acquireClient(r, model, tokenReservation, true)
 }
@@ -497,14 +533,22 @@ func (s *Security) AcquireClientPreBody(r *http.Request) (*ClientLease, *PolicyE
 }
 
 func (s *Security) acquireClient(r *http.Request, model string, tokenReservation uint64, inference bool) (*ClientLease, *PolicyError) {
+	return s.acquireClientAt(r, model, tokenReservation, inference, time.Now())
+}
+
+// acquireClientAt implements smooth sliding-window rate limiting: the previous
+// minute's request and token counts decay linearly across the current minute,
+// eliminating the classic 2x boundary burst of fixed-window counters while
+// preserving exact first-window accounting.
+func (s *Security) acquireClientAt(r *http.Request, model string, tokenReservation uint64, inference bool, now time.Time) (*ClientLease, *PolicyError) {
 	identity := ClientIdentityFromRequest(r)
 	if identity == nil {
 		return nil, &PolicyError{Status: 401, Message: "valid client API key required"}
 	}
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record := s.keys[identity.authHash]
+	var record *clientKeyRecord
+	if snap := s.keysSnap.Load(); snap != nil {
+		record = (*snap)[identity.authHash]
+	}
 	if record == nil || record.view.ID != identity.ID || record.view.RevokedAt != 0 || (record.view.ExpiresAt != 0 && record.view.ExpiresAt <= now.UnixMilli()) {
 		return nil, &PolicyError{Status: 401, Message: "valid client API key required"}
 	}
@@ -517,25 +561,73 @@ func (s *Security) acquireClient(r *http.Request, model string, tokenReservation
 		return nil, &PolicyError{Status: http.StatusConflict, Message: "client token policy changed; retry the request"}
 	}
 	usage := record.usage
-	if usage.window.IsZero() || now.Sub(usage.window) >= time.Minute {
+	usage.mu.Lock()
+	defer usage.mu.Unlock()
+	if usage.window.IsZero() {
 		usage.window = now
-		usage.requests = 0
-		usage.tokens = 0
+		usage.requests, usage.tokens = 0, 0
+		usage.prevRequests, usage.prevTokens = 0, 0
+	} else {
+		elapsed := now.Sub(usage.window)
+		switch {
+		case elapsed >= 2*time.Minute:
+			usage.window = now
+			usage.requests, usage.tokens = 0, 0
+			usage.prevRequests, usage.prevTokens = 0, 0
+		case elapsed >= time.Minute:
+			usage.window = usage.window.Add(time.Minute)
+			usage.prevRequests, usage.prevTokens = usage.requests, usage.tokens
+			usage.requests, usage.tokens = 0, 0
+		}
 	}
-	retryAfter := max(1, int(time.Until(usage.window.Add(time.Minute)).Seconds())+1)
+	inWindow := now.Sub(usage.window)
+	if inWindow < 0 {
+		inWindow = 0
+	}
+	prevWeight := float64(time.Minute-inWindow) / float64(time.Minute)
+	if prevWeight < 0 {
+		prevWeight = 0
+	}
+	effectiveRequests := saturatingTokenAdd(usage.requests, uint64(math.Ceil(float64(usage.prevRequests)*prevWeight)))
+	effectiveTokens := saturatingTokenAdd(usage.tokens, uint64(math.Ceil(float64(usage.prevTokens)*prevWeight)))
+
+	retryAfter := max(1, int(usage.window.Add(time.Minute).Sub(now).Seconds())+1)
 	if record.view.MaxConcurrent > 0 && usage.active >= uint64(record.view.MaxConcurrent) {
 		return nil, &PolicyError{Status: 429, Message: "client concurrency limit reached", RetryAfter: 1}
 	}
-	if record.view.RPM > 0 && usage.requests >= uint64(record.view.RPM) {
-		return nil, &PolicyError{Status: 429, Message: "client request rate limit reached", RetryAfter: retryAfter}
+	if record.view.RPM > 0 && effectiveRequests >= uint64(record.view.RPM) {
+		ra := slidingRetryAfter(usage.requests, usage.prevRequests, uint64(record.view.RPM), 1, inWindow, retryAfter)
+		return nil, &PolicyError{Status: 429, Message: "client request rate limit reached", RetryAfter: ra}
 	}
-	if inference && record.view.TPM > 0 && (tokenReservation > uint64(record.view.TPM) || usage.tokens > uint64(record.view.TPM)-tokenReservation) {
-		return nil, &PolicyError{Status: 429, Message: "client token rate limit reached", RetryAfter: retryAfter}
+	if inference && record.view.TPM > 0 && (tokenReservation > uint64(record.view.TPM) || effectiveTokens > uint64(record.view.TPM)-tokenReservation) {
+		ra := slidingRetryAfter(usage.tokens, usage.prevTokens, uint64(record.view.TPM), tokenReservation, inWindow, retryAfter)
+		return nil, &PolicyError{Status: 429, Message: "client token rate limit reached", RetryAfter: ra}
 	}
 	usage.requests = saturatingTokenAdd(usage.requests, 1)
 	usage.tokens = saturatingTokenAdd(usage.tokens, tokenReservation)
 	usage.active++
-	return &ClientLease{Identity: record.identity, security: s, usage: usage, window: usage.window, reserved: tokenReservation}, nil
+	return &ClientLease{Identity: record.identity, usage: usage, window: usage.window, reserved: tokenReservation}, nil
+}
+
+// slidingRetryAfter estimates how many seconds until previous-window decay
+// frees enough capacity for need (clamped to [1, fallback]).
+func slidingRetryAfter(cur, prev, limit, need uint64, inWindow time.Duration, fallback int) int {
+	if prev == 0 || cur+need > limit {
+		return fallback
+	}
+	// Need prev * (1 - t/60) <= limit - cur - need
+	allowedPrev := float64(limit - cur - need)
+	targetWeight := allowedPrev / float64(prev)
+	if targetWeight <= 0 {
+		return fallback
+	}
+	targetElapsed := time.Duration((1.0 - targetWeight) * float64(time.Minute))
+	wait := targetElapsed - inWindow
+	if wait <= 0 {
+		return 1
+	}
+	sec := int(math.Ceil(wait.Seconds()))
+	return max(1, min(sec, fallback))
 }
 
 func saturatingTokenAdd(a, b uint64) uint64 {
@@ -546,28 +638,38 @@ func saturatingTokenAdd(a, b uint64) uint64 {
 }
 
 // Finish always releases concurrency, exactly once. Unknown usage retains its
-// conservative reservation. A late completion cannot refund a newer window.
+// conservative reservation. A late completion reconciles either the current
+// window or the just-slid previous window, and cannot refund older windows.
 func (lease *ClientLease) Finish(actualTokens uint64, usageKnown bool) {
 	if lease == nil {
 		return
 	}
 	lease.once.Do(func() {
-		lease.security.mu.Lock()
-		defer lease.security.mu.Unlock()
+		lease.usage.mu.Lock()
+		defer lease.usage.mu.Unlock()
 		if lease.usage.active > 0 {
 			lease.usage.active--
 		}
-		if !usageKnown || !lease.window.Equal(lease.usage.window) {
+		if !usageKnown {
+			return
+		}
+		var target *uint64
+		switch {
+		case lease.window.Equal(lease.usage.window):
+			target = &lease.usage.tokens
+		case lease.window.Add(time.Minute).Equal(lease.usage.window):
+			target = &lease.usage.prevTokens
+		default:
 			return
 		}
 		if actualTokens >= lease.reserved {
-			lease.usage.tokens = saturatingTokenAdd(lease.usage.tokens, actualTokens-lease.reserved)
+			*target = saturatingTokenAdd(*target, actualTokens-lease.reserved)
 		} else {
 			refund := lease.reserved - actualTokens
-			if refund > lease.usage.tokens {
-				lease.usage.tokens = 0
+			if refund > *target {
+				*target = 0
 			} else {
-				lease.usage.tokens -= refund
+				*target -= refund
 			}
 		}
 	})
