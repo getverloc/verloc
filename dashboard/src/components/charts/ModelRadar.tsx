@@ -29,7 +29,10 @@ const DIMS = [
 
 export function ModelRadar({ models, loading }: { models: ModelFootprint[]; loading?: boolean }) {
   const { axes, ranked } = useMemo(() => {
-    const ranked = [...models].sort((a, b) => b.requests - a.requests).slice(0, 5);
+    const ranked = [...models]
+      .filter((m) => Boolean(m.name) && m.name !== '(unknown)')
+      .sort((a, b) => b.requests - a.requests)
+      .slice(0, 5);
     const peak = {
       requests: Math.max(...ranked.map((m) => m.requests), 1),
       errors: Math.max(...ranked.map((m) => m.errors), 1),
@@ -80,14 +83,28 @@ export function ModelRadar({ models, loading }: { models: ModelFootprint[]; load
       <ul className="min-w-0 divide-y divide-edge-700">
         {ranked.map((m, i) => (
           <li key={m.name} className="space-y-2 py-3 text-[11px]">
-            <div className="flex min-w-0 items-center gap-2"><span className="size-2 shrink-0" style={{ background: PALETTE.models[i % PALETTE.models.length] }} /><span className="min-w-0 truncate text-edge-100" title={m.name}>{shortName(m.name)}</span></div>
-            <div className="flex flex-wrap gap-x-3 gap-y-1 pl-4 text-[10px] text-edge-400">
-              <span>{fmtInt(m.requests)} req</span><span>{fmtInt(m.errors)} session err</span><span className="text-chart-4">{fmtMoney(m.cost)}</span><span>{fmtMs(m.latencyMs)} session latency</span><span>{fmtTokens(m.tokens)} reported tokens</span><span className="text-chart-5">{fmtInt(m.images)} known images</span>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="size-2 shrink-0" style={{ background: PALETTE.models[i % PALETTE.models.length] }} />
+                <span className="min-w-0 truncate font-medium text-edge-100" title={m.name}>{shortName(m.name)}</span>
+              </div>
+              <span className="shrink-0 font-mono text-chart-4">{fmtMoney(m.cost)}</span>
             </div>
+            <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 pl-4 text-[10px] sm:grid-cols-4">
+              <div><dt className="text-edge-500">Requests</dt><dd className="mt-0.5 font-mono text-edge-200">{fmtInt(m.requests)}</dd></div>
+              <div><dt className="text-edge-500">Errors</dt><dd className={`mt-0.5 font-mono ${m.errors > 0 ? 'text-destructive' : 'text-edge-200'}`}>{fmtInt(m.errors)}</dd></div>
+              <div><dt className="text-edge-500">Latency</dt><dd className="mt-0.5 font-mono text-edge-200">{fmtMs(m.latencyMs)}</dd></div>
+              <div>
+                <dt className="text-edge-500">{m.images > 0 && m.tokens === 0 ? 'Images' : 'Tokens'}</dt>
+                <dd className="mt-0.5 font-mono text-edge-200">
+                  {m.images > 0 && m.tokens === 0 ? `${fmtInt(m.images)} img` : fmtTokens(m.tokens)}
+                </dd>
+              </div>
+            </dl>
           </li>
         ))}
       </ul>
-      <p className="border-t border-edge-700 pt-3 text-[10px] leading-relaxed text-edge-400 lg:col-span-2">Axes normalize each metric against the top-model peak, with a minimum baseline of 1 (0–100). Request, cost and reported token values follow snapshots; known images use durable window history. Error and latency values are session counters. Unknown quantities are excluded, not converted into free usage.</p>
+      <p className="border-t border-edge-700 pt-3 text-[10px] leading-relaxed text-edge-400 lg:col-span-2">Axes normalize each metric against the top-model peak (0–100) across the top 5 configured models in the selected date range.</p>
     </div>
   );
 }

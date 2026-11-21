@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Inbox, TriangleAlert } from 'lucide-react';
+import { Inbox, Info } from 'lucide-react';
 import { getRequests, fmtInt, fmtMoney, fmtTokens, fmtMs, fmtDateTime, type RequestPage, type TabProps, type ReqRecord } from '../api';
 import { HistoryFilters } from '../components/HistoryFilters';
 import { useHistoryFilters } from '../useHistoryFilters';
@@ -13,6 +13,7 @@ import { Separator } from '@/components/ui/separator';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
 function outcomeVariant(status: number): 'destructive' | 'secondary' | 'default' | 'outline' {
   if (status <= 0) return 'outline';
@@ -51,8 +52,8 @@ function RequestDetail({ record }: { record: ReqRecord }) {
     ['Endpoint', record.endpoint || 'Unknown / legacy'],
     ['Model', record.model],
     ['Upstream', record.upstream || 'Not recorded'],
-    ['Provider', record.backend || 'Unattributed'],
-    ['Client', record.client_name || record.client_key_id || 'Unattributed'],
+    ['Provider', record.backend || 'Unrouted'],
+    ['Client', record.client_name || record.client_key_id || 'Anonymous'],
     ['Client IP', record.ip || '—'],
     ['User agent', record.ua || '—'],
     ['Upstream credential (masked)', record.key || '—'],
@@ -162,13 +163,35 @@ export default function Requests({ range, rangeAnchor }: TabProps) {
     <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-3 xl:grid-cols-7 [&>*]:border-0">
       <KpiCard label="Matching requests" value={summary ? fmtInt(summary.requests) : '—'} sub="All matching retained detail" />
       <KpiCard label="Errors" value={summary ? fmtInt(summary.errors) : '—'} accent="text-destructive" sub="Within query" />
-      <KpiCard label="Known cost" value={summary ? fmtMoney(summary.cost) : '—'} accent="text-chart-4" sub="Missing prices excluded" />
-      <KpiCard label="Known tokens" value={summary ? fmtTokens(summary.tok_in + summary.tok_out) : '—'} sub="Input + output" />
-      <KpiCard label="Generated images" value={summary ? fmtInt(summary.images) : '—'} sub={summary ? `${fmtInt(summary.unknown_images)} image requests with unknown count` : 'Returned image count'} accent="text-chart-5" />
+      <KpiCard
+        label="Known cost"
+        value={summary ? fmtMoney(summary.cost) : '—'}
+        accent="text-chart-4"
+        sub={
+          summary && summary.unknown_cost > 0 ? (
+            <Tooltip>
+              <TooltipTrigger render={<span className="inline-flex cursor-help items-center gap-1 text-chart-4" />}>
+                <Info className="size-3 shrink-0" aria-hidden="true" />
+                <span>{fmtInt(summary.unknown_cost)} unpriced</span>
+              </TooltipTrigger>
+              <TooltipContent>
+                {fmtInt(summary.unknown_cost)} matching requests lack token counts or model pricing (for example, rejected or unconfigured requests) and are excluded from known cost.
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            'Priced requests in query'
+          )
+        }
+      />
+      <KpiCard
+        label="Known tokens"
+        value={summary ? fmtTokens(summary.tok_in + summary.tok_out) : '—'}
+        sub={summary && summary.unknown_usage > 0 ? `${fmtInt(summary.unknown_usage)} without token counts` : 'Input + output'}
+      />
+      <KpiCard label="Generated images" value={summary ? fmtInt(summary.images) : '—'} sub={summary ? (summary.unknown_images > 0 ? `${fmtInt(summary.unknown_images)} without count` : 'Returned image count') : 'Returned image count'} accent="text-chart-5" />
       <KpiCard label="Avg latency" value={summary ? fmtMs(summary.avg_latency_ms) : '—'} accent="text-chart-2" sub="Recorded requests" />
       <KpiCard label="Avg TTFT" value={summary ? fmtMs(summary.avg_ttft_ms) : '—'} accent="text-chart-3" sub="Recorded streams" />
     </div>
-    {!!summary && (summary.unknown_usage > 0 || summary.unknown_cost > 0) && <div role="note" className="flex items-start gap-3 border border-chart-4/30 bg-chart-4/5 px-4 py-3 text-[11px] leading-relaxed text-chart-4"><TriangleAlert className="mt-0.5 size-3.5 shrink-0" />Usage unknown for {fmtInt(summary.unknown_usage)} requests; cost unknown for {fmtInt(summary.unknown_cost)}. Unknown is not zero or free.</div>}
     <Card className="gap-0 rounded-none border-edge-700 bg-edge-900/95 py-0 shadow-none">
       <CardHeader className="gap-2 border-b border-edge-700 px-5 py-4">
         <CardTitle className="text-[11px] uppercase tracking-[.16em]">02 / Request ledger</CardTitle>
@@ -190,8 +213,8 @@ export default function Requests({ range, rangeAnchor }: TabProps) {
                   <Button variant="link" size="sm" onClick={(e) => { e.stopPropagation(); setSelected(r); }} className="mt-1 h-auto max-w-48 justify-start truncate p-0 text-[10px] text-primary" title={`Inspect request ${r.id}`}>{r.id}</Button>
                 </TableCell>
                  <TableCell className="max-w-52 text-edge-100" title={r.model}><div className="truncate">{r.model}</div><div className="mt-1 text-[10px] text-edge-400">{r.endpoint || 'Unknown / legacy'}{r.images_known ? ` · ${r.images ?? 0} img` : ''}</div></TableCell>
-                <TableCell className="text-edge-300">{r.backend || 'Unattributed'}</TableCell>
-                <TableCell className="max-w-40 truncate text-edge-300" title={r.client_name || r.client_key_id || 'Unattributed'}>{r.client_name || r.client_key_id || 'Unattributed'}</TableCell>
+                <TableCell className="text-edge-300">{r.backend || <span className="text-edge-500">Unrouted</span>}</TableCell>
+                <TableCell className="max-w-40 truncate text-edge-300" title={r.client_name || r.client_key_id || 'Anonymous'}>{r.client_name || r.client_key_id || <span className="text-edge-500">Anonymous</span>}</TableCell>
                 <TableCell>
                   <Badge variant={outcomeVariant(r.status)}>{r.status <= 0 ? 'No response' : r.status}</Badge>
                   <div className="mt-1 text-xs text-muted-foreground">{outcomeLabel(r)}</div>

@@ -16,11 +16,14 @@ export default function Cost({ state, series, range }: TabProps) {
   const booting = !state;
   const { data: detail, error, retry } = useWindowAnalytics(range);
 
-  const modelRows = useMemo(() => Object.entries(roll.models).map(([name, m]) => ({
-    name, cost: m.cost, requests: m.requests, tokens: m.tokIn + m.tokOut,
-  })), [roll]);
+  const modelRows = useMemo(() => Object.entries(roll.models)
+    .filter(([name]) => Boolean(name) && name !== '(unknown)')
+    .map(([name, m]) => ({
+      name, cost: m.cost, requests: m.requests, tokens: m.tokIn + m.tokOut,
+    })), [roll]);
 
   const providerRows = useMemo(() => Object.entries(roll.backends)
+    .filter(([name]) => Boolean(name))
     .map(([name, m]) => ({ name, cost: m.cost, req: m.requests, tokIn: m.tokIn, tokOut: m.tokOut, err: m.err }))
     .sort((a, b) => b.cost - a.cost || b.req - a.req), [roll]);
 
@@ -34,8 +37,8 @@ export default function Cost({ state, series, range }: TabProps) {
       {error && <InlineError message={error} onRetry={retry} />}
       <p className="text-[11px] text-muted-foreground">Snapshots retain reported tokens and known spend across all endpoints. Image quantities and missing-cost coverage come from durable request history, not reconstructed snapshots.</p>
       <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 [&>*]:border-0">
-        <KpiCard label="Images / durable window" value={detail ? fmtInt(detail.summary.images) : '—'} sub={detail ? `${fmtInt(detail.summary.unknown_images)} requests with unknown image count` : 'Loading durable quantities'} accent="text-chart-5" />
-        <KpiCard label="Unknown cost / durable window" value={detail ? fmtInt(detail.summary.unknown_cost) : '—'} sub="Unknown is not zero or free" accent="text-chart-4" />
+        <KpiCard label="Images / durable window" value={detail ? fmtInt(detail.summary.images) : '—'} sub={detail ? (detail.summary.unknown_images > 0 ? `${fmtInt(detail.summary.unknown_images)} without image count` : 'Recorded image outputs') : 'Loading durable quantities'} accent="text-chart-5" />
+        <KpiCard label="Unpriced requests" value={detail ? fmtInt(detail.summary.unknown_cost) : '—'} sub="Excluded from known cost" accent="text-chart-4" />
       </div>
       <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 md:grid-cols-4 [&>*]:border-0">
         {booting ? (
@@ -109,7 +112,7 @@ export default function Cost({ state, series, range }: TabProps) {
               {providerRows.map((r) => (
                 <TableRow key={r.name}>
                   <TableCell className="max-w-[220px] whitespace-normal break-all font-mono text-xs text-edge-100">
-                    {r.name || 'Unattributed provider'}
+                    {r.name}
                   </TableCell>
                   <TableCell className="text-right font-mono text-chart-4">{fmtMoney(r.cost)}</TableCell>
                   <TableCell className="text-right font-mono">{fmtInt(r.req)}</TableCell>

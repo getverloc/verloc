@@ -447,6 +447,97 @@ func decodeHourAnalyticsInto(
 	return nil
 }
 
+// decodeHourSummaryInto decodes only the header or one single dimension's
+// usageAccumulator from a binary hourly analytics blob, skipping the remaining
+// sections without allocating maps or strings.
+//
+// targetKind:
+//
+//	0 -> total (unfiltered)
+//	1 -> models[targetKey]
+//	2 -> providers[targetKey]
+//	3 -> endpoints[targetKey]
+//	4 -> clients[targetKey]
+func decodeHourSummaryInto(blob []byte, targetKind int, targetKey string, dst *usageAccumulator) error {
+	if len(blob) == 0 || blob[0] != hourAnalyticsCodecVersion {
+		return errHourAnalyticsDecode
+	}
+	b := blob[1:]
+	var err error
+	// minTS, maxTS
+	if _, b, err = readUvarintSlice(b); err != nil {
+		return err
+	}
+	if _, b, err = readUvarintSlice(b); err != nil {
+		return err
+	}
+	if targetKind == 0 {
+		_, err = decodeUsageAccInto(b, dst)
+		return err
+	}
+	var scratch usageAccumulator
+	if b, err = decodeUsageAccInto(b, &scratch); err != nil {
+		return err
+	}
+	scanGroup := func(match bool) (bool, error) {
+		var n uint64
+		if n, b, err = readUvarintSlice(b); err != nil {
+			return false, err
+		}
+		for range n {
+			var kb []byte
+			if kb, b, err = readBytesSlice(b); err != nil {
+				return false, err
+			}
+			if match && string(kb) == targetKey {
+				if b, err = decodeUsageAccInto(b, dst); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			if b, err = decodeUsageAccInto(b, &scratch); err != nil {
+				return false, err
+			}
+		}
+		return match, nil
+	}
+	for idx, kind := range [3]int{1, 2, 3} {
+		done, err := scanGroup(targetKind == kind)
+		if err != nil {
+			return err
+		}
+		if done || idx == 2 && targetKind <= 3 {
+			return nil
+		}
+	}
+	if targetKind == 4 {
+		var nClients uint64
+		if nClients, b, err = readUvarintSlice(b); err != nil {
+			return err
+		}
+		for range nClients {
+			var idB []byte
+			if idB, b, err = readBytesSlice(b); err != nil {
+				return err
+			}
+			if _, b, err = readBytesSlice(b); err != nil {
+				return err
+			}
+			if _, b, err = readUvarintSlice(b); err != nil {
+				return err
+			}
+			if string(idB) == targetKey {
+				_, err = decodeUsageAccInto(b, dst)
+				return err
+			}
+			if b, err = decodeUsageAccInto(b, &scratch); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // rollRequestBatch folds a batch of newly inserted ReqRecords into
 // analytics_hour_summary inside the caller's transaction. Only runs when the
 // cache is marked ready (brand-new DBs or after backfill).

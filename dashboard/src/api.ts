@@ -170,9 +170,16 @@ async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
   return adminJSON<T>(url, { signal });
 }
 
+import { type TimeRange } from './time-range';
+
 export const getState = () => getJSON<State>('/dash/api/state');
-export const getSeriesSince = (sinceMs: number, limit = 500, signal?: AbortSignal) =>
-  getJSON<SeriesPoint[]>(`/dash/api/series?since=${sinceMs}&limit=${limit}`, signal);
+export const getSeriesSince = (sinceMs: number, limit = 500, signal?: AbortSignal, untilMs?: number | null) =>
+  getJSON<SeriesPoint[]>(
+    `/dash/api/series?since=${sinceMs}${untilMs != null ? `&until=${untilMs}` : ''}&limit=${limit}`,
+    signal,
+  );
+export const getSeriesRange = (range: TimeRange, limit = 800, signal?: AbortSignal) =>
+  getSeriesSince(range.from, limit, signal, range.to);
 export const getRange = () => getJSON<DataRange>('/dash/api/range');
 export const getRecent = (limit = 200) => getJSON<ReqRecord[]>(`/dash/api/recent?limit=${limit}`);
 export const getAlerts = (limit = 200) => getJSON<AlertEvent[]>(`/dash/api/alerts?limit=${limit}`);
@@ -493,16 +500,8 @@ export function connectLive(handlers: {
   return () => es.close();
 }
 
-// ---- time-range presets ----
-export interface RangePreset { key: string; label: string; ms: number | null }
-export const RANGE_PRESETS: RangePreset[] = [
-  { key: '1h', label: '1h', ms: 1 * 60 * 60 * 1000 },
-  { key: '1d', label: '1d', ms: 24 * 60 * 60 * 1000 },
-  { key: '7d', label: '7d', ms: 7 * 24 * 60 * 60 * 1000 },
-  { key: '30d', label: '30d', ms: 30 * 24 * 60 * 60 * 1000 },
-  { key: '1y', label: '1y', ms: 365 * 24 * 60 * 60 * 1000 },
-  { key: 'all', label: 'All', ms: null },
-];
+// ---- time-range types ----
+export type RangePreset = TimeRange;
 
 // ---- formatting helpers ----
 export const fmtInt = (n: number) => Math.round(n || 0).toLocaleString();

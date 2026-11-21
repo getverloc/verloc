@@ -4,7 +4,7 @@ import { getAnalytics, type Analytics, type RangePreset } from './api';
 // Media counts and coverage come from the durable ledger, not legacy snapshots.
 export function useWindowAnalytics(range: RangePreset, backend?: string) {
   const [round, setRound] = useState(0);
-  const scope = `${range.ms}:${backend || ''}:${round}`;
+  const scope = `${range.key}:${backend || ''}:${round}`;
   const [result, setResult] = useState<{ scope: string; data: Analytics | null; error: string }>({ scope: '', data: null, error: '' });
   useEffect(() => {
     let stopped = false;
@@ -14,7 +14,8 @@ export function useWindowAnalytics(range: RangePreset, backend?: string) {
       if (inFlight || stopped) return;
       inFlight = true;
       const query = new URLSearchParams();
-      if (range.ms !== null) query.set('since', String(Date.now() - range.ms));
+      if (range.from > 0) query.set('since', String(range.from));
+      if (range.to !== null) query.set('until', String(range.to));
       if (backend) query.set('backend', backend);
       try {
         const response = await getAnalytics(query, controller.signal);
@@ -24,8 +25,8 @@ export function useWindowAnalytics(range: RangePreset, backend?: string) {
       } finally { inFlight = false; }
     };
     void load();
-    const timer = setInterval(load, 15000);
-    return () => { stopped = true; controller.abort(); clearInterval(timer); };
-  }, [range.ms, backend, scope]);
+    const timer = range.to === null ? setInterval(load, 15000) : null;
+    return () => { stopped = true; controller.abort(); if (timer) clearInterval(timer); };
+  }, [range.from, range.to, backend, scope]);
   return { data: result.scope === scope ? result.data : null, error: result.scope === scope ? result.error : '', retry: () => setRound((v) => v + 1) };
 }

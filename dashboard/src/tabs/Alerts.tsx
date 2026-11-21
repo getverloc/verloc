@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { ArrowUpRight, Bell, Radio } from 'lucide-react';
 import { fmtDateTime, type TabProps } from '../api';
-import { rangeSince } from '../window';
+import { rangeSince, rangeUntil } from '../window';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
@@ -32,7 +32,10 @@ export default function Alerts({ state, liveAlerts, range }: TabProps) {
   const rules = state?.alert_rules || [];
   const events = useMemo(() => {
     const since = rangeSince(range);
-    return [...liveAlerts].filter((a) => a.ts >= since).sort((a, b) => b.ts - a.ts);
+    const until = rangeUntil(range);
+    return [...liveAlerts]
+      .filter((a) => a.ts >= since && (until === null || a.ts <= until))
+      .sort((a, b) => b.ts - a.ts);
   }, [liveAlerts, range]);
 
   const lastByRule = useMemo(() => {

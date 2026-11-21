@@ -19,8 +19,10 @@ import {
   TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
-import { getState, getSeriesSince, getAlerts, getKeyEvents, connectLive, logout, RANGE_PRESETS, fmtMs, fmtMoney, fmtInt, fmtTokens, type State, type SeriesPoint, type RangePreset, type AlertEvent, type KeyEvent, type TabProps } from './api';
-import { rollupSeries, rangeSince, fmtSpan } from './window';
+import { getState, getSeriesRange, getAlerts, getKeyEvents, connectLive, logout, fmtMs, fmtMoney, fmtInt, fmtTokens, type State, type SeriesPoint, type RangePreset, type AlertEvent, type KeyEvent, type TabProps } from './api';
+import { rollupSeries, fmtSpan } from './window';
+import { readRange, writeRange } from './time-range';
+import { DateRangePicker } from './components/DateRangePicker';
 import Overview from './tabs/Overview';
 import Requests from './tabs/Requests';
 import Backends from './tabs/Backends';
@@ -78,7 +80,7 @@ const NAV_GROUPS: { label: string; keys: TabKey[] }[] = [
 ];
 
 function locationTab(): TabKey { const value = new URLSearchParams(location.search).get('tab'); return TABS.find((t) => t.key === value)?.key || 'overview'; }
-function locationRange(): RangePreset { const value = new URLSearchParams(location.search).get('range'); return RANGE_PRESETS.find((r) => r.key === value) || RANGE_PRESETS[1]; }
+function locationRange(): RangePreset { return readRange(location.search); }
 const EMPTY_SERIES: SeriesPoint[] = [];
 
 export default function App() { return <Auth><Gateway /></Auth>; }
@@ -104,7 +106,7 @@ function Gateway() {
     return () => window.removeEventListener('popstate', pop);
   }, []);
   const navigate = (next: TabKey) => { const url = new URL(location.href); url.searchParams.set('tab', next); history.pushState(null, '', url); setTab(next); setNavOpen(false); };
-  const changeRange = (next: RangePreset, anchor: number) => { const url = new URL(location.href); url.searchParams.set('range', next.key); history.pushState(null, '', url); setRange(next); setRangeAnchor(anchor); };
+  const changeRange = (next: RangePreset, anchor = Date.now()) => { const url = new URL(location.href); writeRange(url, next); history.pushState(null, '', url); setRange(next); setRangeAnchor(anchor); };
   useEffect(() => {
     let stopped = false;
     let inFlight = false;
@@ -121,12 +123,12 @@ function Gateway() {
     const controller = new AbortController(); let stopped = false; let inFlight = false;
     const tick = async () => {
       if (inFlight || stopped) return; inFlight = true;
-      try { const response = await getSeriesSince(rangeSince(range), 800, controller.signal); if (!stopped) { setSeries(response || []); setSeriesKey(range.key); setSeriesError(''); } }
+      try { const response = await getSeriesRange(range, 800, controller.signal); if (!stopped) { setSeries(response || []); setSeriesKey(range.key); setSeriesError(''); } }
       catch (e) { if (!stopped) setSeriesError(e instanceof Error ? e.message : 'Historical charts unavailable'); }
       finally { inFlight = false; }
     };
-    void tick(); const timer = setInterval(tick, 10000);
-    return () => { stopped = true; controller.abort(); clearInterval(timer); };
+    void tick(); const timer = range.to === null ? setInterval(tick, 10000) : null;
+    return () => { stopped = true; controller.abort(); if (timer) clearInterval(timer); };
   }, [range, seriesNonce]);
   useEffect(() => {
     let stopped = false;
@@ -254,9 +256,7 @@ function Gateway() {
                 <div className="flex items-center gap-2 text-[11px] text-edge-300"><CalendarRange className="size-3.5 text-edge-500" aria-hidden="true" />Reporting window <span className="text-edge-600">/</span><span className="text-edge-100">{range.label}</span></div>
                 <div role="status" className="mt-1.5 text-[9px] leading-relaxed text-edge-500">{seriesKey !== range.key ? 'Loading historical snapshots…' : !viewSeries.length ? 'No historical snapshots in this window' : `${fmtMoney(roll.cost)} known spend · ${fmtInt(roll.requests)} requests · ${fmtTokens(roll.tokIn + roll.tokOut)} tokens · ${fmtSpan(roll.from, roll.to)}`}</div>
               </div>
-              <div className="window-presets" role="group" aria-label="Reporting window">
-                {RANGE_PRESETS.map((preset) => <Button key={preset.key} variant={range.key === preset.key ? 'secondary' : 'ghost'} size="xs" aria-pressed={range.key === preset.key} className={range.key === preset.key ? 'bg-primary/10 text-primary' : 'text-edge-400'} onClick={() => changeRange(preset, Date.now())}>{preset.label}</Button>)}
-              </div>
+              <DateRangePicker range={range} onChange={(next) => changeRange(next, Date.now())} />
             </div>
           )}
           <div className="space-y-5">

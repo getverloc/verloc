@@ -281,6 +281,15 @@ func (s *Server) handleDashState(w http.ResponseWriter, r *http.Request) {
 // handleDashSeries serves historical deltas from SQLite.
 func (s *Server) handleDashSeries(w http.ResponseWriter, r *http.Request) {
 	since := parseSince(r)
+	var until int64
+	if v := r.URL.Query().Get("until"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 || (n > 0 && n < since) {
+			http.Error(w, "invalid until", http.StatusBadRequest)
+			return
+		}
+		until = n
+	}
 	limit := 500
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 5000 {
@@ -292,7 +301,7 @@ func (s *Server) handleDashSeries(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("[]"))
 		return
 	}
-	raw, gzipped, err := s.store.SeriesSinceEncoded(r.Context(), since, limit, acceptsGzip(r))
+	raw, gzipped, err := s.store.SeriesRangeEncoded(r.Context(), since, until, limit, acceptsGzip(r))
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return

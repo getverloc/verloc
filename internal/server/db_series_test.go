@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -70,5 +71,37 @@ func TestSeriesSinceEmptyIsArray(t *testing.T) {
 	}
 	if rows == nil {
 		t.Fatal("empty window must be an empty slice, not nil")
+	}
+}
+
+func TestSeriesRangeEncodedRespectsUntilBound(t *testing.T) {
+	s := testKeyEventStore(t)
+	base := int64(1_800_000_000_000)
+	for i := 0; i < 6; i++ {
+		d := &Delta{
+			TS:       base + int64(i)*60_000,
+			Requests: 1,
+			Cost:     0.1,
+			MS:       1000,
+			Models:   map[string]deltaModel{"m/a": {Requests: 1, Cost: 0.1}},
+			Backends: map[string]deltaBackend{"p": {Requests: 1, Cost: 0.1}},
+		}
+		if err := s.InsertDelta(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, gz, err := s.SeriesRangeEncoded(context.Background(), base+60_000, base+240_000, 100, false)
+	if err != nil || gz {
+		t.Fatalf("SeriesRangeEncoded=(%v, %v)", gz, err)
+	}
+	var rows []SeriesRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("rows=%d want 4", len(rows))
+	}
+	if rows[0].TS != base+60_000 || rows[len(rows)-1].TS != base+240_000 {
+		t.Fatalf("bounds=[%d..%d] want [%d..%d]", rows[0].TS, rows[len(rows)-1].TS, base+60_000, base+240_000)
 	}
 }

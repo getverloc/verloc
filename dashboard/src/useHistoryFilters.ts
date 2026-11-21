@@ -15,6 +15,9 @@ export function useHistoryFilters(range: RangePreset, rangeAnchor: number) {
     for (const [key, value] of Object.entries(filters)) { if (value) url.searchParams.set(key, value); else url.searchParams.delete(key); }
     history.replaceState(null, '', url);
   }, [filters]);
-  const params = useMemo(() => buildHistoryParams(filters, range.ms, Math.max(anchor, rangeAnchor)), [filters, range.ms, anchor, rangeAnchor]);
+  const params = useMemo(
+    () => buildHistoryParams(filters, range.ms, Math.max(anchor, rangeAnchor), range.from, range.to),
+    [filters, range.ms, range.from, range.to, anchor, rangeAnchor],
+  );
   return { filters, setFilters, params, refreshWindow: () => setAnchor(Date.now()) };
 }
