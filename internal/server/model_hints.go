@@ -84,11 +84,55 @@ func operationsForKind(kind string) []string {
 	return nil
 }
 
+func isBlockedAudioOrVideoKind(raw string) bool {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	for _, tok := range []string{"audio", "video", "speech", "tts", "stt", "asr", "transcri", "voice", "music", "rerank", "moderation"} {
+		if strings.Contains(s, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// inferKindFromUpstreamID conservatively infers embeddings or image generation
+// only from unambiguous model-ID naming patterns when neither upstream nor
+// catalog metadata supplies a type/modality field. Audio/video/speech/rerank
+// patterns are never guessed as chat/images/embeddings.
+func inferKindFromUpstreamID(id string) string {
+	s := strings.ToLower(strings.TrimSpace(id))
+	if s == "" || isBlockedAudioOrVideoKind(s) {
+		return ""
+	}
+	for _, tok := range []string{
+		"text-embedding", "embedding-", "-embedding", "/embedding",
+		"embed-", "-embed", "/embed", "bge-", "/bge", "e5-", "/e5",
+		"jina-embeddings", "voyage-", "nv-embed", "nomic-embed", "mxbai-embed",
+	} {
+		if strings.Contains(s, tok) {
+			return "embeddings"
+		}
+	}
+	for _, tok := range []string{
+		"dall-e", "gpt-image", "flux-", "flux.", "/flux", "sdxl",
+		"stable-diffusion", "imagen-", "/imagen", "seedream", "recraft",
+		"ideogram", "playground-v2", "kolors", "hunyuan-image", "qwen-image",
+	} {
+		if strings.Contains(s, tok) {
+			return "images"
+		}
+	}
+	return ""
+}
+
 // hintKind prefers explicit provider type/mode evidence, then OpenRouter's
 // modality string, and only then a modality shape that cannot be a chat model.
 func hintKind(m map[string]json.RawMessage) string {
-	for _, key := range []string{"type", "mode"} {
-		if kind := modelKind(strField(m, key)); kind != "" {
+	for _, key := range []string{"type", "mode", "task_type", "pipeline_tag", "category"} {
+		raw := strField(m, key)
+		if raw == "model" || raw == "models" {
+			continue
+		}
+		if kind := modelKind(raw); kind != "" {
 			return kind
 		}
 	}
@@ -109,13 +153,56 @@ func hintKind(m map[string]json.RawMessage) string {
 	if modalities == nil && arch != nil {
 		modalities = map[string]json.RawMessage{"input": arch["input_modalities"], "output": arch["output_modalities"]}
 	}
-	var output []string
+	var input, output []string
+	_ = json.Unmarshal(modalities["input"], &input)
 	_ = json.Unmarshal(modalities["output"], &output)
 	if len(output) == 1 && output[0] == "image" {
 		return "images"
 	}
+	if len(output) == 1 && (output[0] == "embedding" || output[0] == "embeddings" || output[0] == "vector") {
+		return "embeddings"
+	}
 	if slices.Contains(output, "video") || slices.Contains(output, "audio") {
 		return "unsupported"
+	}
+	if slices.Contains(output, "text") && (len(input) == 0 || slices.Contains(input, "text")) {
+		return "chat"
+	}
+	var endpoints []string
+	if json.Unmarshal(m["endpoints"], &endpoints) == nil || json.Unmarshal(m["supported_endpoints"], &endpoints) == nil || json.Unmarshal(m["supported_generation_methods"], &endpoints) == nil {
+		hasChat, hasEmbed, hasImage := false, false, false
+		for _, ep := range endpoints {
+			el := strings.ToLower(ep)
+			switch {
+			case strings.Contains(el, "chat") || strings.Contains(el, "generatecontent") || strings.Contains(el, "messages") || strings.Contains(el, "responses"):
+				hasChat = true
+			case strings.Contains(el, "embed"):
+				hasEmbed = true
+			case strings.Contains(el, "image"):
+				hasImage = true
+			}
+		}
+		if hasEmbed && !hasChat && !hasImage {
+			return "embeddings"
+		}
+		if hasImage && !hasChat && !hasEmbed {
+			return "images"
+		}
+		if hasChat && !hasEmbed && !hasImage {
+			return "chat"
+		}
+	}
+	if string(m["reasoning"]) == "true" || string(m["tool_call"]) == "true" || string(m["structured_output"]) == "true" {
+		return "chat"
+	}
+	var params []string
+	if json.Unmarshal(m["supported_parameters"], &params) == nil {
+		for _, p := range params {
+			switch p {
+			case "tools", "tool_choice", "reasoning", "include_reasoning", "response_format", "structured_outputs", "max_tokens", "max_completion_tokens", "temperature", "top_p":
+				return "chat"
+			}
+		}
 	}
 	return ""
 }
@@ -322,18 +409,75 @@ func consensusHints(entries []*catalogEntry) modelHint {
 	return h
 }
 
+func stripHintModifiers(id string) string {
+	n := normHintID(id)
+	// Strip date/version snapshots or provider-specific quantization suffixes
+	// strictly when they are not `:free` (free vs paid pricing must never mix).
+	if strings.HasSuffix(n, ":free") {
+		return ""
+	}
+	if i := strings.Index(n, ":"); i > 0 {
+		return n[:i]
+	}
+	for _, suffix := range []string{"-instruct", "-it", "-fp8", "-bf16", "-int4", "-int8", "-awq", "-gptq"} {
+		if strings.HasSuffix(n, suffix) && len(n) > len(suffix)+2 {
+			return strings.TrimSuffix(n, suffix)
+		}
+	}
+	return ""
+}
+
 func (c catalogIndex) lookup(upstream string) *catalogEntry {
 	id := normHintID(upstream)
 	if e := c.byID[id]; e != nil {
 		return e
 	}
+	// Cloudflare Workers AI prefixes upstream IDs with "@cf/" or "@hf/" before
+	// "<org>/<model>" (for example "@cf/meta/llama-3.1-8b-instruct"). Strip the
+	// leading vendor tag so standard "<org>/<model>" catalog entries can match.
+	if strings.HasPrefix(id, "@cf/") || strings.HasPrefix(id, "@hf/") {
+		trimmed := id[4:]
+		if e := c.byID[trimmed]; e != nil {
+			return e
+		}
+		if base := stripHintModifiers(trimmed); base != "" {
+			if e := c.byID[base]; e != nil {
+				return e
+			}
+		}
+	}
+	if base := stripHintModifiers(id); base != "" {
+		if e := c.byID[base]; e != nil {
+			return e
+		}
+	}
 	// Qualified identities must never cross organizations. Bare names may
 	// match a unique catalog identity, but ambiguous tails are not evidence.
 	if strings.Contains(id, "/") {
+		// Allow matching a bare catalog entry only when that entry has no
+		// organization prefix of its own (e.g., LiteLLM keys "gpt-4o" while
+		// upstream is "openai/gpt-4o") and the tail is unambiguous. Never
+		// match across different organization prefixes.
+		if !strings.HasSuffix(id, ":free") {
+			tail := tailHintID(id)
+			if e := c.byID[tail]; e != nil && !strings.Contains(e.ID, "/") && len(c.tails[tail]) == 1 {
+				return e
+			}
+			if baseTail := stripHintModifiers(tail); baseTail != "" {
+				if e := c.byID[baseTail]; e != nil && !strings.Contains(e.ID, "/") && len(c.tails[baseTail]) == 1 {
+					return e
+				}
+			}
+		}
 		return nil
 	}
 	if matches := c.tails[id]; len(matches) == 1 {
 		return matches[0]
+	}
+	if base := stripHintModifiers(id); base != "" {
+		if matches := c.tails[base]; len(matches) == 1 {
+			return matches[0]
+		}
 	}
 	return nil
 }
@@ -582,8 +726,8 @@ func decodeCatalogObject(m map[string]json.RawMessage, id, source string) (catal
 	if h.OwnedBy == "" {
 		h.OwnedBy = strField(m, "owner")
 	}
-	h.ContextWindow = positiveLimit(m, "context_window", "context_length")
-	h.MaxTokens = positiveLimit(m, "max_output_tokens", "max_completion_tokens", "max_tokens")
+	h.ContextWindow = positiveLimit(m, "context_window", "context_length", "max_input_tokens", "max_context_length", "input_token_limit", "num_ctx", "max_sequence_length", "max_model_len")
+	h.MaxTokens = positiveLimit(m, "max_output_tokens", "max_completion_tokens", "max_tokens", "output_token_limit", "max_generated_tokens")
 	limit := objectField(m, "limit")
 	if h.ContextWindow == 0 {
 		h.ContextWindow = positiveLimit(limit, "context")
@@ -599,9 +743,9 @@ func decodeCatalogObject(m map[string]json.RawMessage, id, source string) (catal
 		h.MaxTokens = positiveLimit(tp, "max_completion_tokens")
 	}
 	prices := objectField(m, "pricing")
-	h.PricingInput, h.inputKnown = priceField(prices, 1e6, "input", "prompt")
-	h.PricingOutput, h.outputKnown = priceField(prices, 1e6, "output", "completion")
-	h.PricingCache, h.cacheKnown = priceField(prices, 1e6, "input_cache_read", "cache_read")
+	h.PricingInput, h.inputKnown = priceField(prices, 1e6, "input", "prompt", "input_tokens", "prompt_tokens")
+	h.PricingOutput, h.outputKnown = priceField(prices, 1e6, "output", "completion", "output_tokens", "completion_tokens")
+	h.PricingCache, h.cacheKnown = priceField(prices, 1e6, "input_cache_read", "cache_read", "cached_input")
 	cost := objectField(m, "cost")
 	if n, ok := priceField(cost, 1, "input"); ok {
 		h.PricingInput, h.inputKnown = n, true
@@ -1040,10 +1184,80 @@ func nonemptyHint(h *modelHint) *modelHint {
 	return h
 }
 
+func embeddedCatalogIndex() catalogIndex {
+	catalog.mu.RLock()
+	embedded := make([]modelInfo, len(catalog.embedded))
+	copy(embedded, catalog.embedded)
+	catalog.mu.RUnlock()
+
+	entries := make([]catalogEntry, 0, len(embedded))
+	for _, m := range embedded {
+		uid := strings.TrimSpace(m.Upstream)
+		if uid == "" {
+			continue
+		}
+		kind := modelKind(m.Type)
+		ops := m.Operations
+		if len(ops) == 0 {
+			ops = operationsForKind(kind)
+		}
+		h := modelHint{
+			Name:          m.Name,
+			Description:   m.Description,
+			OwnedBy:       m.OwnedBy,
+			Tags:          slices.Clone(m.Tags),
+			ContextWindow: m.ContextWindow,
+			MaxTokens:     m.MaxTokens,
+			Source:        "embedded",
+			Type:          kind,
+			Operations:    ops,
+			ImagePrices:   m.ImagePrices,
+			Modalities:    m.Modalities,
+			Attachment:    m.Attachment,
+			Reasoning:     m.Reasoning,
+			Temperature:   m.Temperature,
+		}
+		if m.Pricing.Prompt != "" {
+			h.PricingInput, h.inputKnown = m.PricingPerMillion.Input, true
+		}
+		if m.Pricing.Completion != "" {
+			h.PricingOutput, h.outputKnown = m.PricingPerMillion.Output, true
+		}
+		if m.Pricing.InputCacheRead != "" {
+			h.PricingCache, h.cacheKnown = m.PricingPerMillion.CacheRead, true
+		}
+		if m.Pricing.Image != "" {
+			if n, err := strconv.ParseFloat(m.Pricing.Image, 64); err == nil && n >= 0 && !math.IsNaN(n) && !math.IsInf(n, 0) {
+				h.PricingImage = &n
+			}
+		}
+		h.PricingKnown = hintPricingKnown(&h)
+		entries = append(entries, catalogEntry{ID: uid, modelHint: h})
+	}
+	return indexCatalog(entries)
+}
+
 func mergeDiscoveredModelHint(native, catalog *modelHint) *modelHint {
 	h := &modelHint{}
 	fillModelHint(h, native)
 	fillModelHint(h, catalog)
+	return nonemptyHint(h)
+}
+
+func applyFallbackKindInference(upstream string, h *modelHint) *modelHint {
+	if h == nil {
+		if kind := inferKindFromUpstreamID(upstream); kind != "" {
+			return &modelHint{Type: kind, Operations: operationsForKind(kind), Source: "inferred"}
+		}
+		return nil
+	}
+	if h.Type == "" && len(h.Operations) == 0 {
+		if kind := inferKindFromUpstreamID(upstream); kind != "" {
+			h.Type = kind
+			h.Operations = operationsForKind(kind)
+			h.PricingKnown = hintPricingKnown(h)
+		}
+	}
 	return nonemptyHint(h)
 }
 
@@ -1095,6 +1309,7 @@ type hintResolver struct {
 	or      cachedIndex
 	md      cachedIndex
 	litellm cachedIndex
+	embed   catalogIndex
 
 	// fetching marks sources with a refresh already in flight, so N
 	// concurrent callers cannot each launch their own multi-MB fetch.
@@ -1107,6 +1322,7 @@ func newHintResolver() *hintResolver {
 		vercelURL:     defaultVercelURL,
 		openRouterURL: defaultOpenRouterURL,
 		litellmURL:    defaultLiteLLMURL,
+		embed:         embeddedCatalogIndex(),
 	}
 }
 
@@ -1231,10 +1447,12 @@ func (h *hintResolver) hintsFor(ctx context.Context, cfg *Config, upstreams []st
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	idxs := []catalogIndex{h.vercel.idx, h.or.idx, h.md.idx, h.litellm.idx}
+	idxs := []catalogIndex{h.vercel.idx, h.or.idx, h.md.idx, h.litellm.idx, h.embed}
 	out := make(map[string]*modelHint, len(upstreams))
 	for _, u := range upstreams {
-		if hint := mergeHint(u, idxs); hint != nil {
+		hint := mergeHint(u, idxs)
+		hint = applyFallbackKindInference(u, hint)
+		if hint != nil {
 			out[u] = hint
 		}
 	}

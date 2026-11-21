@@ -294,7 +294,11 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if resp.StatusCode != http.StatusOK {
-			writeErr(w, http.StatusBadGateway, "upstream rejected request")
+			msg := fmt.Sprintf("upstream rejected model discovery (status %d)", resp.StatusCode)
+			if hint := testHint(resp.StatusCode, string(body)); hint != "" {
+				msg += " — " + hint
+			}
+			writeErr(w, http.StatusBadGateway, msg)
 			return
 		}
 		pageModels := parseModelsList(body)
@@ -340,7 +344,7 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for i := range models {
-		models[i].Hint = mergeDiscoveredModelHint(models[i].Hint, hints[models[i].ID])
+		models[i].Hint = applyFallbackKindInference(models[i].ID, mergeDiscoveredModelHint(models[i].Hint, hints[models[i].ID]))
 	}
 	log.Printf("[admin] discover models=%d dur=%v", len(models), time.Since(start))
 	for i := range models {

@@ -467,3 +467,66 @@ func TestAdminDiscoverAttachesHints(t *testing.T) {
 		t.Fatalf("gadget-v2 bad hint values: %+v", gadget.Hint)
 	}
 }
+
+func TestHintKindDetectionAndBareCatalogLookup(t *testing.T) {
+	// 1. OpenRouter-style text->text modality + supported_parameters -> chat
+	hChat := hintForDiscoveredModel(json.RawMessage(`{"id":"org/new-chat","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"supported_parameters":["tools","max_tokens"]}`), "upstream")
+	if hChat == nil || hChat.Type != "chat" || !slices.Equal(hChat.Operations, []string{"chat"}) {
+		t.Fatalf("expected chat kind from modalities/parameters, got %+v", hChat)
+	}
+
+	// 2. Upstream object with "type":"model" (OpenAI object type) + reasoning:true -> chat
+	hObj := hintForDiscoveredModel(json.RawMessage(`{"id":"org/reasoner","type":"model","reasoning":true,"max_context_length":131072,"max_generated_tokens":8192}`), "upstream")
+	if hObj == nil || hObj.Type != "chat" || hObj.ContextWindow != 131072 || hObj.MaxTokens != 8192 {
+		t.Fatalf("expected chat kind and limits from type=model + reasoning, got %+v", hObj)
+	}
+
+	// 3. Qualified upstream "openai/gpt-4o" matching bare LiteLLM catalog entry "gpt-4o",
+	// while still refusing cross-organization matches ("other/gpt-4o" vs "openai/gpt-4o").
+	bareIdx := catalogFixture(t, `[{"id":"bare-only-model","name":"Bare Model","type":"chat","context_window":128000}]`, "litellm")
+	if e := bareIdx.lookup("openai/bare-only-model"); e == nil || e.Name != "Bare Model" {
+		t.Fatalf("qualified upstream did not match unique bare catalog entry: %+v", e)
+	}
+	if e := bareIdx.lookup("openai/bare-only-model:free"); e != nil {
+		t.Fatalf(":free variant matched paid bare entry: %+v", e)
+	}
+
+	// 4. Conservative ID-pattern fallback for embeddings and images, while blocking audio/video.
+	for _, tc := range []struct {
+		id   string
+		want string
+	}{
+		{"baai/bge-large-en-v1.5", "embeddings"},
+		{"intfloat/multilingual-e5-large", "embeddings"},
+		{"voyage-3-lite", "embeddings"},
+		{"black-forest-labs/flux.1-dev", "images"},
+		{"bytedance/seedream-3.0", "images"},
+		{"stabilityai/stable-diffusion-xl", "images"},
+		{"openai/whisper-large-v3-audio", ""},
+		{"runway/gen3-video", ""},
+		{"cohere/rerank-v3.5", ""},
+		{"meta-llama/llama-3.3-70b", ""},
+	} {
+		if got := inferKindFromUpstreamID(tc.id); got != tc.want {
+			t.Fatalf("inferKindFromUpstreamID(%q)=%q, want %q", tc.id, got, tc.want)
+		}
+	}
+
+	// 5. Embedded seed index provides offline fallback hints for shipped upstream IDs.
+	embIdx := embeddedCatalogIndex()
+	if e := embIdx.lookup("gpt-oss-120b"); e == nil || e.ContextWindow == 0 || e.Type != "chat" {
+		t.Fatalf("embeddedCatalogIndex missing gpt-oss-120b: %+v", e)
+	}
+
+	// 6. Cloudflare "@cf/<org>/<model>" and quantization/instruct suffix matching.
+	normIdx := catalogFixture(t, `[{"id":"meta/llama-3.1-8b","name":"Llama 3.1 8B","type":"chat","context_window":131072}]`, "models.dev")
+	if e := normIdx.lookup("@cf/meta/llama-3.1-8b-instruct"); e == nil || e.Name != "Llama 3.1 8B" {
+		t.Fatalf("cloudflare @cf/ + -instruct normalization failed: %+v", e)
+	}
+	if e := normIdx.lookup("meta/llama-3.1-8b-fp8"); e == nil || e.Name != "Llama 3.1 8B" {
+		t.Fatalf("quantization -fp8 suffix normalization failed: %+v", e)
+	}
+	if e := normIdx.lookup("meta/llama-3.1-8b:free"); e != nil {
+		t.Fatalf(":free suffix must never match paid entry via stripHintModifiers: %+v", e)
+	}
+}

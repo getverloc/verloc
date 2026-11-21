@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { emptyMeta, fillMetaGaps, fillModelDraftGaps, findCatalogMatch, metaFromMatch } from '../src/components/admin/shared.ts';
+import { emptyMeta, fillMetaGaps, fillModelDraftGaps, findCatalogMatch, metaFromMatch, PROVIDER_PRESETS, uniquePrefix } from '../src/components/admin/shared.ts';
 
 test('catalog lookup fills gaps without replacing manual values', () => {
   const hint = { ...emptyMeta('model'), dn: 'Catalog', pi: '2', po: '4', pc: '1', piImage: '0.01', ctx: '32000', kind: 'images', ops: ['images'], attachment: true, modalities: { input: ['image'], output: ['image'] } };
@@ -39,4 +39,31 @@ test('conflicting image variants and free variants are not catalog aliases', () 
   const base = { backend: 'a', upstream: 'model:free', image_prices: { variants: [{ size: '1024x1024', quality: '', price: '0' }] } };
   assert.equal(findCatalogMatch('model', [base], 'a'), null);
   assert.equal(findCatalogMatch('model:free', [base, { ...base, image_prices: { variants: [{ size: '1024x1024', quality: '', price: '1' }] } }], 'a'), null);
+});
+
+test('provider presets supply valid endpoints and protocol flags', () => {
+  assert.ok(PROVIDER_PRESETS.length >= 10);
+  const ids = new Set();
+  for (const preset of PROVIDER_PRESETS) {
+    assert.ok(preset.id && !ids.has(preset.id));
+    ids.add(preset.id);
+    assert.ok(preset.base_url.startsWith('https://') || preset.base_url.startsWith('http://'));
+    assert.ok(preset.api_format === 'openai' || preset.api_format === 'systemone');
+  }
+  const ts = PROVIDER_PRESETS.find((p) => p.id === 'typesafe');
+  assert.equal(ts?.api_format, 'systemone');
+  const oc = PROVIDER_PRESETS.find((p) => p.id === 'opencode');
+  assert.equal(oc?.no_auth, true);
+  assert.equal(oc?.synthesize_cli_headers, true);
+});
+
+test('uniquePrefix reuses an existing provider prefix when adding more models to that provider', () => {
+  const providers = [{ name: 'nvidia' }, { name: 'novita' }];
+  const models = [
+    { id: 'nv/deepseek-ai/deepseek-v4', backend: 'nvidia' },
+    { id: 'no/meta-llama/llama-3', backend: 'novita' },
+  ];
+  assert.equal(uniquePrefix('nvidia', providers, models), 'nv');
+  assert.equal(uniquePrefix('novita', providers, models), 'no');
+  assert.equal(uniquePrefix('newprov', providers, models), 'ne');
 });

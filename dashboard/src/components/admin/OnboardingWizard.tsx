@@ -12,8 +12,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table';
 import { Textarea } from '../ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
-import { ArrowRight, Check, FlaskConical, Search } from 'lucide-react';
-import { emptyMeta, fillMetaGaps, findCatalogMatch, firstProbeKey, metaFromHint, metaFromMatch, parseKeyLine, suggestVerlocId, uniquePrefix, type PendingConfirm, type WizMeta } from './shared';
+import { ArrowRight, Check, FlaskConical, Search, Sparkles } from 'lucide-react';
+import { emptyMeta, fillMetaGaps, findCatalogMatch, firstProbeKey, metaFromHint, metaFromMatch, parseKeyLine, PROVIDER_PRESETS, suggestVerlocId, uniquePrefix, type PendingConfirm, type ProviderPreset, type WizMeta } from './shared';
+import { ModelCapabilities } from './ModelCapabilities';
 
 type OnboardingWizardProps = {
   open: boolean;
@@ -51,7 +52,59 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
   const [wMeta, setWMeta] = useState<Record<string, WizMeta>>({});
   const [wTests, setWTests] = useState<Record<string, TestResult>>({});
   const [wTesting, setWTesting] = useState<Record<string, boolean>>({});
+  const [wLookupBusy, setWLookupBusy] = useState<Record<string, boolean>>({});
+  const [wBatchDetectBusy, setWBatchDetectBusy] = useState(false);
+  const [wBatchTestBusy, setWBatchTestBusy] = useState(false);
+  const [wPreset, setWPreset] = useState('');
   const [wSaving, setWSaving] = useState(false);
+
+  const resetWizardState = () => {
+    setWizStep(1);
+    setWUseExisting('');
+    setWPreset('');
+    setWName('');
+    setWBase('');
+    setWAPIFormat('openai');
+    setWKeysText('');
+    setWNoAuth(false);
+    setWAllowPrivate(false);
+    setWSynth(false);
+    setWStrip(true);
+    setWCooldown('30');
+    setWCap('');
+    setWTimeout('');
+    setWAuthH('');
+    setWAuthF('');
+    setWDiscovered([]);
+    setWFetchErr(null);
+    setWFilter('');
+    setWManual('');
+    setWSel({});
+    setWIds({});
+    setWMeta({});
+    setWTests({});
+    setWTesting({});
+    setWLookupBusy({});
+  };
+
+  const applyPreset = (preset: ProviderPreset) => {
+    setWPreset(preset.id);
+    setWUseExisting('');
+    setWName(preset.name);
+    setWBase(preset.base_url);
+    setWAPIFormat(preset.api_format);
+    setWNoAuth(!!preset.no_auth);
+    setWSynth(!!preset.synthesize_cli_headers);
+    setWStrip(preset.strip_reasoning_content !== false);
+    setWAllowPrivate(!!preset.allow_private_upstreams);
+    setWCap(preset.max_tokens || '');
+    setWDiscovered([]);
+    setWSel({});
+    setWIds({});
+    setWMeta({});
+    setWTests({});
+    setWFetchErr(null);
+  };
 
   const [previousOpen, setPreviousOpen] = useState(wizOpen);
   if (wizOpen !== previousOpen) {
@@ -90,14 +143,27 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
   };
 
   const wizLookupRow = async (upstream: string) => {
-    setWFetchBusy(true);
+    setWLookupBusy((p) => ({ ...p, [upstream]: true }));
+    setWFetchErr(null);
     try {
       const result = await lookupModelHints([upstream]);
-      if (result.hints[upstream]) wizEnsureRow(upstream, wizProviderName, result.hints[upstream]);
+      const hint = result.hints[upstream];
+      if (hint) {
+        wizEnsureRow(upstream, wizProviderName, hint);
+        toast.success(`Auto-detected metadata for ${upstream} (${hint.source || 'catalog'})`);
+      } else {
+        const local = findCatalogMatch(upstream, models, wizProviderName);
+        if (local) {
+          wizEnsureRow(upstream, wizProviderName);
+          toast.success(`Filled metadata from local catalog match for ${upstream}`);
+        } else {
+          toast.info(`No public catalog metadata found for ${upstream}`);
+        }
+      }
     } catch (error) {
       setWFetchErr(error instanceof Error ? error.message : 'Metadata lookup failed');
     } finally {
-      setWFetchBusy(false);
+      setWLookupBusy((p) => ({ ...p, [upstream]: false }));
     }
   };
 
@@ -115,13 +181,15 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
     setWFetchBusy(true);
     try {
       const res = await discoverUpstreamModels(wizProbeConn());
-      setWDiscovered(res.models || []);
-      const sel: Record<string, boolean> = {};
-      (res.models || []).forEach((m) => {
-        sel[m.id] = wSel[m.id] ?? (!m.hint?.type || ['chat', 'images', 'embeddings', 'systemone'].includes(m.hint.type));
+      const discovered = res.models || [];
+      setWDiscovered(discovered);
+      const nextSel: Record<string, boolean> = {};
+      discovered.forEach((m) => {
+        const autoSelect = !m.hint?.type || ['chat', 'images', 'embeddings', 'systemone'].includes(m.hint.type);
+        nextSel[m.id] = wSel[m.id] ?? autoSelect;
         wizEnsureRow(m.id, name || 'xx', m.hint);
       });
-      setWSel((prev) => ({ ...sel, ...prev }));
+      setWSel(nextSel);
       setWizStep(2);
     } catch (e) {
       setWFetchErr((e as Error).message);
@@ -173,6 +241,68 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
       return;
     }
     run();
+  };
+
+  const wizAutoDetectAll = async () => {
+    const rows = wizSelectedUpstreams;
+    if (rows.length === 0) return;
+    setWBatchDetectBusy(true);
+    setWFetchErr(null);
+    try {
+      const result = await lookupModelHints(rows.slice(0, 256));
+      let filled = 0;
+      for (const u of rows) {
+        const hint = result.hints[u];
+        if (hint) {
+          wizEnsureRow(u, wizProviderName || 'xx', hint);
+          filled++;
+        } else if (findCatalogMatch(u, models, wizProviderName)) {
+          wizEnsureRow(u, wizProviderName || 'xx');
+          filled++;
+        }
+      }
+      toast.success(`Auto-detected metadata for ${filled} of ${rows.length} selected model${rows.length === 1 ? '' : 's'}`);
+    } catch (error) {
+      setWFetchErr(error instanceof Error ? error.message : 'Batch metadata lookup failed');
+    } finally {
+      setWBatchDetectBusy(false);
+    }
+  };
+
+  const wizTestAllNonImage = async () => {
+    const candidates = wizSelectedUpstreams.filter((u) => {
+      const kind = (wMeta[u] || emptyMeta(u)).kind;
+      return kind === 'chat' || kind === 'embeddings' || kind === 'systemone';
+    });
+    if (candidates.length === 0) {
+      toast.info('No chat or embedding models selected to batch-test (image models require individual spend confirmation).');
+      return;
+    }
+    setWBatchTestBusy(true);
+    setWFetchErr(null);
+    const conn = wizProbeConn();
+    try {
+      await Promise.all(
+        candidates.map(async (upstream) => {
+          const meta = wMeta[upstream] || emptyMeta(upstream);
+          const operation = meta.kind === 'embeddings' ? 'embeddings' : 'chat';
+          setWTesting((p) => ({ ...p, [upstream]: true }));
+          try {
+            const res = await testUpstreamModel({ ...conn, upstream, operation, confirm_image_spend: false });
+            setWTests((p) => ({ ...p, [upstream]: res }));
+          } catch (e) {
+            setWTests((p) => ({
+              ...p,
+              [upstream]: { ok: false, status: 0, latency_ms: 0, error: (e as Error).message },
+            }));
+          } finally {
+            setWTesting((p) => ({ ...p, [upstream]: false }));
+          }
+        }),
+      );
+    } finally {
+      setWBatchTestBusy(false);
+    }
   };
 
   const doWizBulkSave = async () => {
@@ -264,6 +394,28 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
         setWFetchErr(`verloc id missing for ${u}`);
         return;
       }
+      const mt = wMeta[u] || emptyMeta(u);
+      for (const [label, raw] of [['In $/1M', mt.pi], ['Out $/1M', mt.po], ['Cache $/1M', mt.pc], ['Image $/img', mt.piImage]] as const) {
+        if (raw.trim() && (!Number.isFinite(Number(raw)) || Number(raw) < 0)) {
+          setWFetchErr(`${id}: ${label} must be a finite, non-negative USD number`);
+          setWizStep(3);
+          return;
+        }
+      }
+      for (const [label, raw] of [['Context tokens', mt.ctx], ['Max out', mt.mx]] as const) {
+        if (raw.trim() && (!Number.isInteger(Number(raw)) || Number(raw) < 0 || Number(raw) > 16_777_216)) {
+          setWFetchErr(`${id}: ${label} must be an integer between 0 and 16,777,216`);
+          setWizStep(3);
+          return;
+        }
+      }
+    }
+    const trimmedIds = rows.map((u) => (wIds[u] || '').trim());
+    const duplicateBatchId = trimmedIds.find((id, idx) => trimmedIds.indexOf(id) !== idx);
+    if (duplicateBatchId) {
+      setWFetchErr(`Duplicate Verloc model ID in batch: ${duplicateBatchId}. Give each selected upstream a unique Verloc ID.`);
+      setWizStep(2);
+      return;
     }
     const collisions = rows.filter((u) => models.some((m) => m.id === wIds[u]?.trim()));
     const providerCollision = !wUseExisting && providers.some((p) => p.name === wName.trim());
@@ -325,7 +477,20 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
             <div className="space-y-5">
               <Field>
                 <FieldLabel htmlFor="wiz-provider">Provider</FieldLabel>
-                <Select value={wUseExisting} onValueChange={(v) => { setWUseExisting(v === '__new' ? '' : (v ?? '')); setWFetchErr(null); }}>
+                <Select
+                  value={wUseExisting}
+                  onValueChange={(v) => {
+                    const nextExisting = v === '__new' ? '' : (v ?? '');
+                    setWUseExisting(nextExisting);
+                    if (nextExisting) setWPreset('');
+                    setWDiscovered([]);
+                    setWSel({});
+                    setWIds({});
+                    setWMeta({});
+                    setWTests({});
+                    setWFetchErr(null);
+                  }}
+                >
                   <SelectTrigger id="wiz-provider" aria-label="Existing provider or new provider">
                     <SelectValue placeholder="+ new provider…" />
                   </SelectTrigger>
@@ -341,9 +506,32 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
 
               {!wUseExisting && (
                 <>
-                  <div className="flex items-center gap-3 border-b border-edge-700 pb-2 text-[10px] uppercase tracking-[0.14em]">
-                    <span className="text-primary">01 / Endpoint</span><span className="text-muted-foreground">Provider connection</span>
+                  <div className="flex items-center justify-between gap-3 border-b border-edge-700 pb-2 text-[10px] uppercase tracking-[0.14em]">
+                    <div><span className="text-primary">01 / Endpoint</span><span className="ml-3 text-muted-foreground">Provider connection</span></div>
                   </div>
+
+                  <Field>
+                    <FieldLabel htmlFor="wiz-preset">Quick-fill provider preset (optional)</FieldLabel>
+                    <Select
+                      value={wPreset}
+                      onValueChange={(v) => {
+                        const found = PROVIDER_PRESETS.find((p) => p.id === v);
+                        if (found) applyPreset(found);
+                      }}
+                    >
+                      <SelectTrigger id="wiz-preset" aria-label="Provider preset">
+                        <SelectValue placeholder="Choose a provider preset to prefill URL & protocol flags…">
+                          {PROVIDER_PRESETS.find((p) => p.id === wPreset)?.label}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {PROVIDER_PRESETS.map((p) => (
+                          <SelectItem key={p.id} value={p.id}>{p.label} · {p.base_url}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FieldDescription>Prefills recommended endpoint, API format, and reasoning/header flags. Every field remains editable below.</FieldDescription>
+                  </Field>
 
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <Field>
@@ -445,6 +633,9 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
               </div>
 
               <DialogFooter className="border-t border-edge-700 pt-4">
+                  <Button variant="ghost" size="sm" disabled={wFetchBusy} onClick={resetWizardState}>
+                    Reset draft
+                  </Button>
                 <Button
                   variant="outline"
                   disabled={wFetchBusy}
@@ -605,6 +796,31 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
 
           {wizStep === 3 && (
             <div className="space-y-5">
+              {wizSelectedUpstreams.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 border border-edge-700 bg-edge-950 px-4 py-3">
+                  <span className="text-[11px] text-edge-300">
+                    Reviewing <span className="text-primary">{wizSelectedUpstreams.length}</span> staged model{wizSelectedUpstreams.length === 1 ? '' : 's'} for <span className="text-chart-2">{wizProviderName}</span>
+                  </span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      disabled={wBatchDetectBusy || wFetchBusy}
+                      onClick={() => { void wizAutoDetectAll(); }}
+                    >
+                      <Sparkles className="size-3" />{wBatchDetectBusy ? 'Detecting all…' : 'Auto-detect all metadata'}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      disabled={wBatchTestBusy || wFetchBusy}
+                      onClick={() => { void wizTestAllNonImage(); }}
+                    >
+                      <FlaskConical className="size-3" />{wBatchTestBusy ? 'Testing…' : 'Test all chat / embedding'}
+                    </Button>
+                  </div>
+                </div>
+              )}
               {wizSelectedUpstreams.length === 0 && (
                 <p className="text-xs text-muted-foreground">Nothing selected — go back and tick at least one model.</p>
               )}
@@ -630,15 +846,23 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
                           {meta.src !== '' && <span className="text-[10px] text-chart-3">source / {meta.src}</span>}
                         </div>
                       </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        {t && (t.ok
-                          ? <Badge variant="outline" className="border-primary/40 text-primary"><Check className="size-3" />{t.kind === 'images' ? `${t.images_known ? t.images : '?'} image` : t.kind === 'embeddings' ? `${t.dimensions || '?'} dims` : 'reply'} · {t.latency_ms}ms</Badge>
-                          : <Badge variant="outline" className="border-destructive/40 text-destructive">fail · {t.status || 'err'}</Badge>)}
-                        <Button variant="outline" size="xs" disabled={testing} onClick={() => wizTestRow(u)}>
-                          <FlaskConical className="size-3" />{testing ? 'Testing…' : 'Test upstream'}
-                        </Button>
-                        <Button variant="ghost" size="xs" onClick={() => { setWFetchErr(null); setWSel((p) => ({ ...p, [u]: false })); }}>remove</Button>
-                      </div>
+                       <div className="flex flex-wrap items-center gap-2">
+                         {t && (t.ok
+                           ? <Badge variant="outline" className="border-primary/40 text-primary"><Check className="size-3" />{t.kind === 'images' ? `${t.images_known ? t.images : '?'} image` : t.kind === 'embeddings' ? `${t.dimensions || '?'} dims` : 'reply'} · {t.latency_ms}ms</Badge>
+                           : <Badge variant="outline" className="border-destructive/40 text-destructive">fail · {t.status || 'err'}</Badge>)}
+                         <Button
+                           variant="outline"
+                           size="xs"
+                           disabled={!!wLookupBusy[u]}
+                           onClick={() => { void wizLookupRow(u); }}
+                         >
+                           <Sparkles className="size-3" />{wLookupBusy[u] ? 'Detecting…' : 'Auto-detect metadata'}
+                         </Button>
+                         <Button variant="outline" size="xs" disabled={testing} onClick={() => wizTestRow(u)}>
+                           <FlaskConical className="size-3" />{testing ? 'Testing…' : 'Test upstream'}
+                         </Button>
+                         <Button variant="ghost" size="xs" onClick={() => { setWFetchErr(null); setWSel((p) => ({ ...p, [u]: false })); }}>remove</Button>
+                       </div>
                     </div>
                     {meta.kind && !['chat', 'images', 'embeddings', 'systemone'].includes(meta.kind) && (
                       <div className="border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs break-words text-destructive">
@@ -709,6 +933,45 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
                         {meta.imagePrices.variants.length} size/quality price variant{meta.imagePrices.variants.length === 1 ? '' : 's'} detected; review them in the model editor after saving.
                       </p>
                     ) : null}
+                    <details className="border border-edge-700 bg-edge-900/60 p-3">
+                      <summary className="cursor-pointer text-[11px] font-medium text-chart-3">
+                        Detected capabilities & modalities
+                        {meta.attachment !== undefined || meta.reasoning !== undefined || meta.temperature !== undefined || meta.modalities
+                          ? ' · auto-detected'
+                          : ' · optional'}
+                      </summary>
+                      <div className="mt-3">
+                        <ModelCapabilities
+                          idPrefix={`wiz-${u}`}
+                          model={{
+                            attachment: meta.attachment,
+                            reasoning: meta.reasoning,
+                            temperature: meta.temperature,
+                            modalities: meta.modalities,
+                          }}
+                          onChange={(patch) => {
+                            const nextModalities =
+                              patch.input_modalities_text !== undefined || patch.output_modalities_text !== undefined
+                                ? {
+                                    ...meta.modalities,
+                                    ...(patch.input_modalities_text !== undefined
+                                      ? { input: patch.input_modalities_text.split('\n').map((v) => v.trim()).filter(Boolean) }
+                                      : {}),
+                                    ...(patch.output_modalities_text !== undefined
+                                      ? { output: patch.output_modalities_text.split('\n').map((v) => v.trim()).filter(Boolean) }
+                                      : {}),
+                                  }
+                                : patch.modalities ?? meta.modalities;
+                            setMeta({
+                              ...(patch.attachment !== undefined ? { attachment: patch.attachment } : {}),
+                              ...(patch.reasoning !== undefined ? { reasoning: patch.reasoning } : {}),
+                              ...(patch.temperature !== undefined ? { temperature: patch.temperature } : {}),
+                              modalities: nextModalities,
+                            });
+                          }}
+                        />
+                      </div>
+                    </details>
                   </div>
                 );
               })}
