@@ -264,22 +264,45 @@ func (h *modelHint) UnmarshalJSON(body []byte) error {
 }
 
 type catalogEntry struct {
-	ID string
+	ID         string
+	ProviderID string
 	modelHint
 }
 
 type catalogIndex struct {
-	byID  map[string]*catalogEntry
-	tails map[string][]*catalogEntry
+	byID       map[string]*catalogEntry
+	tails      map[string][]*catalogEntry
+	byProvider map[string]map[string]*catalogEntry
+	provTails  map[string]map[string][]*catalogEntry
+	byAPIHost  map[string]string
 }
 
 func indexCatalog(list []catalogEntry) catalogIndex {
-	idx := catalogIndex{byID: map[string]*catalogEntry{}, tails: map[string][]*catalogEntry{}}
+	idx := catalogIndex{
+		byID:       map[string]*catalogEntry{},
+		tails:      map[string][]*catalogEntry{},
+		byProvider: map[string]map[string]*catalogEntry{},
+		provTails:  map[string]map[string][]*catalogEntry{},
+		byAPIHost:  map[string]string{},
+	}
 	grouped := make(map[string][]*catalogEntry)
 	for i := range list {
 		e := &list[i]
-		if id := normHintID(e.ID); id != "" {
-			grouped[id] = append(grouped[id], e)
+		id := normHintID(e.ID)
+		if id == "" {
+			continue
+		}
+		grouped[id] = append(grouped[id], e)
+		if prov := normHintID(e.ProviderID); prov != "" {
+			if idx.byProvider[prov] == nil {
+				idx.byProvider[prov] = map[string]*catalogEntry{}
+				idx.provTails[prov] = map[string][]*catalogEntry{}
+			}
+			cp := *e
+			cp.ID = id
+			idx.byProvider[prov][id] = &cp
+			tail := tailHintID(id)
+			idx.provTails[prov][tail] = append(idx.provTails[prov][tail], &cp)
 		}
 	}
 	for id, entries := range grouped {
@@ -291,6 +314,14 @@ func indexCatalog(list []catalogEntry) catalogIndex {
 		idx.tails[tail] = append(idx.tails[tail], &e)
 	}
 	return idx
+}
+
+func (c catalogIndex) providerIndex(prov string) (catalogIndex, bool) {
+	byID := c.byProvider[prov]
+	if len(byID) == 0 {
+		return catalogIndex{}, false
+	}
+	return catalogIndex{byID: byID, tails: c.provTails[prov]}, true
 }
 
 // Missing values do not vote; disagreement makes a field unavailable.
@@ -630,10 +661,14 @@ func hintTags(m map[string]json.RawMessage) []string {
 			add("structured-output")
 		}
 	}
-	for _, field := range []struct{ key, tag string }{{"reasoning", "reasoning"}, {"tool_call", "tool-use"}, {"structured_output", "structured-output"}} {
+	for _, field := range []struct{ key, tag string }{{"reasoning", "reasoning"}, {"tool_call", "tool-use"}, {"structured_output", "structured-output"}, {"open_weights", "open-weights"}} {
 		if string(m[field.key]) == "true" {
 			add(field.tag)
 		}
+	}
+	var reasoningOpts []json.RawMessage
+	if json.Unmarshal(m["reasoning_options"], &reasoningOpts) == nil && len(reasoningOpts) > 0 && string(m["reasoning"]) != "false" {
+		add("reasoning")
 	}
 	modalities := objectField(m, "modalities")
 	if modalities == nil {
@@ -709,6 +744,13 @@ func decodeCatalogObject(m map[string]json.RawMessage, id, source string) (catal
 			*field.dest = &v
 		}
 	}
+	if h.Reasoning == nil {
+		var reasoningOpts []json.RawMessage
+		if json.Unmarshal(m["reasoning_options"], &reasoningOpts) == nil && len(reasoningOpts) > 0 {
+			t := true
+			h.Reasoning = &t
+		}
+	}
 	mods := objectField(m, "modalities")
 	if mods == nil {
 		arch := objectField(m, "architecture")
@@ -721,10 +763,22 @@ func decodeCatalogObject(m map[string]json.RawMessage, id, source string) (catal
 				h.Modalities = map[string]any{}
 			}
 			h.Modalities[key] = values
+			if key == "input" && h.Attachment == nil {
+				for _, mode := range values {
+					switch mode {
+					case "image", "audio", "video", "pdf":
+						t := true
+						h.Attachment = &t
+					}
+				}
+			}
 		}
 	}
 	if h.OwnedBy == "" {
 		h.OwnedBy = strField(m, "owner")
+	}
+	if h.OwnedBy == "" {
+		h.OwnedBy = strField(m, "family")
 	}
 	h.ContextWindow = positiveLimit(m, "context_window", "context_length", "max_input_tokens", "max_context_length", "input_token_limit", "num_ctx", "max_sequence_length", "max_model_len")
 	h.MaxTokens = positiveLimit(m, "max_output_tokens", "max_completion_tokens", "max_tokens", "output_token_limit", "max_generated_tokens")
@@ -753,7 +807,7 @@ func decodeCatalogObject(m map[string]json.RawMessage, id, source string) (catal
 	if n, ok := priceField(cost, 1, "output"); ok {
 		h.PricingOutput, h.outputKnown = n, true
 	}
-	if n, ok := priceField(cost, 1, "cache_read"); ok {
+	if n, ok := priceField(cost, 1, "cache_read", "input_cache_read", "cached_input"); ok {
 		h.PricingCache, h.cacheKnown = n, true
 	}
 	if n, ok := priceField(m, 1, "pricing_input"); ok {
@@ -1017,17 +1071,23 @@ func fetchOpenRouter(ctx context.Context, endpoint string) ([]catalogEntry, erro
 // Accept api.json's provider map, catalog.json's providers/models wrapper,
 // and models.json's canonical model map. Bad individual rows are isolated.
 func decodeModelsDev(body []byte) ([]catalogEntry, error) {
+	entries, _, err := decodeModelsDevFull(body)
+	return entries, err
+}
+
+func decodeModelsDevFull(body []byte) ([]catalogEntry, map[string]string, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []catalogEntry
+	apiHosts := map[string]string{}
 	// The same model legitimately appears under several providers (and the
 	// canonical map) with possibly disagreeing fields: those duplicates are
 	// the INPUT to consensusHints, which drops fields the sources disagree
 	// on. Deduping here would silently crown the first source instead.
 	// Iteration is sorted only so decoding is deterministic.
-	appendModels := func(models map[string]json.RawMessage) {
+	appendModels := func(provID string, models map[string]json.RawMessage) {
 		ids := make([]string, 0, len(models))
 		for id := range models {
 			ids = append(ids, id)
@@ -1035,6 +1095,10 @@ func decodeModelsDev(body []byte) ([]catalogEntry, error) {
 		sort.Strings(ids)
 		for _, id := range ids {
 			if e, ok := decodeCatalogEntry(models[id], id, "models.dev"); ok {
+				e.ProviderID = provID
+				if e.OwnedBy == "" && provID != "" {
+					e.OwnedBy = provID
+				}
 				out = append(out, e)
 			}
 		}
@@ -1043,13 +1107,31 @@ func decodeModelsDev(body []byte) ([]catalogEntry, error) {
 	if p := objectField(root, "providers"); p != nil {
 		providers = p
 	}
-	for id, raw := range providers {
+	provIDs := make([]string, 0, len(providers))
+	for id := range providers {
+		provIDs = append(provIDs, id)
+	}
+	sort.Strings(provIDs)
+	for _, id := range provIDs {
+		raw := providers[id]
 		var provider map[string]json.RawMessage
 		if json.Unmarshal(raw, &provider) != nil {
 			continue
 		}
 		if models := objectField(provider, "models"); models != nil {
-			appendModels(models)
+			provID := normHintID(strField(provider, "id"))
+			if provID == "" {
+				provID = normHintID(id)
+			}
+			if apiURL := strings.TrimSpace(strField(provider, "api")); apiURL != "" {
+				if u, err := url.Parse(apiURL); err == nil && u.Hostname() != "" {
+					host := strings.ToLower(u.Hostname())
+					if _, exists := apiHosts[host]; !exists {
+						apiHosts[host] = provID
+					}
+				}
+			}
+			appendModels(provID, models)
 		} else if provider["limit"] != nil || provider["cost"] != nil || provider["description"] != nil || provider["modalities"] != nil {
 			if e, ok := decodeCatalogEntry(raw, id, "models.dev"); ok {
 				out = append(out, e)
@@ -1057,9 +1139,27 @@ func decodeModelsDev(body []byte) ([]catalogEntry, error) {
 		}
 	}
 	if canonical := objectField(root, "models"); canonical != nil {
-		appendModels(canonical)
+		appendModels("", canonical)
 	}
-	return out, nil
+	return out, apiHosts, nil
+}
+
+func indexModelsDev(body []byte) (catalogIndex, error) {
+	entries, apiHosts, err := decodeModelsDevFull(body)
+	if err != nil {
+		return catalogIndex{}, err
+	}
+	idx := indexCatalog(entries)
+	idx.byAPIHost = apiHosts
+	return idx, nil
+}
+
+func fetchModelsDevIndex(ctx context.Context, url string) (catalogIndex, error) {
+	body, err := getJSON(ctx, url, 32<<20, 25*time.Second)
+	if err != nil {
+		return catalogIndex{}, err
+	}
+	return indexModelsDev(body)
 }
 
 func fetchModelsDev(ctx context.Context, url string) ([]catalogEntry, error) {
@@ -1261,6 +1361,146 @@ func applyFallbackKindInference(upstream string, h *modelHint) *modelHint {
 	return nonemptyHint(h)
 }
 
+// modelsDevProviderAliases maps verloc provider names, common aliases, and
+// organization prefixes to canonical models.dev provider IDs.
+var modelsDevProviderAliases = map[string][]string{
+	"cf":               {"cloudflare-workers-ai", "cloudflare-ai-gateway"},
+	"cloudflare":       {"cloudflare-workers-ai", "cloudflare-ai-gateway"},
+	"novita":           {"novita-ai"},
+	"gmi":              {"gmicloud"},
+	"ollama":           {"ollama-cloud"},
+	"stepfun":          {"stepfun", "stepfun-ai"},
+	"together":         {"togetherai"},
+	"fireworks":        {"fireworks-ai"},
+	"gemini":           {"google", "google-vertex"},
+	"google":           {"google", "google-vertex"},
+	"qwen":             {"alibaba", "alibaba-cn"},
+	"alibaba":          {"alibaba", "alibaba-cn"},
+	"deepseek-ai":      {"deepseek"},
+	"minimaxai":        {"minimax", "minimax-coding-plan"},
+	"minimax":          {"minimax", "minimax-coding-plan"},
+	"moonshot":         {"moonshotai", "moonshotai-cn"},
+	"moonshotai":       {"moonshotai", "moonshotai-cn"},
+	"zhipu":            {"zhipuai", "zai"},
+	"zai-org":          {"zai", "zhipuai"},
+	"x-ai":             {"xai"},
+	"mistralai":        {"mistral"},
+	"baichuan-inc":     {"baichuan"},
+	"01-ai":            {"yi"},
+	"upstage":          {"upstage"},
+	"cohereforai":      {"cohere"},
+	"perplexity-ai":    {"perplexity"},
+}
+
+// resolveModelsDevProviders returns ordered models.dev provider IDs matching
+// a verloc provider name and/or base_url.
+func (c catalogIndex) resolveModelsDevProviders(providerName, baseURL string) []string {
+	var out []string
+	add := func(id string) {
+		id = normHintID(id)
+		if id != "" && len(c.byProvider[id]) > 0 && !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	if u := strings.TrimSpace(baseURL); u != "" {
+		parsedURL := strings.ReplaceAll(u, "%ACCOUNT%", "account")
+		if parsed, err := url.Parse(parsedURL); err == nil && parsed.Hostname() != "" {
+			host := strings.ToLower(parsed.Hostname())
+			if prov := c.byAPIHost[host]; prov != "" {
+				add(prov)
+			}
+			switch {
+			case strings.Contains(host, "generativelanguage.googleapis.com"):
+				add("google")
+			case strings.Contains(host, "api.cloudflare.com"):
+				add("cloudflare-workers-ai")
+				add("cloudflare-ai-gateway")
+			case strings.Contains(host, "integrate.api.nvidia.com"):
+				add("nvidia")
+			case strings.Contains(host, "api.novita.ai"):
+				add("novita-ai")
+			case strings.Contains(host, "api.gmi-serving.com"):
+				add("gmicloud")
+			case strings.Contains(host, "opencode.ai"):
+				add("opencode")
+			case strings.Contains(host, "openrouter.ai"):
+				add("openrouter")
+			case strings.Contains(host, "ai-gateway.vercel.sh"):
+				add("vercel")
+			case strings.Contains(host, "api.hyperbolic.xyz") || strings.Contains(host, "hyper.charm.land"):
+				add("hyper")
+			case strings.Contains(host, "api.siliconflow."):
+				add("siliconflow")
+			case strings.Contains(host, "zenmux.ai"):
+				add("zenmux")
+			}
+		}
+	}
+	if name := normHintID(providerName); name != "" {
+		add(name)
+		for _, alias := range modelsDevProviderAliases[name] {
+			add(alias)
+		}
+		for _, suffix := range []string{"-ai", "-cloud", "ai", "cloud"} {
+			add(name + suffix)
+		}
+	}
+	return out
+}
+
+// resolveCreatorProviders returns canonical first-party models.dev provider IDs
+// inferred from a qualified upstream model ID ("google/gemini-4-neon") or a
+// well-known first-party model family prefix ("gemini-*", "claude-*", "gpt-*").
+func (c catalogIndex) resolveCreatorProviders(upstream string) []string {
+	id := normHintID(upstream)
+	if strings.HasPrefix(id, "@cf/") || strings.HasPrefix(id, "@hf/") {
+		id = id[4:]
+	}
+	var out []string
+	add := func(p string) {
+		p = normHintID(p)
+		if p != "" && len(c.byProvider[p]) > 0 && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	if i := strings.Index(id, "/"); i > 0 {
+		org := id[:i]
+		add(org)
+		for _, alias := range modelsDevProviderAliases[org] {
+			add(alias)
+		}
+	}
+	tail := tailHintID(id)
+	switch {
+	case strings.HasPrefix(tail, "gemini-") || strings.HasPrefix(tail, "gemma-") || strings.HasPrefix(tail, "imagen-") || strings.HasPrefix(tail, "veo-"):
+		add("google")
+	case strings.HasPrefix(tail, "claude-"):
+		add("anthropic")
+	case strings.HasPrefix(tail, "gpt-4") || strings.HasPrefix(tail, "gpt-5") || strings.HasPrefix(tail, "o1-") || strings.HasPrefix(tail, "o3-") || strings.HasPrefix(tail, "o4-") || strings.HasPrefix(tail, "text-embedding-3-"):
+		add("openai")
+	case strings.HasPrefix(tail, "deepseek-"):
+		add("deepseek")
+	case strings.HasPrefix(tail, "grok-"):
+		add("xai")
+	case strings.HasPrefix(tail, "mistral-") || strings.HasPrefix(tail, "ministral-") || strings.HasPrefix(tail, "codestral-") || strings.HasPrefix(tail, "pixtral-") || strings.HasPrefix(tail, "devstral-") || strings.HasPrefix(tail, "magistral-"):
+		add("mistral")
+	case strings.HasPrefix(tail, "qwen"):
+		add("alibaba")
+	case strings.HasPrefix(tail, "kimi-") || strings.HasPrefix(tail, "moonshot-"):
+		add("moonshotai")
+	case strings.HasPrefix(tail, "glm-"):
+		add("zai")
+		add("zhipuai")
+	case strings.HasPrefix(tail, "minimax-"):
+		add("minimax")
+	case strings.HasPrefix(tail, "step-"):
+		add("stepfun")
+	case strings.HasPrefix(tail, "command-r") || strings.HasPrefix(tail, "command-a"):
+		add("cohere")
+	}
+	return out
+}
+
 func mergeHint(upstream string, idxs []catalogIndex) *modelHint {
 	h := &modelHint{}
 	if id := normHintID(upstream); !strings.Contains(id, "/") {
@@ -1277,6 +1517,49 @@ func mergeHint(upstream string, idxs []catalogIndex) *modelHint {
 		}
 	}
 	for _, idx := range idxs {
+		if e := idx.lookup(upstream); e != nil {
+			fillModelHint(h, &e.modelHint)
+		}
+	}
+	return nonemptyHint(h)
+}
+
+func mergeHintForProvider(upstream, providerName, baseURL string, md catalogIndex, idxs []catalogIndex) *modelHint {
+	var scoped []catalogIndex
+	for _, provID := range md.resolveModelsDevProviders(providerName, baseURL) {
+		if pIdx, ok := md.providerIndex(provID); ok {
+			scoped = append(scoped, pIdx)
+		}
+	}
+	// When the caller specifies a target provider or the model has a known
+	// first-party creator in models.dev (e.g. google/gemini-4-neon), include
+	// the creator's first-party models.dev entry right after the global
+	// models.dev consensus index so reseller conflicts never blank
+	// authoritative first-party limits or pricing.
+	var creators []catalogIndex
+	for _, creatorID := range md.resolveCreatorProviders(upstream) {
+		if cIdx, ok := md.providerIndex(creatorID); ok {
+			creators = append(creators, cIdx)
+		}
+	}
+	if len(scoped) == 0 && len(creators) == 0 {
+		return mergeHint(upstream, idxs)
+	}
+	ordered := make([]catalogIndex, 0, len(scoped)+len(idxs)+len(creators))
+	ordered = append(ordered, scoped...)
+	insertedCreators := false
+	for _, idx := range idxs {
+		ordered = append(ordered, idx)
+		if !insertedCreators && len(idx.byProvider) > 0 {
+			ordered = append(ordered, creators...)
+			insertedCreators = true
+		}
+	}
+	if !insertedCreators {
+		ordered = append(ordered, creators...)
+	}
+	h := &modelHint{}
+	for _, idx := range ordered {
 		if e := idx.lookup(upstream); e != nil {
 			fillModelHint(h, &e.modelHint)
 		}
@@ -1362,8 +1645,17 @@ func (h *hintResolver) fresh(c cachedIndex, ttl time.Duration) bool {
 // hintsFor returns per-upstream merged hints, refreshing stale catalogs
 // concurrently. Any source failure only drops that source.
 func (h *hintResolver) hintsFor(ctx context.Context, cfg *Config, upstreams []string) map[string]*modelHint {
+	return h.hintsForProvider(ctx, cfg, "", "", upstreams)
+}
+
+func (h *hintResolver) hintsForProvider(ctx context.Context, cfg *Config, providerName, baseURL string, upstreams []string) map[string]*modelHint {
+	if baseURL == "" && providerName != "" && cfg != nil {
+		if p := cfg.Providers[providerName]; p != nil {
+			baseURL = p.BaseURL
+		}
+	}
 	var wg sync.WaitGroup
-	refresh := func(cur cachedIndex, ttl time.Duration, set func(cachedIndex), fetch func(context.Context) ([]catalogEntry, error), label string) {
+	refreshIndex := func(cur cachedIndex, ttl time.Duration, set func(cachedIndex), fetch func(context.Context) (catalogIndex, error), label string) {
 		h.mu.Lock()
 		stale := !h.fresh(cur, ttl)
 		if h.fetching == nil {
@@ -1385,19 +1677,28 @@ func (h *hintResolver) hintsFor(ctx context.Context, cfg *Config, upstreams []st
 			}()
 			// WithoutCancel: with cache-first serving the caller may
 			// return (and cancel) while this refresh is still running.
-			list, err := fetch(context.WithoutCancel(ctx))
+			idx, err := fetch(context.WithoutCancel(ctx))
 			if err != nil {
 				log.Printf("[admin] %s hint fetch failed: %v", label, err)
 				return
 			}
 			// D9: an empty-but-successful fetch must not blank every hint
 			// for the whole TTL — keep the previous index.
-			if len(list) == 0 {
+			if len(idx.byID) == 0 {
 				log.Printf("[admin] %s hint fetch returned no entries; keeping previous hints", label)
 				return
 			}
-			set(cachedIndex{at: time.Now(), idx: indexCatalog(list)})
+			set(cachedIndex{at: time.Now(), idx: idx})
 		}()
+	}
+	refresh := func(cur cachedIndex, ttl time.Duration, set func(cachedIndex), fetch func(context.Context) ([]catalogEntry, error), label string) {
+		refreshIndex(cur, ttl, set, func(ctx context.Context) (catalogIndex, error) {
+			list, err := fetch(ctx)
+			if err != nil {
+				return catalogIndex{}, err
+			}
+			return indexCatalog(list), nil
+		}, label)
 	}
 	h.mu.Lock()
 	vercel, or, md, litellm := h.vercel, h.or, h.md, h.litellm
@@ -1418,11 +1719,11 @@ func (h *hintResolver) hintsFor(ctx context.Context, cfg *Config, upstreams []st
 		h.or = c
 		h.mu.Unlock()
 	}, func(ctx context.Context) ([]catalogEntry, error) { return fetchOpenRouter(ctx, orURL) }, "openrouter")
-	refresh(md, catalogHintTTL, func(c cachedIndex) {
+	refreshIndex(md, catalogHintTTL, func(c cachedIndex) {
 		h.mu.Lock()
 		h.md = c
 		h.mu.Unlock()
-	}, func(ctx context.Context) ([]catalogEntry, error) { return fetchModelsDev(ctx, mdURL) }, "models.dev")
+	}, func(ctx context.Context) (catalogIndex, error) { return fetchModelsDevIndex(ctx, mdURL) }, "models.dev")
 	refresh(litellm, catalogHintTTL, func(c cachedIndex) {
 		h.mu.Lock()
 		h.litellm = c
@@ -1447,10 +1748,10 @@ func (h *hintResolver) hintsFor(ctx context.Context, cfg *Config, upstreams []st
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	idxs := []catalogIndex{h.vercel.idx, h.or.idx, h.md.idx, h.litellm.idx, h.embed}
+	idxs := []catalogIndex{h.md.idx, h.vercel.idx, h.or.idx, h.litellm.idx, h.embed}
 	out := make(map[string]*modelHint, len(upstreams))
 	for _, u := range upstreams {
-		hint := mergeHint(u, idxs)
+		hint := mergeHintForProvider(u, providerName, baseURL, h.md.idx, idxs)
 		hint = applyFallbackKindInference(u, hint)
 		if hint != nil {
 			out[u] = hint

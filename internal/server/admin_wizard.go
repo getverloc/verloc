@@ -338,7 +338,11 @@ func (s *Server) handleAdminDiscover(w http.ResponseWriter, r *http.Request) {
 	for _, m := range models {
 		ids = append(ids, m.ID)
 	}
-	hints := s.hints.hintsFor(ctx, s.runtime().cfg, ids)
+	providerName := strings.TrimSpace(req.Provider)
+	if providerName == "" {
+		providerName = strings.TrimSpace(req.Backend)
+	}
+	hints := s.hints.hintsForProvider(ctx, s.runtime().cfg, providerName, conn.baseURL, ids)
 	if ctx.Err() != nil {
 		writeErr(w, http.StatusBadGateway, "upstream unreachable")
 		return
@@ -421,6 +425,9 @@ func (s *Server) handleAdminModelHints(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Upstreams []string `json:"upstreams"`
+		Provider  string   `json:"provider"`
+		Backend   string   `json:"backend"`
+		BaseURL   string   `json:"base_url"`
 	}
 	if !decodeAdminJSON(w, r, &req) {
 		return
@@ -435,7 +442,11 @@ func (s *Server) handleAdminModelHints(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"hints": s.hints.hintsFor(r.Context(), s.runtime().cfg, req.Upstreams)})
+	providerName := strings.TrimSpace(req.Provider)
+	if providerName == "" {
+		providerName = strings.TrimSpace(req.Backend)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hints": s.hints.hintsForProvider(r.Context(), s.runtime().cfg, providerName, strings.TrimSpace(req.BaseURL), req.Upstreams)})
 }
 
 type testReq struct {

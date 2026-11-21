@@ -118,6 +118,7 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
     if (wUseExisting) return { provider: wUseExisting, allow_private_upstreams: wAllowPrivate };
     const fk = firstProbeKey(wKeysText);
     return {
+      provider: wName.trim() || undefined,
       base_url: wBase.trim(),
       api_format: wAPIFormat,
       api_key: fk.api_key,
@@ -146,7 +147,7 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
     setWLookupBusy((p) => ({ ...p, [upstream]: true }));
     setWFetchErr(null);
     try {
-      const result = await lookupModelHints([upstream]);
+      const result = await lookupModelHints([upstream], { provider: wizProviderName, base_url: wUseExisting ? undefined : wBase.trim() });
       const hint = result.hints[upstream];
       if (hint) {
         wizEnsureRow(upstream, wizProviderName, hint);
@@ -249,7 +250,7 @@ export function OnboardingWizard({ open: wizOpen, onOpenChange: setWizOpen, prov
     setWBatchDetectBusy(true);
     setWFetchErr(null);
     try {
-      const result = await lookupModelHints(rows.slice(0, 256));
+      const result = await lookupModelHints(rows.slice(0, 256), { provider: wizProviderName, base_url: wUseExisting ? undefined : wBase.trim() });
       let filled = 0;
       for (const u of rows) {
         const hint = result.hints[u];

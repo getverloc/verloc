@@ -385,9 +385,9 @@ export const testUpstreamModel = (body: ProbeConn & {
     method: 'POST', body: JSON.stringify(body),
   }, 120000);
 
-export const lookupModelHints = (upstreams: string[]) =>
+export const lookupModelHints = (upstreams: string[], opts?: { provider?: string; base_url?: string }) =>
   adminJSON<{ hints: Record<string, ModelHint> }>('/dash/api/admin/model-hints', {
-    method: 'POST', body: JSON.stringify({ upstreams }),
+    method: 'POST', body: JSON.stringify({ upstreams, ...(opts?.provider ? { provider: opts.provider } : {}), ...(opts?.base_url ? { base_url: opts.base_url } : {}) }),
   }, 60000);
 
 export interface Session { authenticated: boolean; setup_required: boolean; csrf_token?: string }

@@ -15,6 +15,10 @@ export type ProviderPreset = {
 };
 
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
+  { id: 'google', label: 'Google Gemini', name: 'google', base_url: 'https://generativelanguage.googleapis.com/v1beta/openai', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'openai', label: 'OpenAI', name: 'openai', base_url: 'https://api.openai.com/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'deepseek', label: 'DeepSeek', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', api_format: 'openai', strip_reasoning_content: false },
+  { id: 'xai', label: 'xAI (Grok)', name: 'xai', base_url: 'https://api.x.ai/v1', api_format: 'openai', strip_reasoning_content: true },
   { id: 'nvidia', label: 'NVIDIA NIM', name: 'nvidia', base_url: 'https://integrate.api.nvidia.com/v1', api_format: 'openai', strip_reasoning_content: true },
   { id: 'openrouter', label: 'OpenRouter', name: 'openrouter', base_url: 'https://openrouter.ai/api/v1', api_format: 'openai', strip_reasoning_content: true },
   { id: 'vercel', label: 'Vercel AI Gateway', name: 'vercel', base_url: 'https://ai-gateway.vercel.sh/v1', api_format: 'openai', strip_reasoning_content: true },
@@ -24,10 +28,15 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
   { id: 'cloudflare', label: 'Cloudflare Workers AI', name: 'cf', base_url: 'https://api.cloudflare.com/client/v4/accounts/%ACCOUNT%/ai/v1', api_format: 'openai', strip_reasoning_content: true, note: 'Paste credentials as account_id:api_key' },
   { id: 'siliconflow', label: 'SiliconFlow', name: 'siliconflow', base_url: 'https://api.siliconflow.com/v1', api_format: 'openai', strip_reasoning_content: true },
   { id: 'novita', label: 'Novita AI', name: 'novita', base_url: 'https://api.novita.ai/v3/openai', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'gmi', label: 'GMI Cloud', name: 'gmi', base_url: 'https://api.gmi-serving.com/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'together', label: 'Together AI', name: 'together', base_url: 'https://api.together.xyz/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'fireworks', label: 'Fireworks AI', name: 'fireworks', base_url: 'https://api.fireworks.ai/inference/v1', api_format: 'openai', strip_reasoning_content: true },
   { id: 'hyperbolic', label: 'Hyperbolic', name: 'hyper', base_url: 'https://api.hyperbolic.xyz/v1', api_format: 'openai', strip_reasoning_content: false },
   { id: 'wandb', label: 'W&B Inference', name: 'wandb', base_url: 'https://api.inference.wandb.ai/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'zenmux', label: 'ZenMux', name: 'zenmux', base_url: 'https://zenmux.ai/api/v1', api_format: 'openai', strip_reasoning_content: true },
   { id: 'opencode', label: 'OpenCode Zen (keyless)', name: 'opencode', base_url: 'https://opencode.ai/zen/v1', api_format: 'openai', no_auth: true, synthesize_cli_headers: true, strip_reasoning_content: false },
   { id: 'typesafe', label: 'TypeSafe (System One)', name: 'typesafe', base_url: 'https://api.typesafe.ai/v1', api_format: 'systemone', strip_reasoning_content: true },
+  { id: 'ollama-cloud', label: 'Ollama Cloud', name: 'ollama', base_url: 'https://ollama.com/v1', api_format: 'openai', strip_reasoning_content: true },
   { id: 'ollama-local', label: 'Ollama (Local / LAN)', name: 'ollama', base_url: 'http://127.0.0.1:11434/v1', api_format: 'openai', no_auth: true, allow_private_upstreams: true, strip_reasoning_content: true },
 ] as const;
 

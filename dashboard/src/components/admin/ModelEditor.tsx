@@ -94,7 +94,7 @@ export function ModelEditor({ editModel, setEditModel, originalModelID, saveMode
                       setBusy(true);
                       setErr(null);
                       try {
-                        const result = await lookupModelHints([upstream]);
+                        const result = await lookupModelHints([upstream], { provider: editModel.backend || undefined });
                         const local = metaFromMatch(upstream, findCatalogMatch(upstream, models, editModel.backend || ''));
                         const hint = result.hints[upstream];
                         if (!hint && !local.src) { setErr(`No metadata found for ${upstream}`); return; }
