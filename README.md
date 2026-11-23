@@ -1,5 +1,10 @@
 # verloc
 
+[![Release](https://img.shields.io/github/v/release/getverloc/verloc?display_name=tag&sort=semver)](https://github.com/getverloc/verloc/releases)
+[![CI](https://github.com/getverloc/verloc/actions/workflows/ci.yml/badge.svg)](https://github.com/getverloc/verloc/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/getverloc/verloc)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A self-hosted, OpenAI-compatible LLM gateway with an embedded operations dashboard. Point applications at one endpoint; manage upstream providers, credentials, model routes, client access, and usage from the browser.
 
 verloc runs as a single Go binary. SQLite stores management state and analytics; the React dashboard is embedded in the binary. Node.js is a build dependency, not a runtime dependency. No external database, Redis, or separate dashboard server is required.
@@ -30,13 +35,13 @@ Install `verloc` into `~/.local/bin`, initialize a private loopback-bound runtim
 
 ```sh
 # Install and start as a background service (systemd user unit on Linux, launchd on macOS)
-curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh -s -- --service
+curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sh -s -- --service
 ```
 
 Or install without a background service and run it in the foreground:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sh
 ~/.local/bin/verloc -config ~/.local/share/verloc/bootstrap.json
 ```
 
@@ -50,7 +55,7 @@ Already cloned the repository? Run directly from the checkout:
 For a system-wide Linux server install (`/usr/local/bin/verloc`, dedicated `verloc` user, `/etc/verloc/bootstrap.json`, `/var/lib/verloc`, and a hardened `systemd` unit):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sudo sh -s -- --system
+curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sudo sh -s -- --system
 ```
 
 **How `install.sh` works:**
@@ -439,7 +444,7 @@ Use persistent **local** storage. Do not share SQLite files across replicas or p
 
 ### systemd example
 
-You can provision the hardened systemd deployment automatically with `sudo ./install.sh --system` (or `curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sudo sh -s -- --system`), or configure it manually below.
+You can provision the hardened systemd deployment automatically with `sudo ./install.sh --system` (or `curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sudo sh -s -- --system`), or configure it manually below.
 
 On a Linux host with systemd, install the binary as `/usr/local/bin/verloc`, create a dedicated `verloc` system user/group, and make `/var/lib/verloc` writable only by that user. Make the bootstrap file readable by the service user. Never run the gateway as root.
 
@@ -587,7 +592,8 @@ CI uses Node 24 with the locked dashboard dependencies, runs the catalog
 regressions and frontend lint/type-check/build, then vets/tests Go and builds
 the CGO-free binary with the freshly generated assets. Pushing a `v*` tag triggers
 [`.github/workflows/release.yml`](.github/workflows/release.yml) to build and
-publish cross-platform release tarballs with SHA-256 checksums for `install.sh`.
+publish cross-platform release tarballs with SHA-256 checksums for `install.sh`
+and multi-arch container images (`linux/amd64`, `linux/arm64`) to `ghcr.io/getverloc/verloc`.
 
 ```text
 VERSION                  Canonical SemVer version (MAJOR.MINOR.PATCH)

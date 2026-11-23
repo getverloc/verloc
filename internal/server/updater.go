@@ -27,7 +27,8 @@ import (
 )
 
 const (
-	defaultUpdateRepo          = "kunalkcube/verloc"
+	defaultUpdateRepo          = "getverloc/verloc"
+	legacyUpdateRepo           = "kunalkcube/verloc"
 	defaultUpdateIntervalHours = 6
 	maxChecksumBytes           = 1 << 20   // 1 MiB
 	maxReleaseArchiveBytes     = 200 << 20 // 200 MiB
@@ -61,14 +62,19 @@ type UpdateConfig struct {
 
 func boolPtr(v bool) *bool { return &v }
 
+func normalizeUpdateRepo(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" || strings.EqualFold(repo, legacyUpdateRepo) {
+		return defaultUpdateRepo
+	}
+	return repo
+}
+
 func effectiveUpdateConfig(cfg *UpdateConfig) UpdateConfig {
 	out := UpdateConfig{
 		AutoCheck:          boolPtr(true),
 		CheckIntervalHours: defaultUpdateIntervalHours,
-		Repo:               strings.TrimSpace(os.Getenv("VERLOC_UPDATE_REPO")),
-	}
-	if out.Repo == "" {
-		out.Repo = defaultUpdateRepo
+		Repo:               normalizeUpdateRepo(os.Getenv("VERLOC_UPDATE_REPO")),
 	}
 	if cfg == nil {
 		return out
@@ -82,7 +88,7 @@ func effectiveUpdateConfig(cfg *UpdateConfig) UpdateConfig {
 	}
 	out.IncludePrereleases = cfg.IncludePrereleases
 	if strings.TrimSpace(cfg.Repo) != "" {
-		out.Repo = strings.TrimSpace(cfg.Repo)
+		out.Repo = normalizeUpdateRepo(cfg.Repo)
 	}
 	return out
 }

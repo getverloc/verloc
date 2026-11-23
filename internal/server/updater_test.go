@@ -61,27 +61,35 @@ func TestSemVerComparisonAndChannels(t *testing.T) {
 }
 
 func TestValidateUpdateConfigAndDownloadURL(t *testing.T) {
-	if _, err := validateUpdateConfig(&UpdateConfig{Repo: "kunalkcube/verloc", CheckIntervalHours: 6}); err != nil {
+	if _, err := validateUpdateConfig(&UpdateConfig{Repo: "getverloc/verloc", CheckIntervalHours: 6}); err != nil {
 		t.Fatalf("valid update config rejected: %v", err)
+	}
+	// Legacy personal-account repo migrates seamlessly to the organization repo.
+	migrated, err := validateUpdateConfig(&UpdateConfig{Repo: "kunalkcube/verloc", CheckIntervalHours: 6})
+	if err != nil {
+		t.Fatalf("legacy repo rejected: %v", err)
+	}
+	if migrated.Repo != "getverloc/verloc" {
+		t.Fatalf("legacy repo migrated to %q, want getverloc/verloc", migrated.Repo)
 	}
 	for _, bad := range []UpdateConfig{
 		{Repo: "../evil/repo", CheckIntervalHours: 6},
 		{Repo: "https://evil.example/repo", CheckIntervalHours: 6},
 		{Repo: "onlyone", CheckIntervalHours: 6},
-		{Repo: "kunalkcube/verloc", CheckIntervalHours: 999},
+		{Repo: "getverloc/verloc", CheckIntervalHours: 999},
 	} {
 		if _, err := validateUpdateConfig(&bad); err == nil {
 			t.Errorf("expected invalid UpdateConfig %+v to fail", bad)
 		}
 	}
 
-	if err := validateDownloadURL("https://github.com/kunalkcube/verloc/releases/download/v1.0.1/checksums.txt", false); err != nil {
+	if err := validateDownloadURL("https://github.com/getverloc/verloc/releases/download/v1.0.1/checksums.txt", false); err != nil {
 		t.Fatalf("github.com rejected: %v", err)
 	}
 	if err := validateDownloadURL("https://objects.githubusercontent.com/github-production-release-asset/123", false); err != nil {
 		t.Fatalf("objects.githubusercontent.com rejected: %v", err)
 	}
-	if err := validateDownloadURL("http://github.com/kunalkcube/verloc/releases/download/v1.0.1/checksums.txt", false); err == nil {
+	if err := validateDownloadURL("http://github.com/getverloc/verloc/releases/download/v1.0.1/checksums.txt", false); err == nil {
 		t.Fatalf("expected HTTP download URL to be rejected")
 	}
 	if err := validateDownloadURL("https://evil.example/verloc.tar.gz", false); err == nil {
@@ -130,11 +138,11 @@ func TestUpdaterCheckAndSelfUpdatePreservesUserData(t *testing.T) {
 
 	// Simulate user data living right beside the binary (same layout as kcube).
 	userData := map[string][]byte{
-		filepath.Join(dir, "verloc.db"):                    []byte("sqlite-analytics-user-data"),
-		filepath.Join(dir, "config.json"):                  []byte(`{"listen":":8787"}`),
-		filepath.Join(dir, "verloc-data", "control.db"):    []byte("encrypted-control-data"),
-		filepath.Join(dir, "verloc-data", "master.key"):    bytes.Repeat([]byte{0x42}, 32),
-		filepath.Join(dir, "verloc-data", "setup.token"):   []byte("secret-setup-token"),
+		filepath.Join(dir, "verloc.db"):                  []byte("sqlite-analytics-user-data"),
+		filepath.Join(dir, "config.json"):                []byte(`{"listen":":8787"}`),
+		filepath.Join(dir, "verloc-data", "control.db"):  []byte("encrypted-control-data"),
+		filepath.Join(dir, "verloc-data", "master.key"):  bytes.Repeat([]byte{0x42}, 32),
+		filepath.Join(dir, "verloc-data", "setup.token"): []byte("secret-setup-token"),
 	}
 	if err := os.MkdirAll(filepath.Join(dir, "verloc-data"), 0o700); err != nil {
 		t.Fatal(err)
@@ -153,7 +161,7 @@ func TestUpdaterCheckAndSelfUpdatePreservesUserData(t *testing.T) {
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/repos/kunalkcube/verloc/releases/latest":
+		case "/repos/getverloc/verloc/releases/latest":
 			releaseHits.Add(1)
 			if r.Header.Get("If-None-Match") == `"etag-v1.1.0"` {
 				w.WriteHeader(http.StatusNotModified)
@@ -165,7 +173,7 @@ func TestUpdaterCheckAndSelfUpdatePreservesUserData(t *testing.T) {
 				TagName:     "v1.1.0",
 				Name:        "v1.1.0",
 				Body:        "## What's Changed\n- Smooth auto-updates",
-				HTMLURL:     "https://github.com/kunalkcube/verloc/releases/tag/v1.1.0",
+				HTMLURL:     "https://github.com/getverloc/verloc/releases/tag/v1.1.0",
 				PublishedAt: "2026-11-24T00:00:00Z",
 				Assets: []githubAsset{
 					{Name: assetName, Size: int64(len(archiveBytes)), BrowserDownloadURL: ts.URL + "/dl/" + assetName},
@@ -318,7 +326,7 @@ func TestUpdaterRejectsBadChecksumAndBadBinary(t *testing.T) {
 			var ts *httptest.Server
 			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
-				case "/repos/kunalkcube/verloc/releases/latest":
+				case "/repos/getverloc/verloc/releases/latest":
 					_ = json.NewEncoder(w).Encode(githubRelease{
 						TagName: "v1.1.0",
 						Assets: []githubAsset{
@@ -385,7 +393,7 @@ func TestUpdateSettingsPersistenceAndEndpoints(t *testing.T) {
 		AutoUpdate:         true,
 		CheckIntervalHours: 12,
 		IncludePrereleases: true,
-		Repo:               "kunalkcube/verloc",
+		Repo:               "getverloc/verloc",
 	}
 	if _, err := store.LoadOrImportConfig(seed); err != nil {
 		t.Fatalf("LoadOrImportConfig: %v", err)

@@ -1,0 +1,66 @@
+name: Bug Report
+description: Report a reproducible bug in the verloc gateway, dashboard, installer, or updater.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! For security vulnerabilities, please use [Private Security Advisories](https://github.com/getverloc/verloc/security/advisories/new) instead of a public issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: verloc version
+      description: Output of `verloc -version` or the version shown in Settings → Software updates.
+      placeholder: "v1.0.0 (commit 906db24)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment method
+      options:
+        - Single binary / install.sh (user service)
+        - Single binary / install.sh --system (systemd)
+        - Docker / Docker Compose
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS & architecture
+      placeholder: "Linux x86_64 (Ubuntu 24.04) / macOS arm64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact requests, dashboard actions, or configuration needed to reproduce.
+      placeholder: |
+        1. Configure provider / model route ...
+        2. Send request to `/v1/chat/completions` ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Redact any API keys, tokens, or secrets before pasting.
+      render: shell

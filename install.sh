@@ -2,8 +2,8 @@
 # verloc one-command installer and updater.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh -s -- --service
+#   curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sh -s -- --service
 #   ./install.sh [options]
 #
 # Options:
@@ -22,7 +22,7 @@
 #   -h, --help          Show this help message
 set -eu
 
-REPO="${VERLOC_REPO:-kunalkcube/verloc}"
+REPO="${VERLOC_REPO:-getverloc/verloc}"
 BRANCH="${VERLOC_BRANCH:-master}"
 VERSION="${VERLOC_VERSION:-latest}"
 LISTEN="${VERLOC_LISTEN:-}"
@@ -63,8 +63,8 @@ usage() {
 verloc one-command installer and updater.
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh -s -- --service
+  curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh | sh -s -- --service
   ./install.sh [--dir PATH] [--bin-dir PATH] [--port PORT] [--listen ADDR] [--service] [--start] [--system] [--from-source] [--build-dash] [--uninstall [--purge]]
 EOF
 }
