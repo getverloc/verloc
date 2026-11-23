@@ -7,7 +7,7 @@ RUN npm ci
 COPY dashboard/ ./
 RUN npm run build
 
-FROM golang:1.25-alpine AS go-builder
+FROM golang:1.27-alpine AS go-builder
 ARG VERSION=""
 ARG COMMIT=none
 ARG BUILD_TIME=unknown
