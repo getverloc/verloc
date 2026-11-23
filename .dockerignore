@@ -1,0 +1,12 @@
+.git
+.github
+assets
+skills
+verloc
+verloc-data
+*.db
+*.db-wal
+*.db-shm
+dashboard/node_modules
+dashboard/dist
+dashboard/.vite

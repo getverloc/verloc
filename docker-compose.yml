@@ -1,0 +1,34 @@
+services:
+  verloc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: verloc
+    restart: unless-stopped
+    ports:
+      # Loopback-only by default so plain HTTP is not exposed on the LAN.
+      # Put HTTPS (Caddy, nginx, Traefik) in front for remote access.
+      - "${VERLOC_BIND:-127.0.0.1}:${VERLOC_PORT:-8080}:8080"
+    environment:
+      VERLOC_LISTEN: ":8080"
+      # Set to "true" when terminating TLS at a reverse proxy:
+      VERLOC_SECURE_COOKIES: "${VERLOC_SECURE_COOKIES:-false}"
+      # Optional comma-separated hostnames / trusted proxy CIDRs:
+      VERLOC_ALLOWED_HOSTS: "${VERLOC_ALLOWED_HOSTS:-}"
+      VERLOC_TRUSTED_PROXIES: "${VERLOC_TRUSTED_PROXIES:-}"
+    volumes:
+      - verloc_data:/var/lib/verloc
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  verloc_data:

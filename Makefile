@@ -1,5 +1,5 @@
 # verloc — build, test, run, bench
-.PHONY: all build test vet fmt tidy dash clean version run bench bench-scale bench-race race check
+.PHONY: all build test vet fmt tidy dash clean version run install quickstart bench bench-scale bench-race race check
 
 BENCH      ?= .
 BENCHTIME  ?= 200x
@@ -53,6 +53,14 @@ version: build
 
 run: build
 	./$(OUT) -config config.json
+
+# One-command local install into ~/.local/bin and ~/.local/share/verloc.
+install:
+	./install.sh
+
+# Install and start immediately on 127.0.0.1:8080.
+quickstart:
+	./install.sh --start
 
 clean:
 	rm -f $(OUT)

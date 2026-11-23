@@ -22,12 +22,70 @@ Designed for a **single gateway instance on a single host**, with local persiste
 
 This is not a clustered gateway or a billing system. There is no built-in multi-owner RBAC, SSO, distributed rate limiting, or cross-instance coordination. Read the [operating limits](#operating-limits) before exposing it to other users.
 
-## Build and start
+## Quick start (one-command setup)
 
-### Requirements
+### Option 1: One-command installer (Linux & macOS)
+
+Install `verloc` into `~/.local/bin`, initialize a private loopback-bound runtime directory (`~/.local/share/verloc`, mode `0700`), and optionally start it as a background service:
+
+```sh
+# Install and start as a background service (systemd user unit on Linux, launchd on macOS)
+curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh -s -- --service
+```
+
+Or install without a background service and run it in the foreground:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sh
+~/.local/bin/verloc -config ~/.local/share/verloc/bootstrap.json
+```
+
+Already cloned the repository? Run directly from the checkout:
+
+```sh
+./install.sh --start        # build, install, and start immediately (or: make quickstart)
+./install.sh --service      # build, install, and enable as a background service
+```
+
+For a system-wide Linux server install (`/usr/local/bin/verloc`, dedicated `verloc` user, `/etc/verloc/bootstrap.json`, `/var/lib/verloc`, and a hardened `systemd` unit):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sudo sh -s -- --system
+```
+
+**How `install.sh` works:**
+- Downloads a checksum-verified binary from GitHub Releases when available for your OS/arch (`linux`/`darwin`, `amd64`/`arm64`), and automatically falls back to building from source with Go **1.25+** (no C compiler or Node.js required because embedded dashboard assets are committed).
+- Re-running the installer upgrades only the binary and preserves your existing `bootstrap.json`, databases, and `master.key`.
+- Common flags: `--port 9000`, `--listen 127.0.0.1:9000`, `--dir /path/to/data`, `--from-source`, `--build-dash`, `--uninstall` (preserves data), `--uninstall --purge`.
+
+Open **<http://127.0.0.1:8080/dash/>** and continue with [First-run setup](#first-run-setup).
+
+### Option 2: Docker Compose
+
+From the repository root:
+
+```sh
+docker compose up -d
+```
+
+Read the private first-run setup token and open **<http://127.0.0.1:8080/dash/>**:
+
+```sh
+docker compose exec verloc cat /var/lib/verloc/verloc-data/setup.token
+```
+
+The Compose stack binds to `127.0.0.1:8080` by default, stores state in the persistent `verloc_data` volume under a non-root user (`uid 10001`), mounts the container root filesystem read-only, and includes a `/healthz` health check. Override defaults with environment variables:
+
+- `VERLOC_PORT` (default `8080`), `VERLOC_BIND` (default `127.0.0.1`)
+- `VERLOC_SECURE_COOKIES=true` when terminating TLS at a reverse proxy
+- `VERLOC_ALLOWED_HOSTS` and `VERLOC_TRUSTED_PROXIES` (comma-separated lists)
+
+### Option 3: Manual build from source
+
+#### Requirements
 
 - Go **1.25 or newer**.
-- Node.js **22.12 or newer** and npm to build the dashboard.
+- Node.js **22.12 or newer** and npm (only needed when rebuilding the dashboard; `CGO_ENABLED=0 go build ./cmd/verloc` works using the committed embedded assets).
 - A writable local filesystem for SQLite and private key files.
 - An upstream provider implementing the endpoint you intend to use.
 
@@ -55,11 +113,11 @@ printf '{"listen":"127.0.0.1:8080"}\n' > bootstrap.json
 
 Open **<http://127.0.0.1:8080/dash/>**.
 
-A bootstrap file is optional. Running `./verloc` in an empty directory creates the default databases and key files without `config.json`. **The default listener is `:8080` on all interfaces**; the example above binds to loopback explicitly. Do not expose plain HTTP credentials on an untrusted network.
+A bootstrap file is optional. Running `./verloc` in an empty directory creates the default databases and key files without `config.json`. **The default listener is `:8080` on all interfaces**; `install.sh`, `docker-compose.yml`, and the example above bind to loopback explicitly. Do not expose plain HTTP credentials on an untrusted network.
 
 ### First-run setup
 
-1. Read `verloc-data/setup.token` privately on the gateway host. The server logs its path, not its value. Do not share or commit it.
+1. Read the private `setup.token` file on the gateway host (default: `~/.local/share/verloc/verloc-data/setup.token` with `install.sh`, or `verloc-data/setup.token` in your runtime directory). The server logs its path, not its value. Do not share or commit it.
 2. Enter that token in the dashboard and create the owner password: at least 12 characters, at most 1,024 UTF-8 bytes. Setup can be completed only once.
 3. Open **Providers** and add an upstream. Supply its API base URL and credential, or explicitly select no authentication for a keyless provider. Use discovery and a test request to check the connection; tests can incur upstream charges.
 4. Add a model with a public ID such as `coding`, choose its provider, and set the upstream model ID. Review pricing instead of assuming that missing prices mean free usage.
@@ -178,6 +236,9 @@ provider prices.
 | `POST /v1/systemone` | Application API key | Native Jev/Clef typed-question evaluation; no streaming |
 | `POST /v1/messages` | Application API key | Anthropic Messages translated to Chat Completions, including streaming |
 | `POST /v1/messages/count_tokens` | Application API key | Local, approximate token count; no upstream inference |
+| `POST /v1/embeddings` | Application API key | Embeddings generation |
+| `POST /v1/images/generations` | Application API key | Image generation |
+| `POST /v1/images/edits` | Application API key | Image edits (multipart/form-data) |
 | `GET /v1/models` | None (key optional) | Enabled models; a presented key scopes the list to its access, anonymous callers see all enabled models |
 | `GET /v1/pricing` | Application API key | Scoped pricing catalog in USD per million tokens |
 | `GET /healthz` | None | Process liveness; does not test upstreams or storage |
@@ -304,12 +365,12 @@ All controls below default to off/`ordered` and live-apply immediately when save
 | Per-provider bulkhead | **Providers → Edit → Limits** | `providers.<name>.max_in_flight` (`0–4096`) | `0` (unbounded) |
 | TLS keep-warm probes | **Providers → Edit → Limits** | `providers.<name>.keep_warm_seconds` (`0–300`) | `0` (off) |
 | Adaptive / weighted routing | **Models → Edit → Routing** | `model_meta.<id>.routing.strategy` (`ordered` \| `latency` \| `weighted`), `primary_weight`, `model_routes.<id>[].weight` | `ordered` |
-| Speculative hedging | **Models → Edit → Routing** | `model_meta.<id>.routing.hedge_delay_ms` (`0–10000`), `max_hedges` (`1–2`) | `0` (off) |
+| Speculative hedging | **Models → Edit → Routing** | `model_meta.<id>.routing.hedge_delay_ms` (`0–30000`), `max_hedges` (`1–2`) | `0` (off) |
 | Deterministic response cache | **Settings → Response cache** | `cache.{enabled, ttl_seconds, max_entries, max_bytes, models}` | `enabled: false` |
 
 - **`latency` routing** uses Peak EWMA latency weighted by live in-flight concurrency and error penalties to steer toward the fastest healthy route.
 - **`weighted` routing** uses smooth weighted round-robin across primary and fallback targets and automatically bypasses unhealthy or bulkhead-saturated providers.
-- **Speculative hedging** applies to non-streaming requests only: if the primary route has not returned headers within `hedge_delay_ms`, verloc races backup routes and cancels losers immediately once a winner commits.
+- **Speculative hedging** applies to chat, Responses, and Anthropic Messages requests (both non-streaming and streaming, racing until response headers arrive): if the primary route has not returned headers within `hedge_delay_ms`, verloc launches a backup route and cancels the loser immediately once a winner commits.
 - **Response cache** is strictly isolated per client API key, caches only non-streaming `temperature=0` chat, `/v1/embeddings`, and `/v1/systemone`, sets `X-Verloc-Cache: HIT|MISS`, and bypasses whenever a request sends `Cache-Control: no-store` or `no-cache`.
 
 ## State and configuration
@@ -377,6 +438,8 @@ gateway.example.com {
 Use persistent **local** storage. Do not share SQLite files across replicas or put them on a network filesystem. Provider/model discovery and connection tests are owner-authorized outbound requests; grant owner access only to trusted operators.
 
 ### systemd example
+
+You can provision the hardened systemd deployment automatically with `sudo ./install.sh --system` (or `curl -fsSL https://raw.githubusercontent.com/kunalkcube/verloc/master/install.sh | sudo sh -s -- --system`), or configure it manually below.
 
 On a Linux host with systemd, install the binary as `/usr/local/bin/verloc`, create a dedicated `verloc` system user/group, and make `/var/lib/verloc` writable only by that user. Make the bootstrap file readable by the service user. Never run the gateway as root.
 
@@ -468,7 +531,7 @@ Restore validates checksums and credential decryption before publishing the new 
 ### Upgrade
 
 1. Back up the databases and separately secure the master key.
-2. Build and test the new binary, including its embedded dashboard.
+2. Build and test the new binary, including its embedded dashboard (or re-run `install.sh` to atomically replace the binary and restart the service).
 3. Stop the service, replace **only the binary**, and restart using the existing bootstrap and data paths.
 4. Check liveness, sign in, inspect readiness, and exercise an inference request.
 
@@ -488,6 +551,9 @@ Keep the previous binary for recovery, but do not assume older binaries can read
 
 | Command | Purpose |
 | --- | --- |
+| `./install.sh --service` | One-command install and background service setup |
+| `make install` / `make quickstart` | Local install (`~/.local/bin`) or install + start immediately |
+| `docker compose up -d` | Build and run the containerized gateway on `127.0.0.1:8080` |
 | `npm --prefix dashboard ci` | Install locked frontend dependencies |
 | `make build` | Build the dashboard, then the CGO-free binary |
 | `./scripts/build.sh` | Build with version/commit/build-time metadata |
@@ -504,14 +570,19 @@ Keep the previous binary for recovery, but do not assume older binaries can read
 
 CI uses Node 24 with the locked dashboard dependencies, runs the catalog
 regressions and frontend lint/type-check/build, then vets/tests Go and builds
-the CGO-free binary with the freshly generated assets.
+the CGO-free binary with the freshly generated assets. Pushing a `v*` tag triggers
+[`.github/workflows/release.yml`](.github/workflows/release.yml) to build and
+publish cross-platform release tarballs with SHA-256 checksums for `install.sh`.
 
 ```text
+install.sh               One-command installer, updater, and service manager (Linux/macOS)
+Dockerfile               Multi-stage container image (non-root, CGO-free)
+docker-compose.yml       One-command loopback-safe Compose stack
 config.example.json      Minimal key-less nvidia bootstrap example
 cmd/verloc/              CLI entry point
 internal/server/         HTTP gateway, auth, management, analytics, embedded assets
 dashboard/               React dashboard source (builds → internal/server/static)
-scripts/                 Release build and catalog tooling
+scripts/                 Release build, container entrypoint, and catalog tooling
 ```
 
 ## License
