@@ -10,7 +10,13 @@ export function readHistoryFilters(search: string): HistoryFilter {
   return filters;
 }
 
-export function buildHistoryParams(filters: HistoryFilter, rangeMs: number | null, anchor: number): URLSearchParams {
+export function buildHistoryParams(
+  filters: HistoryFilter,
+  rangeMs: number | null,
+  anchor: number,
+  rangeFrom?: number,
+  rangeTo?: number | null,
+): URLSearchParams {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
     if (!value) continue;
@@ -19,6 +25,12 @@ export function buildHistoryParams(filters: HistoryFilter, rangeMs: number | nul
       if (Number.isFinite(ts)) query.set(key, String(ts));
     } else query.set(key, value);
   }
-  if (!filters.since && rangeMs !== null) query.set('since', String(anchor - rangeMs));
+  if (!filters.since) {
+    if (typeof rangeFrom === 'number' && rangeFrom > 0) query.set('since', String(rangeFrom));
+    else if (rangeMs !== null) query.set('since', String(anchor - rangeMs));
+  }
+  if (!filters.until && typeof rangeTo === 'number' && rangeTo > 0) {
+    query.set('until', String(rangeTo));
+  }
   return query;
 }

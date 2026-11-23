@@ -491,6 +491,44 @@ func TestAnalyticsHourSummaryParityAndEdgeCases(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertAnalyticsEqual(t, tc.name, got, want)
+
+			// Store.Requests summary must also match between the hour-cache fast
+			// path (request_hour_cache_ready=1) and the raw requests table scan.
+			if _, err := s.db.Exec(`UPDATE analytics_meta SET value=1 WHERE name='request_hour_cache_ready'`); err != nil {
+				t.Fatal(err)
+			}
+			s.summaryMu.Lock()
+			s.summaryCache = nil
+			s.summaryMu.Unlock()
+			pageGot, err := s.Requests(ctx, tc.f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`UPDATE analytics_meta SET value=0 WHERE name='request_hour_cache_ready'`); err != nil {
+				t.Fatal(err)
+			}
+			s.summaryMu.Lock()
+			s.summaryCache = nil
+			s.summaryMu.Unlock()
+			pageWant, err := s.Requests(ctx, tc.f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pageGot.Total != pageWant.Total ||
+				pageGot.Summary.Requests != pageWant.Summary.Requests ||
+				pageGot.Summary.Errors != pageWant.Summary.Errors ||
+				pageGot.Summary.TokIn != pageWant.Summary.TokIn ||
+				pageGot.Summary.TokOut != pageWant.Summary.TokOut ||
+				pageGot.Summary.TokCache != pageWant.Summary.TokCache ||
+				pageGot.Summary.Images != pageWant.Summary.Images ||
+				pageGot.Summary.UnknownImages != pageWant.Summary.UnknownImages ||
+				pageGot.Summary.UnknownUsage != pageWant.Summary.UnknownUsage ||
+				pageGot.Summary.UnknownCost != pageWant.Summary.UnknownCost ||
+				math.Abs(pageGot.Summary.Cost-pageWant.Summary.Cost) > 1e-6 ||
+				math.Abs(pageGot.Summary.AvgLatencyMs-pageWant.Summary.AvgLatencyMs) > 1e-6 ||
+				math.Abs(pageGot.Summary.AvgTTFTMs-pageWant.Summary.AvgTTFTMs) > 1e-6 {
+				t.Fatalf("%s Requests summary mismatch:\n got =%+v\n want=%+v", tc.name, pageGot.Summary, pageWant.Summary)
+			}
 		})
 	}
 

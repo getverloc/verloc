@@ -33,7 +33,7 @@ export default function Backends({ state, series, range }: TabProps) {
 
   const backends = useMemo(() => {
     if (!state) return [];
-    const names = new Set([...Object.keys(state.backends), ...Object.keys(roll.backends)]);
+    const names = new Set([...Object.keys(state.backends), ...Object.keys(roll.backends)].filter(Boolean));
     return [...names]
       .filter((name) => name.toLowerCase().includes(q.trim().toLowerCase()))
       .map((name) => {

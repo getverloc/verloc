@@ -1,5 +1,3 @@
-import type { SeriesPoint } from '../../api';
-
 export const PALETTE = {
   requests: '#65e6cf',
   cost: '#eab97c',
@@ -20,20 +18,6 @@ export const TICK = {
   fontSize: 10,
   fontFamily: 'var(--font-mono)',
 } as const;
-
-// Anchor on the newest sample, so saved and stale snapshot windows still chart.
-export const CHART_RANGES = [
-  { value: '7d', label: '7 days', days: 7 },
-  { value: '30d', label: '30 days', days: 30 },
-  { value: '90d', label: '90 days', days: 90 },
-] as const;
-export type ChartRangeKey = (typeof CHART_RANGES)[number]['value'];
-
-export function filterSeriesByDays(series: SeriesPoint[], days: number): SeriesPoint[] {
-  if (!series.length) return series;
-  const newest = series.reduce((m, p) => Math.max(m, p.ts), 0);
-  return series.filter((p) => p.ts >= newest - days * 86_400_000);
-}
 
 export function shortName(name: string): string {
   const parts = name.split('/');

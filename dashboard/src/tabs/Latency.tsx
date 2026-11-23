@@ -19,18 +19,20 @@ export default function Latency({ state, series, range }: TabProps) {
   // counters and are labeled as such below.
   const footprints = useMemo(() => {
     const top = Object.entries(roll.models)
+      .filter(([name]) => Boolean(name) && name !== '(unknown)')
       .sort((a, b) => b[1].requests - a[1].requests)
       .slice(0, 5);
     return top.map(([name, w]) => {
       const session = state?.models[name];
+      const durableModel = detail?.models.find((m) => m.id === name);
       return {
         name,
         requests: w.requests,
-        errors: session?.err ?? 0,
+        errors: durableModel?.errors ?? session?.err ?? 0,
         cost: w.cost,
-        latencyMs: session?.lat_p95_ms ?? session?.lat_avg_ms ?? 0,
+        latencyMs: durableModel?.avg_latency_ms ?? session?.lat_p95_ms ?? session?.lat_avg_ms ?? 0,
         tokens: w.tokIn + w.tokOut,
-        images: detail?.models.find((m) => m.id === name)?.images ?? 0,
+        images: durableModel?.images ?? 0,
       };
     });
   }, [roll, state, detail]);
@@ -82,11 +84,11 @@ export default function Latency({ state, series, range }: TabProps) {
                     <TableRow>
                       <TableHead>Model</TableHead>
                       <TableHead className="text-right">Req</TableHead>
-                      <TableHead className="text-right">Err (session)</TableHead>
+                      <TableHead className="text-right">Errors</TableHead>
                       <TableHead className="text-right">Known cost</TableHead>
-                      <TableHead className="text-right">p95 (session)</TableHead>
+                      <TableHead className="text-right">Avg latency</TableHead>
                        <TableHead className="text-right">Tokens</TableHead>
-                       <TableHead className="text-right">Images (durable)</TableHead>
+                       <TableHead className="text-right">Images</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>

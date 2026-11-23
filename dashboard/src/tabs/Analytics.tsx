@@ -1,17 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from 'recharts';
+import { Info } from 'lucide-react';
 import {
   getAnalytics, fmtMoney, fmtInt, fmtTokens, fmtMs, fmtDateTime,
   type Analytics as AnalyticsData, type TabProps, type UsageGroup,
 } from '../api';
 import { HistoryFilters } from '../components/HistoryFilters';
 import { useHistoryFilters } from '../useHistoryFilters';
-import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '../components/ui/empty';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { Skeleton } from '../components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '../components/ui/chart';
 import { InlineError, KpiCard, PanelCard } from '../components/charts/shared';
 import { GRID_STROKE, PALETTE, TICK } from '../components/charts/config';
@@ -20,9 +21,9 @@ import Latency from './Latency';
 
 type UsageGroupKey = 'clients' | 'models' | 'providers' | 'endpoints';
 const UNATTRIBUTED_LABELS: Record<UsageGroupKey, string> = {
-  clients: 'Unattributed client',
-  models: 'Unattributed model',
-  providers: 'Unattributed provider',
+  clients: 'Anonymous / unkeyed',
+  models: 'Unconfigured model',
+  providers: 'Unrouted (rejected pre-upstream)',
   endpoints: 'Unknown / legacy endpoint',
 };
 
@@ -77,19 +78,34 @@ export default function Analytics(props: TabProps) {
         <>
           <div className="grid grid-cols-2 gap-px border border-edge-700 bg-edge-700 xl:grid-cols-5 [&>*]:border-0">
             <KpiCard label="Requests" value={fmtInt(summary.requests)} sub={`${fmtInt(summary.errors)} errors`} />
-            <KpiCard label="Known cost" value={fmtMoney(summary.cost)} sub={`${fmtInt(summary.unknown_cost)} requests with unknown cost`} accent="text-chart-4" />
-            <KpiCard label="Known input / output" value={`${fmtTokens(summary.tok_in)} / ${fmtTokens(summary.tok_out)}`} sub={`${fmtInt(summary.unknown_usage)} requests with unknown usage`} />
+            <KpiCard
+              label="Known cost"
+              value={fmtMoney(summary.cost)}
+              sub={
+                summary.unknown_cost > 0 ? (
+                  <Tooltip>
+                    <TooltipTrigger render={<span className="inline-flex cursor-help items-center gap-1 text-chart-4" />}>
+                      <Info className="size-3 shrink-0" aria-hidden="true" />
+                      <span>{fmtInt(summary.unknown_cost)} unpriced req</span>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {fmtInt(summary.unknown_cost)} requests lack token counts or model pricing and are excluded from known cost.
+                    </TooltipContent>
+                  </Tooltip>
+                ) : (
+                  'All requests priced'
+                )
+              }
+              accent="text-chart-4"
+            />
+            <KpiCard
+              label="Known input / output"
+              value={`${fmtTokens(summary.tok_in)} / ${fmtTokens(summary.tok_out)}`}
+              sub={summary.unknown_usage > 0 ? `${fmtInt(summary.unknown_usage)} without token counts` : 'All requests metered'}
+            />
             <KpiCard label="Cache tokens" value={fmtTokens(summary.tok_cache)} sub="Reported cache-read tokens" />
-            <KpiCard label="Generated images" value={fmtInt(summary.images)} sub={`${fmtInt(summary.unknown_images)} image requests with unknown count`} accent="text-chart-5" />
+            <KpiCard label="Generated images" value={fmtInt(summary.images)} sub={summary.unknown_images > 0 ? `${fmtInt(summary.unknown_images)} without count` : 'Recorded image outputs'} accent="text-chart-5" />
           </div>
-
-          {(summary.unknown_usage > 0 || summary.unknown_cost > 0) && (
-            <p>
-              <Badge variant="outline" className="whitespace-normal border-chart-4/40 px-3 py-2 text-chart-4">
-                Incomplete usage / cost coverage — unknown is not zero or free
-              </Badge>
-            </p>
-          )}
           <PanelCard
             title="02 / Dimensional comparison"
             description="Compare request volume and errors, then select a row to narrow the query. All groups remain in the ledger."

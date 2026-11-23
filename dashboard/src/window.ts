@@ -72,7 +72,12 @@ export function rollupSeries(series: SeriesPoint[]): WindowRollup {
 }
 
 export function rangeSince(range: RangePreset, now = Date.now()): number {
+  if (typeof range.from === 'number' && range.from > 0) return range.from;
   return range.ms == null ? 0 : now - range.ms;
+}
+
+export function rangeUntil(range: RangePreset): number | null {
+  return range.to ?? null;
 }
 
 /** How much of the selected window actually has samples. */
@@ -90,7 +95,10 @@ export function fmtSpan(from: number, to: number): string {
 
 export function fmtAxis(ts: number, range: RangePreset): string {
   const d = new Date(ts);
-  const ms = range.ms ?? Number.POSITIVE_INFINITY;
+  const end = range.to ?? Date.now();
+  const ms = typeof range.from === 'number' && range.from > 0
+    ? Math.max(0, end - range.from)
+    : (range.ms ?? Number.POSITIVE_INFINITY);
   if (ms > 60 * 60 * 1000) {
     return d.toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
   }

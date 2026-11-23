@@ -1,5 +1,7 @@
-// Known-cost share by provider. The ledger includes every active provider;
-// only positive known costs contribute slices to the donut.
+// Provider spend share (Overview).
+// A clean donut plus an always-visible provider list so every provider's full
+// identity, known spend, share, and request count are readable without hover.
+
 import { useMemo, useState } from 'react';
 import { Cell, Pie, PieChart } from 'recharts';
 import { fmtInt, fmtMoney } from '../../api';
@@ -7,41 +9,53 @@ import { ChartContainer, ChartTooltip, ChartTooltipContent } from '../ui/chart';
 import { ChartEmptyState, ChartSkeleton } from './shared';
 import { PALETTE } from './config';
 
-export interface ProviderCostSlice {
+export interface ProviderShareRow {
   name: string;
   cost: number;
   requests: number;
 }
 
 const MAX_SLICES = 6;
-// Tiny nonzero slices render at least this many degrees so their colours stay
-// visible next to a dominant provider. Tooltips and the provider list always
-// report the exact spend.
-const MIN_SLICE_ANGLE = 3;
 
-function withMinAngle(slices: ProviderCostSlice[], total: number) {
-  const minCost = total > 0 && slices.length > 1 ? total * (MIN_SLICE_ANGLE / 360) : 0;
-  return slices.map((slice) => ({ ...slice, renderCost: Math.max(slice.cost, minCost) }));
-}
-
-export function CostSharePie({ rows, loading }: { rows: ProviderCostSlice[]; loading?: boolean }) {
+export function CostSharePie({ rows, loading }: {
+  rows: ProviderShareRow[];
+  loading?: boolean;
+}) {
   const [activeSlice, setActiveSlice] = useState<number | null>(null);
-  const { providers, slices, renderSlices, total, groupedCount } = useMemo(() => {
-    const providers = [...rows].filter((row) => row.requests > 0 || row.cost > 0).sort((a, b) => b.cost - a.cost);
-    const priced = providers.filter((row) => row.cost > 0);
-    const total = priced.reduce((sum, row) => sum + row.cost, 0);
-    if (priced.length <= MAX_SLICES) return { providers, slices: priced, renderSlices: withMinAngle(priced, total), total, groupedCount: 0 };
+  const { providers, slices, total, groupedCount } = useMemo(() => {
+    const providers = rows
+      .filter((r) => Boolean(r.name) && (r.cost > 0 || r.requests > 0))
+      .sort((a, b) => b.cost - a.cost || b.requests - a.requests);
+    const priced = providers.filter((r) => r.cost > 0);
+    const total = priced.reduce((s, r) => s + r.cost, 0);
+    if (priced.length <= MAX_SLICES) return { providers, slices: priced, total, groupedCount: 0 };
+    const head = priced.slice(0, MAX_SLICES - 1);
     const tail = priced.slice(MAX_SLICES - 1);
-    const slices = [
-      ...priced.slice(0, MAX_SLICES - 1),
-      { name: `${tail.length} other providers`, cost: tail.reduce((sum, row) => sum + row.cost, 0), requests: tail.reduce((sum, row) => sum + row.requests, 0) },
-    ];
-    return { providers, slices, renderSlices: withMinAngle(slices, total), total, groupedCount: tail.length };
+    return {
+      providers,
+      slices: [
+        ...head,
+        {
+          name: `${tail.length} additional providers`,
+          cost: tail.reduce((s, r) => s + r.cost, 0),
+          requests: tail.reduce((s, r) => s + r.requests, 0),
+        },
+      ],
+      total,
+      groupedCount: tail.length,
+    };
   }, [rows]);
+
+  // Floor each visual slice at 2% of the circle so sub-1% providers still get a
+  // hoverable arc; tooltips and the ledger always read the real `cost`.
+  const renderSlices = useMemo(() => {
+    const floor = total * 0.02;
+    return slices.map((s) => ({ ...s, renderCost: Math.max(s.cost, floor) }));
+  }, [slices, total]);
 
   if (loading) return <ChartSkeleton height={240} />;
   if (!providers.length) {
-    return <ChartEmptyState title="No provider activity in this window" description="Provider spend and request details appear here after traffic is recorded." />;
+    return <ChartEmptyState title="No routed provider traffic" description="Upstream providers will appear here once requests are routed." />;
   }
 
   return (
@@ -91,7 +105,7 @@ export function CostSharePie({ rows, loading }: { rows: ProviderCostSlice[]; loa
             </div>
           </div>
         ) : (
-          <ChartEmptyState title="No known spend" description="Requests are listed alongside. Missing prices or usage do not mean free traffic." />
+          <ChartEmptyState title="No known spend" description="Routed providers and request counts are listed alongside." />
         )}
         {groupedCount > 0 && <p className="mt-2 text-[10px] leading-relaxed text-edge-400">The donut combines {groupedCount} providers into one slice. Every provider is listed individually.</p>}
       </div>
@@ -110,9 +124,6 @@ export function CostSharePie({ rows, loading }: { rows: ProviderCostSlice[]; loa
           </li>
         ))}
       </ul>
-      <p className="border-t border-edge-700 pt-3 text-[10px] leading-relaxed text-muted-foreground lg:col-span-2">
-        Share is based on the window's known spend. Request counts include all recorded outcomes; unknown costs are excluded from spend, not treated as free traffic.
-      </p>
     </div>
   );
 }

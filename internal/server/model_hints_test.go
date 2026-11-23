@@ -483,3 +483,170 @@ func TestAdminDiscoverAttachesHints(t *testing.T) {
 		t.Fatalf("gadget-v2 bad hint values: %+v", gadget.Hint)
 	}
 }
+
+func TestHintKindDetectionAndBareCatalogLookup(t *testing.T) {
+	// 1. OpenRouter-style text->text modality + supported_parameters -> chat
+	hChat := hintForDiscoveredModel(json.RawMessage(`{"id":"org/new-chat","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"supported_parameters":["tools","max_tokens"]}`), "upstream")
+	if hChat == nil || hChat.Type != "chat" || !slices.Equal(hChat.Operations, []string{"chat"}) {
+		t.Fatalf("expected chat kind from modalities/parameters, got %+v", hChat)
+	}
+
+	// 2. Upstream object with "type":"model" (OpenAI object type) + reasoning:true -> chat
+	hObj := hintForDiscoveredModel(json.RawMessage(`{"id":"org/reasoner","type":"model","reasoning":true,"max_context_length":131072,"max_generated_tokens":8192}`), "upstream")
+	if hObj == nil || hObj.Type != "chat" || hObj.ContextWindow != 131072 || hObj.MaxTokens != 8192 {
+		t.Fatalf("expected chat kind and limits from type=model + reasoning, got %+v", hObj)
+	}
+
+	// 3. Qualified upstream "openai/gpt-4o" matching bare LiteLLM catalog entry "gpt-4o",
+	// while still refusing cross-organization matches ("other/gpt-4o" vs "openai/gpt-4o").
+	bareIdx := catalogFixture(t, `[{"id":"bare-only-model","name":"Bare Model","type":"chat","context_window":128000}]`, "litellm")
+	if e := bareIdx.lookup("openai/bare-only-model"); e == nil || e.Name != "Bare Model" {
+		t.Fatalf("qualified upstream did not match unique bare catalog entry: %+v", e)
+	}
+	if e := bareIdx.lookup("openai/bare-only-model:free"); e != nil {
+		t.Fatalf(":free variant matched paid bare entry: %+v", e)
+	}
+
+	// 4. Conservative ID-pattern fallback for embeddings and images, while blocking audio/video.
+	for _, tc := range []struct {
+		id   string
+		want string
+	}{
+		{"baai/bge-large-en-v1.5", "embeddings"},
+		{"intfloat/multilingual-e5-large", "embeddings"},
+		{"voyage-3-lite", "embeddings"},
+		{"black-forest-labs/flux.1-dev", "images"},
+		{"bytedance/seedream-3.0", "images"},
+		{"stabilityai/stable-diffusion-xl", "images"},
+		{"openai/whisper-large-v3-audio", ""},
+		{"runway/gen3-video", ""},
+		{"cohere/rerank-v3.5", ""},
+		{"meta-llama/llama-3.3-70b", ""},
+	} {
+		if got := inferKindFromUpstreamID(tc.id); got != tc.want {
+			t.Fatalf("inferKindFromUpstreamID(%q)=%q, want %q", tc.id, got, tc.want)
+		}
+	}
+
+	// 5. Embedded seed index provides offline fallback hints for shipped upstream IDs.
+	embIdx := embeddedCatalogIndex()
+	if e := embIdx.lookup("gpt-oss-120b"); e == nil || e.ContextWindow == 0 || e.Type != "chat" {
+		t.Fatalf("embeddedCatalogIndex missing gpt-oss-120b: %+v", e)
+	}
+
+	// 6. Cloudflare "@cf/<org>/<model>" and quantization/instruct suffix matching.
+	normIdx := catalogFixture(t, `[{"id":"meta/llama-3.1-8b","name":"Llama 3.1 8B","type":"chat","context_window":131072}]`, "models.dev")
+	if e := normIdx.lookup("@cf/meta/llama-3.1-8b-instruct"); e == nil || e.Name != "Llama 3.1 8B" {
+		t.Fatalf("cloudflare @cf/ + -instruct normalization failed: %+v", e)
+	}
+	if e := normIdx.lookup("meta/llama-3.1-8b-fp8"); e == nil || e.Name != "Llama 3.1 8B" {
+		t.Fatalf("quantization -fp8 suffix normalization failed: %+v", e)
+	}
+	if e := normIdx.lookup("meta/llama-3.1-8b:free"); e != nil {
+		t.Fatalf(":free suffix must never match paid entry via stripHintModifiers: %+v", e)
+	}
+}
+
+func TestModelsDevProviderScopedAndFirstPartyCreatorResolution(t *testing.T) {
+	mdBody := `{
+		"google": {
+			"id": "google",
+			"name": "Google",
+			"models": {
+				"gemini-4-neon": {
+					"id": "gemini-4-neon",
+					"name": "Gemini 4 Neon",
+					"description": "Google's Gemini 4 model for fast, frontier-level coding, knowledge work and science workflows, with four thinking levels and a 1M-token context window",
+					"family": "gemini",
+					"attachment": true,
+					"reasoning": true,
+					"reasoning_options": [{"level": "high"}],
+					"tool_call": true,
+					"structured_output": true,
+					"temperature": true,
+					"modalities": {
+						"input": ["text", "image", "video", "audio", "pdf"],
+						"output": ["text"]
+					},
+					"open_weights": false,
+					"limit": {"context": 1048576, "output": 65536},
+					"cost": {"input": 3, "output": 15, "cache_read": 0.15, "input_audio": 3}
+				}
+			}
+		},
+		"reseller-a": {
+			"id": "reseller-a",
+			"api": "https://api.reseller-a.example/v1",
+			"models": {
+				"google/gemini-4-neon": {
+					"id": "google/gemini-4-neon",
+					"name": "Gemini 4 Neon (Reseller A)",
+					"open_weights": true,
+					"limit": {"context": 524288, "output": 32768},
+					"cost": {"input": 4, "output": 18, "cache_read": 0.5}
+				}
+			}
+		},
+		"reseller-b": {
+			"id": "reseller-b",
+			"api": "https://api.reseller-b.example/v1",
+			"models": {
+				"google/gemini-4-neon": {
+					"id": "google/gemini-4-neon",
+					"name": "Gemini 4 Neon (Reseller B)",
+					"limit": {"context": 262144, "output": 16384},
+					"cost": {"input": 5, "output": 20, "cache_read": 1.0}
+				}
+			}
+		}
+	}`
+	mdIdx, err := indexModelsDev([]byte(mdBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Direct lookup for provider="google" (or base_url="https://generativelanguage.googleapis.com/v1beta/openai")
+	// gets 100% of Google's gemini-4-neon fields.
+	hGoogle := mergeHintForProvider("gemini-4-neon", "google", "https://generativelanguage.googleapis.com/v1beta/openai", mdIdx, []catalogIndex{mdIdx})
+	if hGoogle == nil {
+		t.Fatal("missing google gemini-4-neon hint")
+	}
+	if hGoogle.Name != "Gemini 4 Neon" || hGoogle.OwnedBy != "gemini" || hGoogle.Type != "chat" || hGoogle.ContextWindow != 1048576 || hGoogle.MaxTokens != 65536 {
+		t.Fatalf("unexpected google hint identity/limits: %+v", hGoogle)
+	}
+	if !hGoogle.PricingKnown || hGoogle.PricingInput != 3 || hGoogle.PricingOutput != 15 || !hGoogle.cacheKnown || hGoogle.PricingCache != 0.15 {
+		t.Fatalf("unexpected google hint pricing: %+v", hGoogle)
+	}
+	if hGoogle.Attachment == nil || !*hGoogle.Attachment || hGoogle.Reasoning == nil || !*hGoogle.Reasoning || hGoogle.Temperature == nil || !*hGoogle.Temperature {
+		t.Fatalf("unexpected google hint capability flags: attachment=%v reasoning=%v temp=%v", hGoogle.Attachment, hGoogle.Reasoning, hGoogle.Temperature)
+	}
+	for _, tag := range []string{"reasoning", "tool-use", "structured-output", "vision", "audio-input", "video-input", "pdf-input"} {
+		if !slices.Contains(hGoogle.Tags, tag) {
+			t.Fatalf("missing tag %q in %v", tag, hGoogle.Tags)
+		}
+	}
+
+	// 2. Scoped lookup by API host ("https://api.reseller-a.example/v1") gets Reseller A's exact pricing and limits
+	// even though Reseller A and Reseller B conflict in the global index!
+	hResellerA := mergeHintForProvider("google/gemini-4-neon", "custom-name", "https://api.reseller-a.example/v1", mdIdx, []catalogIndex{mdIdx})
+	if hResellerA == nil || !hResellerA.PricingKnown || hResellerA.PricingInput != 4 || hResellerA.PricingOutput != 18 || hResellerA.PricingCache != 0.5 || hResellerA.ContextWindow != 524288 || hResellerA.MaxTokens != 32768 {
+		t.Fatalf("provider-scoped API host lookup lost reseller-a pricing/limits: %+v", hResellerA)
+	}
+	if !slices.Contains(hResellerA.Tags, "open-weights") {
+		t.Fatalf("expected open-weights tag on reseller-a entry: %v", hResellerA.Tags)
+	}
+
+	// 3. Unscoped lookup of "google/gemini-4-neon" (where reseller-a and reseller-b conflict in global consensus)
+	// falls back to first-party creator "google" in models.dev so authoritative limits/pricing are recovered!
+	hCreator := mergeHintForProvider("google/gemini-4-neon", "unknown-proxy", "", mdIdx, []catalogIndex{mdIdx})
+	if hCreator == nil || !hCreator.PricingKnown || hCreator.PricingInput != 3 || hCreator.PricingOutput != 15 || hCreator.ContextWindow != 1048576 || hCreator.MaxTokens != 65536 {
+		t.Fatalf("first-party creator fallback did not recover google specs when resellers conflicted: %+v", hCreator)
+	}
+
+	// 4. Priority order check: models.dev is 2nd position (right after upstream native metadata, before Vercel/OpenRouter).
+	vercelIdx := catalogFixture(t, `{"data":[{"id":"google/gemini-4-neon","name":"Vercel Gemini","context_window":128000,"max_tokens":8192,"pricing":{"input":"0.000009","output":"0.000029"}}]}`, "vercel")
+	hPriority := mergeHintForProvider("google/gemini-4-neon", "google", "", mdIdx, []catalogIndex{mdIdx, vercelIdx})
+	if hPriority == nil || hPriority.Source != "models.dev" || hPriority.PricingInput != 3 || hPriority.ContextWindow != 1048576 {
+		t.Fatalf("models.dev did not take 2nd-position priority ahead of vercel: %+v", hPriority)
+	}
+}

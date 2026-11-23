@@ -148,6 +148,171 @@ func scanSummary(row interface{ Scan(...any) error }, s *RequestSummary) error {
 	return row.Scan(&s.Requests, &s.Errors, &s.TokIn, &s.TokOut, &s.TokCache, &s.Cost, &s.UnknownUsage, &s.UnknownCost, &s.AvgLatencyMs, &s.AvgTTFTMs, &s.Images, &s.UnknownImages)
 }
 
+// requestHourCacheTarget reports whether f can be satisfied from
+// analytics_hour_summary (either unfiltered or with a single dimension
+// filter: model, backend, endpoint, or client_key_id).
+func (f RequestFilter) requestHourCacheTarget() (kind int, key string, ok bool) {
+	if f.Status != "" || f.Q != "" {
+		return 0, "", false
+	}
+	n := 0
+	if f.Model != "" {
+		n++
+		kind, key = 1, f.Model
+	}
+	if f.Backend != "" {
+		n++
+		kind, key = 2, f.Backend
+	}
+	if f.Endpoint != "" {
+		n++
+		kind, key = 3, f.Endpoint
+	}
+	if f.ClientKeyID != "" {
+		n++
+		kind, key = 4, f.ClientKeyID
+	}
+	return kind, key, n <= 1
+}
+
+func foldRequestsSummaryWhere(ctx context.Context, tx *sql.Tx, f RequestFilter, timeWhere string, timeArgs []any, dst *usageAccumulator) error {
+	where, args := f.where(false)
+	if timeWhere != "" {
+		where, args = timeWhere, append([]any(nil), timeArgs...)
+		for _, v := range []struct{ col, val string }{{"model", f.Model}, {"backend", f.Backend}, {"client_key_id", f.ClientKeyID}, {"endpoint", f.Endpoint}} {
+			if v.val != "" {
+				where += " AND " + v.col + "=?"
+				args = append(args, v.val)
+			}
+		}
+	}
+	var (
+		reqs, errs, unkU, unkC, ttftN, imgs, unkImgs int64
+		tokIn, tokOut, tokCache                      uint64
+		cost, latSum, ttftSum                        float64
+	)
+	err := tx.QueryRowContext(ctx, `SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(tok_in),0),
+		COALESCE(SUM(tok_out),0),
+		COALESCE(SUM(tok_cache),0),
+		COALESCE(SUM(cost),0),
+		COALESCE(SUM(CASE WHEN usage_known=0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN cost_known=0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(lat_ms),0),
+		COALESCE(SUM(CASE WHEN ttft_ms>0 THEN ttft_ms ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN ttft_ms>0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN images_known=1 THEN images ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN endpoint IN ('images','images/generations','images/edits') AND images_known=0 THEN 1 ELSE 0 END),0)
+		FROM requests WHERE `+where, args...).
+		Scan(&reqs, &errs, &tokIn, &tokOut, &tokCache, &cost, &unkU, &unkC, &latSum, &ttftSum, &ttftN, &imgs, &unkImgs)
+	if err != nil {
+		return err
+	}
+	dst.Requests += reqs
+	dst.Errors += errs
+	dst.TokIn += tokIn
+	dst.TokOut += tokOut
+	dst.TokCache += tokCache
+	dst.Cost += cost
+	dst.UnknownUsage += unkU
+	dst.UnknownCost += unkC
+	dst.latSum += latSum
+	dst.ttftSum += ttftSum
+	dst.ttftN += ttftN
+	dst.Images += imgs
+	dst.UnknownImages += unkImgs
+	return nil
+}
+
+func foldHourCacheSummaryWhere(ctx context.Context, tx *sql.Tx, where string, args []any, targetKind int, targetKey string, dst *usageAccumulator) error {
+	rows, err := tx.QueryContext(ctx, `SELECT blob FROM analytics_hour_summary WHERE `+where+` ORDER BY hour ASC`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var blob sql.RawBytes
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := rows.Scan(&blob); err != nil {
+			return err
+		}
+		if err := decodeHourSummaryInto(blob, targetKind, targetKey, dst); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func computeRequestSummaryFromHourCache(ctx context.Context, tx *sql.Tx, f RequestFilter, targetKind int, targetKey string) (RequestSummary, bool, error) {
+	var cacheReady int64
+	_ = tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT value FROM analytics_meta WHERE name='request_hour_cache_ready'), 0)`).Scan(&cacheReady)
+	if cacheReady != 1 {
+		return RequestSummary{}, false, nil
+	}
+	var total usageAccumulator
+	switch {
+	case f.Since <= 0 && f.Until <= 0:
+		if err := foldHourCacheSummaryWhere(ctx, tx, "1=1", nil, targetKind, targetKey, &total); err != nil {
+			return RequestSummary{}, false, err
+		}
+	case f.Since > 0 && f.Until <= 0:
+		fullStart := ((f.Since + 3599999) / 3600000) * 3600000
+		if f.Since < fullStart {
+			if err := foldRequestsSummaryWhere(ctx, tx, f, "ts>=? AND ts<?", []any{f.Since, fullStart}, &total); err != nil {
+				return RequestSummary{}, false, err
+			}
+		}
+		if err := foldHourCacheSummaryWhere(ctx, tx, "hour>=?", []any{fullStart}, targetKind, targetKey, &total); err != nil {
+			return RequestSummary{}, false, err
+		}
+	case f.Since <= 0 && f.Until > 0:
+		fullEnd := ((f.Until + 1) / 3600000) * 3600000
+		if fullEnd > 0 {
+			if err := foldHourCacheSummaryWhere(ctx, tx, "hour<?", []any{fullEnd}, targetKind, targetKey, &total); err != nil {
+				return RequestSummary{}, false, err
+			}
+			if fullEnd <= f.Until {
+				if err := foldRequestsSummaryWhere(ctx, tx, f, "ts>=? AND ts<=?", []any{fullEnd, f.Until}, &total); err != nil {
+					return RequestSummary{}, false, err
+				}
+			}
+		} else {
+			if err := foldRequestsSummaryWhere(ctx, tx, f, "ts<=?", []any{f.Until}, &total); err != nil {
+				return RequestSummary{}, false, err
+			}
+		}
+	default: // f.Since > 0 && f.Until > 0
+		if f.Until >= f.Since {
+			fullStart := ((f.Since + 3599999) / 3600000) * 3600000
+			fullEnd := ((f.Until + 1) / 3600000) * 3600000
+			if fullStart < fullEnd {
+				if f.Since < fullStart {
+					if err := foldRequestsSummaryWhere(ctx, tx, f, "ts>=? AND ts<?", []any{f.Since, fullStart}, &total); err != nil {
+						return RequestSummary{}, false, err
+					}
+				}
+				if err := foldHourCacheSummaryWhere(ctx, tx, "hour>=? AND hour<?", []any{fullStart, fullEnd}, targetKind, targetKey, &total); err != nil {
+					return RequestSummary{}, false, err
+				}
+				if fullEnd <= f.Until {
+					if err := foldRequestsSummaryWhere(ctx, tx, f, "ts>=? AND ts<=?", []any{fullEnd, f.Until}, &total); err != nil {
+						return RequestSummary{}, false, err
+					}
+				}
+			} else {
+				if err := foldRequestsSummaryWhere(ctx, tx, f, "ts>=? AND ts<=?", []any{f.Since, f.Until}, &total); err != nil {
+					return RequestSummary{}, false, err
+				}
+			}
+		}
+	}
+	return total.summary(), true, nil
+}
+
 // summaryCache memoises the full-scan summary aggregate. The dashboard
 // recomputes it on every pagination click (the same filter, a new cursor), so
 // without this a 300k-row history paid 138ms per click. Keyed by the filter
@@ -189,8 +354,21 @@ func (s *Store) Requests(ctx context.Context, f RequestFilter) (RequestPage, err
 	if ok {
 		out.Summary = cached.s
 	} else {
-		if err = scanSummary(tx.QueryRowContext(ctx, `SELECT `+summarySQL+` FROM requests WHERE `+where, args...), &out.Summary); err != nil {
-			return out, err
+		usedHourCache := false
+		if targetKind, targetKey, canUse := f.requestHourCacheTarget(); canUse {
+			sSummary, okCache, cerr := computeRequestSummaryFromHourCache(ctx, tx, f, targetKind, targetKey)
+			if cerr != nil {
+				return out, cerr
+			}
+			if okCache {
+				out.Summary = sSummary
+				usedHourCache = true
+			}
+		}
+		if !usedHourCache {
+			if err = scanSummary(tx.QueryRowContext(ctx, `SELECT `+summarySQL+` FROM requests WHERE `+where, args...), &out.Summary); err != nil {
+				return out, err
+			}
 		}
 		s.summaryMu.Lock()
 		if s.summaryCache == nil {

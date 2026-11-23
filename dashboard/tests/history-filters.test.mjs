@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildHistoryParams, readHistoryFilters } from '../src/history-filters.ts';
+import { defaultRange, makeTimeRange, readRange, writeRange } from '../src/time-range.ts';
 
 const emptyFilters = () => ({
   endpoint: '',
@@ -58,4 +59,29 @@ test('invalid custom dates are omitted from the API query', () => {
   const params = buildHistoryParams(filters, 60_000, 1_800_000_000_000);
 
   assert.equal(params.has('since'), false);
+});
+
+test('custom date range supplies since and until when filter overrides are blank', () => {
+  const filters = emptyFilters();
+  const params = buildHistoryParams(filters, 120_000, 1_800_000_000_000, 1_700_000_000_000, 1_700_086_400_000);
+
+  assert.equal(params.get('since'), '1700000000000');
+  assert.equal(params.get('until'), '1700086400000');
+});
+
+test('time-range URL serialization round-trips live and fixed bounds', () => {
+  const now = 1_800_000_000_000;
+  const fixed = makeTimeRange(1_799_000_000_000, 1_799_500_000_000, now);
+  const url = new URL('http://localhost/dash/?range=1h');
+  writeRange(url, fixed);
+
+  assert.equal(url.searchParams.has('range'), false);
+  const parsed = readRange(url.search, now);
+  assert.equal(parsed.from, 1_799_000_000_000);
+  assert.equal(parsed.to, 1_799_500_000_000);
+
+  const fallback = readRange('?from=invalid', now);
+  const def = defaultRange(now);
+  assert.equal(fallback.from, def.from);
+  assert.equal(fallback.to, null);
 });

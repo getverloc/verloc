@@ -1,5 +1,45 @@
 import type { AdminModel, ImagePricing, ModelHint } from '../../api';
 
+export type ProviderPreset = {
+  id: string;
+  label: string;
+  name: string;
+  base_url: string;
+  api_format: 'openai' | 'systemone';
+  no_auth?: boolean;
+  synthesize_cli_headers?: boolean;
+  strip_reasoning_content?: boolean;
+  allow_private_upstreams?: boolean;
+  max_tokens?: string;
+  note?: string;
+};
+
+export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
+  { id: 'google', label: 'Google Gemini', name: 'google', base_url: 'https://generativelanguage.googleapis.com/v1beta/openai', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'openai', label: 'OpenAI', name: 'openai', base_url: 'https://api.openai.com/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'deepseek', label: 'DeepSeek', name: 'deepseek', base_url: 'https://api.deepseek.com/v1', api_format: 'openai', strip_reasoning_content: false },
+  { id: 'xai', label: 'xAI (Grok)', name: 'xai', base_url: 'https://api.x.ai/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'nvidia', label: 'NVIDIA NIM', name: 'nvidia', base_url: 'https://integrate.api.nvidia.com/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'openrouter', label: 'OpenRouter', name: 'openrouter', base_url: 'https://openrouter.ai/api/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'vercel', label: 'Vercel AI Gateway', name: 'vercel', base_url: 'https://ai-gateway.vercel.sh/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'groq', label: 'Groq', name: 'groq', base_url: 'https://api.groq.com/openai/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'cerebras', label: 'Cerebras', name: 'cerebras', base_url: 'https://api.cerebras.ai/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'mistral', label: 'Mistral', name: 'mistral', base_url: 'https://api.mistral.ai/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'cloudflare', label: 'Cloudflare Workers AI', name: 'cf', base_url: 'https://api.cloudflare.com/client/v4/accounts/%ACCOUNT%/ai/v1', api_format: 'openai', strip_reasoning_content: true, note: 'Paste credentials as account_id:api_key' },
+  { id: 'siliconflow', label: 'SiliconFlow', name: 'siliconflow', base_url: 'https://api.siliconflow.com/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'novita', label: 'Novita AI', name: 'novita', base_url: 'https://api.novita.ai/v3/openai', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'gmi', label: 'GMI Cloud', name: 'gmi', base_url: 'https://api.gmi-serving.com/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'together', label: 'Together AI', name: 'together', base_url: 'https://api.together.xyz/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'fireworks', label: 'Fireworks AI', name: 'fireworks', base_url: 'https://api.fireworks.ai/inference/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'hyperbolic', label: 'Hyperbolic', name: 'hyper', base_url: 'https://api.hyperbolic.xyz/v1', api_format: 'openai', strip_reasoning_content: false },
+  { id: 'wandb', label: 'W&B Inference', name: 'wandb', base_url: 'https://api.inference.wandb.ai/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'zenmux', label: 'ZenMux', name: 'zenmux', base_url: 'https://zenmux.ai/api/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'opencode', label: 'OpenCode Zen (keyless)', name: 'opencode', base_url: 'https://opencode.ai/zen/v1', api_format: 'openai', no_auth: true, synthesize_cli_headers: true, strip_reasoning_content: false },
+  { id: 'typesafe', label: 'TypeSafe (System One)', name: 'typesafe', base_url: 'https://api.typesafe.ai/v1', api_format: 'systemone', strip_reasoning_content: true },
+  { id: 'ollama-cloud', label: 'Ollama Cloud', name: 'ollama', base_url: 'https://ollama.com/v1', api_format: 'openai', strip_reasoning_content: true },
+  { id: 'ollama-local', label: 'Ollama (Local / LAN)', name: 'ollama', base_url: 'http://127.0.0.1:11434/v1', api_format: 'openai', no_auth: true, allow_private_upstreams: true, strip_reasoning_content: true },
+] as const;
+
 export type WizMeta = {
   dn: string; description: string; owned_by: string; tags: string[];
   pi: string; po: string; pc: string; piImage: string; ctx: string; mx: string; src: string;
@@ -23,7 +63,31 @@ function existingPrefixes(providers: { name: string }[], models: { id: string }[
 }
 
 export function uniquePrefix(providerName: string, providers: { name: string }[], models: { id: string }[]): string {
-  const letters = (providerName || '').toLowerCase().replace(/[^a-z0-9]/g, '') || 'xx';
+  const cleanName = (providerName || '').trim().toLowerCase();
+  // If this provider already has configured models with a consistent prefix,
+  // reuse that provider's own prefix so adding more models to an existing
+  // provider keeps a uniform namespace (e.g. "nv/..." for "nvidia").
+  if (cleanName) {
+    const ownModels = (models as { id: string; backend?: string }[]).filter((m) => m.backend === cleanName);
+    const counts = new Map<string, number>();
+    for (const m of ownModels) {
+      const i = m.id.indexOf('/');
+      if (i > 0) {
+        const p = m.id.slice(0, i);
+        counts.set(p, (counts.get(p) || 0) + 1);
+      }
+    }
+    let bestPrefix = '';
+    let bestCount = 0;
+    for (const [p, c] of counts) {
+      if (c > bestCount) {
+        bestPrefix = p;
+        bestCount = c;
+      }
+    }
+    if (bestPrefix) return bestPrefix;
+  }
+  const letters = cleanName.replace(/[^a-z0-9]/g, '') || 'xx';
   const taken = existingPrefixes(providers, models);
   const cands = [letters.slice(0, 2) || 'xx', letters.slice(0, 3), letters.slice(0, 4)];
   for (const c of cands) if (c && !taken.has(c)) return c;
