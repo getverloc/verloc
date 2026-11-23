@@ -24,7 +24,7 @@ RUN VER="${VERSION:-v$(tr -d ' \t\r\n' < VERSION)}" \
       -ldflags="-s -w -X main.version=${VER} -X main.commit=${COMMIT} -X main.buildTime=${BT}" \
       -o /out/verloc ./cmd/verloc
 
-FROM alpine:3.21
+FROM alpine:3.24
 LABEL org.opencontainers.image.title="verloc" \
       org.opencontainers.image.description="Self-hosted, single-binary OpenAI-compatible LLM gateway with adaptive routing, SQLite analytics, and an embedded operations dashboard." \
       org.opencontainers.image.url="https://github.com/getverloc/verloc" \
