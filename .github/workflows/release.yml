@@ -5,13 +5,15 @@ on:
     tags:
       - 'v*.*.*'
 
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
 
@@ -38,7 +40,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version-file: go.mod
 
       - name: verify tests
         run: |
@@ -69,6 +71,11 @@ jobs:
           (cd dist && sha256sum verloc_*.tar.gz > checksums.txt)
           cat dist/checksums.txt
 
+      - name: attest release archives
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/verloc_*.tar.gz
+
       - name: publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,6 +92,11 @@ jobs:
   docker:
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
 
@@ -111,6 +123,7 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: build and push multi-arch container image
+        id: push
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -124,3 +137,10 @@ jobs:
             BUILD_TIME=${{ steps.meta.outputs.created }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: attest container image provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/getverloc/verloc
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

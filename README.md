@@ -59,15 +59,26 @@ curl -fsSL https://raw.githubusercontent.com/getverloc/verloc/master/install.sh 
 ```
 
 **How `install.sh` works:**
-- Downloads a checksum-verified binary from GitHub Releases when available for your OS/arch (`linux`/`darwin`, `amd64`/`arm64`), and automatically falls back to building from source with Go **1.25+** (no C compiler or Node.js required because embedded dashboard assets are committed).
+- Downloads a checksum-verified binary from GitHub Releases when available for your OS/arch (`linux`/`darwin`, `amd64`/`arm64`), and automatically falls back to building from source with Go **1.26+** (no C compiler or Node.js required because embedded dashboard assets are committed).
 - Re-running the installer upgrades only the binary and preserves your existing `bootstrap.json`, databases, and `master.key`.
 - Common flags: `--port 9000`, `--listen 127.0.0.1:9000`, `--dir /path/to/data`, `--from-source`, `--build-dash`, `--uninstall` (preserves data), `--uninstall --purge`.
 
 Open **<http://127.0.0.1:8080/dash/>** and continue with [First-run setup](#first-run-setup).
 
-### Option 2: Docker Compose
+### Option 2: Docker & Docker Compose
 
-From the repository root:
+Run the prebuilt multi-arch image (`linux/amd64`, `linux/arm64`) from GitHub Container Registry:
+
+```sh
+docker run -d --name verloc \
+  -p 127.0.0.1:8080:8080 \
+  -v verloc_data:/var/lib/verloc \
+  --read-only --tmpfs /tmp \
+  --security-opt no-new-privileges:true \
+  ghcr.io/getverloc/verloc:latest
+```
+
+Or build and run locally with Docker Compose from the repository root:
 
 ```sh
 docker compose up -d
@@ -89,7 +100,7 @@ The Compose stack binds to `127.0.0.1:8080` by default, stores state in the pers
 
 #### Requirements
 
-- Go **1.25 or newer**.
+- Go **1.26 or newer**.
 - Node.js **22.12 or newer** and npm (only needed when rebuilding the dashboard; `CGO_ENABLED=0 go build ./cmd/verloc` works using the committed embedded assets).
 - A writable local filesystem for SQLite and private key files.
 - An upstream provider implementing the endpoint you intend to use.
@@ -592,8 +603,9 @@ CI uses Node 24 with the locked dashboard dependencies, runs the catalog
 regressions and frontend lint/type-check/build, then vets/tests Go and builds
 the CGO-free binary with the freshly generated assets. Pushing a `v*` tag triggers
 [`.github/workflows/release.yml`](.github/workflows/release.yml) to build and
-publish cross-platform release tarballs with SHA-256 checksums for `install.sh`
-and multi-arch container images (`linux/amd64`, `linux/arm64`) to `ghcr.io/getverloc/verloc`.
+publish cross-platform release tarballs with SHA-256 checksums, multi-arch
+container images (`linux/amd64`, `linux/arm64`) to `ghcr.io/getverloc/verloc`,
+and SLSA build provenance attestations (`gh attestation verify`).
 
 ```text
 VERSION                  Canonical SemVer version (MAJOR.MINOR.PATCH)

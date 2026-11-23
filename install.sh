@@ -236,7 +236,7 @@ check_go_version() {
   if [ -z "$major" ] || [ -z "$minor" ]; then
     return 1
   fi
-  if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 25 ]; }; then
+  if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 26 ]; }; then
     return 0
   fi
   return 1
@@ -249,7 +249,7 @@ in_local_repo() {
 build_from_dir() {
   src_dir="$1"
   out_bin="$2"
-  check_go_version || die "Go 1.25 or newer is required to build from source (https://go.dev/dl/)"
+  check_go_version || die "Go 1.26 or newer is required to build from source (https://go.dev/dl/)"
 
   if [ "$BUILD_DASH" -eq 1 ]; then
     need_cmd npm

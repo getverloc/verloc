@@ -1,8 +1,16 @@
 name: ci
+
 on:
   push:
     branches: [master, main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -30,7 +38,7 @@ jobs:
         run: npm run build
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version-file: go.mod
       - name: vet
         run: go vet ./...
       - name: test (race)
@@ -39,3 +47,17 @@ jobs:
         run: CGO_ENABLED=0 go build -trimpath -o /tmp/verloc ./cmd/verloc
       - name: benchmarks compile and run (smoke)
         run: go test ./internal/server/ -short -run='^$' -bench='EndToEndStream100KB' -benchtime=10x -count=1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: verify Docker image builds cleanly
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

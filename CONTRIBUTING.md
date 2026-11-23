@@ -15,7 +15,7 @@ install.sh               One-command installer, updater, and service manager (Li
 
 ## Development Requirements
 
-- **Go 1.25+** (CGO is disabled; no C compiler required)
+- **Go 1.26+** (CGO is disabled; no C compiler required)
 - **Node.js 22.12+** (or 24) and **npm** (only required when editing `dashboard/`)
 
 ## Local Setup & Verification
