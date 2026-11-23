@@ -295,6 +295,15 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			proxyError(w, status, message)
 		}
 	}
+	failUpstream := func(status int, clientMessage string) {
+		rec.Status, rec.Outcome, rec.ErrMsg = status, "upstream_rejected", defaultUpstreamRejectedMsg
+		if clientMessage == "" {
+			clientMessage = defaultUpstreamRejectedMsg
+		}
+		if r.Context().Err() == nil {
+			proxyError(w, status, clientMessage)
+		}
+	}
 	if s.shuttingDown.Load() {
 		fail(503, "unavailable", "gateway shutting down")
 		return
@@ -518,7 +527,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 			b.pool.ObserveHeaders(ks, resp.Header)
 			lastStatus = resp.StatusCode
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 				_ = resp.Body.Close()
 				budgetTimer.Stop()
 				cancel()
@@ -527,7 +536,7 @@ func (s *Server) forwardMedia(w http.ResponseWriter, r *http.Request, endpoint s
 				finishAttempt(resp.StatusCode, "upstream_rejected")
 				if !retryable {
 					releaseHeld()
-					fail(resp.StatusCode, "upstream_rejected", "upstream rejected request")
+					failUpstream(resp.StatusCode, safeUpstreamErrorMessage(resp.StatusCode, body, ks.Key, ks.AccountID))
 					return
 				}
 				b.route.Observe(time.Since(attemptStart), false)

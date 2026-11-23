@@ -242,3 +242,34 @@ func TestGzipVaryPreservesExistingEncodingAndWildcard(t *testing.T) {
 		}
 	}
 }
+
+func TestGzipMiddlewareSkipsAllStreamingInferencePaths(t *testing.T) {
+	paths := []string{
+		"/v1/messages",
+		"/messages",
+		"/v1/responses",
+		"/responses",
+		"/v1/chat/completions",
+		"/chat/completions",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			var sawOriginalWriter bool
+			rec := httptest.NewRecorder()
+			h := gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sawOriginalWriter = (w == http.ResponseWriter(rec))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(strings.Repeat(`{"ok":true}`, 50)))
+			}))
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			req.Header.Set("Accept-Encoding", "gzip")
+			h.ServeHTTP(rec, req)
+			if rec.Header().Get("Content-Encoding") == "gzip" {
+				t.Fatalf("%s was unexpectedly gzipped", path)
+			}
+			if !sawOriginalWriter {
+				t.Fatalf("%s did not bypass gzip ResponseWriter wrapper", path)
+			}
+		})
+	}
+}

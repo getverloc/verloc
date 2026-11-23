@@ -44,16 +44,20 @@ func newAnthropicStreamState(model string) *anthropicStreamState {
 }
 
 // writeAnthropicEvent marshals one SSE event and writes it to the writer.
+// Client write errors are wrapped in *streamClientError so forward() classifies
+// client disconnects as 499 canceled rather than 502 upstream interruption.
 func writeAnthropicEvent(w http.ResponseWriter, event string, payload any) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	if _, err := w.Write([]byte("event: " + event + "\n")); err != nil {
-		return err
+		return &streamClientError{err}
 	}
-	_, err = w.Write([]byte("data: " + string(b) + "\n\n"))
-	return err
+	if _, err := w.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
+		return &streamClientError{err}
+	}
+	return nil
 }
 
 // messageStart is emitted exactly once before the first content.
@@ -162,8 +166,10 @@ func (a *anthropicStreamState) finish(w http.ResponseWriter) error {
 // emitPing writes an SSE comment ping. Claude Code's idle watchdog measures
 // inter-byte gaps, and OpenAI upstreams do not send pings of their own.
 func emitPing(w http.ResponseWriter) error {
-	_, err := w.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
-	return err
+	if _, err := w.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")); err != nil {
+		return &streamClientError{err}
+	}
+	return nil
 }
 
 // ingestChunk translates one OpenAI SSE data payload into Anthropic events.
@@ -378,17 +384,14 @@ func streamCopyAnthropic(w http.ResponseWriter, src io.Reader, model string, onU
 			return nil
 		}
 	}
-	if err := state.finish(w); err != nil {
-		return err
-	}
-	if err := flush(); err != nil {
-		return err
-	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
 	if !terminal && !finished {
 		return io.ErrUnexpectedEOF
 	}
-	return nil
+	if err := state.finish(w); err != nil {
+		return err
+	}
+	return flush()
 }

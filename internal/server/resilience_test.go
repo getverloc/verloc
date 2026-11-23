@@ -195,8 +195,8 @@ func TestAdaptiveRoutingPeakEWMAAndWeighted(t *testing.T) {
 			ModelRoutes:     map[string][]RouteTarget{"m": {{Backend: "fast", Upstream: "up-fast"}}},
 			ModelMeta:       map[string]*ModelMeta{"m": {Routing: &RoutePolicy{Strategy: "latency"}}},
 			Providers: map[string]*ProviderConfig{
-				"slow": {BaseURL: slowSrv.URL, NoAuth: true},
-				"fast": {BaseURL: fastSrv.URL, NoAuth: true},
+				"slow": {BaseURL: slowSrv.URL, NoAuth: true, AllowPrivateUpstreams: true},
+				"fast": {BaseURL: fastSrv.URL, NoAuth: true, AllowPrivateUpstreams: true},
 			},
 		}
 		s := runtimeTestServer(t, cfg)
@@ -238,8 +238,8 @@ func TestAdaptiveRoutingPeakEWMAAndWeighted(t *testing.T) {
 			ModelRoutes:     map[string][]RouteTarget{"m": {{Backend: "b", Upstream: "up-b", Weight: 3}}},
 			ModelMeta:       map[string]*ModelMeta{"m": {Routing: &RoutePolicy{Strategy: "weighted"}}},
 			Providers: map[string]*ProviderConfig{
-				"a": {BaseURL: srvA.URL, Keys: []KeyEntry{{ID: "ka", Key: "sec-a"}}},
-				"b": {BaseURL: srvB.URL, Keys: []KeyEntry{{ID: "kb", Key: "sec-b"}}},
+				"a": {BaseURL: srvA.URL, AllowPrivateUpstreams: true, Keys: []KeyEntry{{ID: "ka", Key: "sec-a"}}},
+				"b": {BaseURL: srvB.URL, AllowPrivateUpstreams: true, Keys: []KeyEntry{{ID: "kb", Key: "sec-b"}}},
 			},
 		}
 		s := runtimeTestServer(t, cfg)
@@ -291,8 +291,8 @@ func TestSpeculativeHedging(t *testing.T) {
 			ModelRoutes:     map[string][]RouteTarget{"m": {{Backend: "h", Upstream: "up-h"}}},
 			ModelMeta:       map[string]*ModelMeta{"m": {Routing: &RoutePolicy{HedgeDelayMs: 200}}},
 			Providers: map[string]*ProviderConfig{
-				"p": {BaseURL: pSrv.URL, NoAuth: true},
-				"h": {BaseURL: hSrv.URL, NoAuth: true},
+				"p": {BaseURL: pSrv.URL, NoAuth: true, AllowPrivateUpstreams: true},
+				"h": {BaseURL: hSrv.URL, NoAuth: true, AllowPrivateUpstreams: true},
 			},
 		}
 		s := runtimeTestServer(t, cfg)
@@ -332,8 +332,8 @@ func TestSpeculativeHedging(t *testing.T) {
 			ModelRoutes:     map[string][]RouteTarget{"m": {{Backend: "h", Upstream: "up-h"}}},
 			ModelMeta:       map[string]*ModelMeta{"m": {Routing: &RoutePolicy{HedgeDelayMs: 25}}},
 			Providers: map[string]*ProviderConfig{
-				"p": {BaseURL: pSrv.URL, NoAuth: true, MaxInFlight: 2},
-				"h": {BaseURL: hSrv.URL, NoAuth: true, MaxInFlight: 2},
+				"p": {BaseURL: pSrv.URL, NoAuth: true, AllowPrivateUpstreams: true, MaxInFlight: 2},
+				"h": {BaseURL: hSrv.URL, NoAuth: true, AllowPrivateUpstreams: true, MaxInFlight: 2},
 			},
 		}
 		s := runtimeTestServer(t, cfg)
@@ -389,8 +389,8 @@ func TestProviderConcurrencyBulkhead(t *testing.T) {
 		ModelMap:        map[string]string{"m": "p:up-p"},
 		ModelRoutes:     map[string][]RouteTarget{"m": {{Backend: "f", Upstream: "up-f"}}},
 		Providers: map[string]*ProviderConfig{
-			"p": {BaseURL: pSrv.URL, NoAuth: true, MaxInFlight: 1},
-			"f": {BaseURL: fSrv.URL, NoAuth: true, MaxInFlight: 4},
+			"p": {BaseURL: pSrv.URL, NoAuth: true, AllowPrivateUpstreams: true, MaxInFlight: 1},
+			"f": {BaseURL: fSrv.URL, NoAuth: true, AllowPrivateUpstreams: true, MaxInFlight: 4},
 		},
 	}
 	s := runtimeTestServer(t, cfg)
@@ -512,7 +512,7 @@ func TestDeterministicResponseCache(t *testing.T) {
 			DefaultProvider: "p",
 			ModelMap:        map[string]string{"m": "p:up-m", "emb": "p:up-emb"},
 			Cache:           &ResponseCacheConfig{Enabled: true, MaxEntries: 16, TTLSeconds: 60},
-			Providers:       map[string]*ProviderConfig{"p": {BaseURL: up.URL, NoAuth: true}},
+			Providers:       map[string]*ProviderConfig{"p": {BaseURL: up.URL, NoAuth: true, AllowPrivateUpstreams: true}},
 		}
 		s := runtimeTestServer(t, cfg)
 

@@ -66,6 +66,9 @@ func mergeMinuteAcc(a, b *minuteAcc) *minuteAcc {
 func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT ts,payload,d_requests,d_tok_in,d_tok_out,d_tok_cache,d_cost,d_ms,d_err,d_models,d_backends
 	                                     FROM snapshots ORDER BY ts ASC`)
 	if err != nil {
@@ -73,18 +76,18 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 	}
 	defer rows.Close()
 
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`DELETE FROM snapshot_minute`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM snapshot_minute`); err != nil {
 		return 0, err
 	}
-	if _, err = tx.Exec(`DELETE FROM snapshot_10m`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM snapshot_10m`); err != nil {
 		return 0, err
 	}
-	if _, err = tx.Exec(`DELETE FROM snapshot_hour`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM snapshot_hour`); err != nil {
 		return 0, err
 	}
 
@@ -101,7 +104,7 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 		if curHour < 0 {
 			return nil
 		}
-		if err := hourAcc.insertDirect(tx, "snapshot_hour", "hour", curHour); err != nil {
+		if err := hourAcc.insertDirectContext(ctx, tx, "snapshot_hour", "hour", curHour); err != nil {
 			return err
 		}
 		hourAcc = newMinuteAcc()
@@ -111,7 +114,7 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 		if curTenMin < 0 {
 			return nil
 		}
-		if err := tenMinAcc.insertDirect(tx, "snapshot_10m", "bucket", curTenMin); err != nil {
+		if err := tenMinAcc.insertDirectContext(ctx, tx, "snapshot_10m", "bucket", curTenMin); err != nil {
 			return err
 		}
 		tenMinAcc = newMinuteAcc()
@@ -137,7 +140,7 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 		}
 		mergeMinuteAcc(tenMinAcc, minAcc)
 		mergeMinuteAcc(hourAcc, minAcc)
-		if err := minAcc.insertDirect(tx, "snapshot_minute", "minute", curMinute); err != nil {
+		if err := minAcc.insertDirectContext(ctx, tx, "snapshot_minute", "minute", curMinute); err != nil {
 			return err
 		}
 		written++
@@ -198,6 +201,9 @@ func (s *Store) RebuildRollups(ctx context.Context) (int, error) {
 func (s *Store) RebuildCoarseRollupsFromMinutes(ctx context.Context) (int, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT minute, requests, err, tok_in, tok_out, tok_cache, cost, ms,
 		       lat_w, lat_sum, ttft_w, ttft_sum,
@@ -212,15 +218,15 @@ func (s *Store) RebuildCoarseRollupsFromMinutes(ctx context.Context) (int, int, 
 	}
 	defer rows.Close()
 
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`DELETE FROM snapshot_10m`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM snapshot_10m`); err != nil {
 		return 0, 0, err
 	}
-	if _, err = tx.Exec(`DELETE FROM snapshot_hour`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM snapshot_hour`); err != nil {
 		return 0, 0, err
 	}
 
@@ -236,7 +242,7 @@ func (s *Store) RebuildCoarseRollupsFromMinutes(ctx context.Context) (int, int, 
 		if curHour < 0 {
 			return nil
 		}
-		if err := hourAcc.insertDirect(tx, "snapshot_hour", "hour", curHour); err != nil {
+		if err := hourAcc.insertDirectContext(ctx, tx, "snapshot_hour", "hour", curHour); err != nil {
 			return err
 		}
 		hourCount++
@@ -247,7 +253,7 @@ func (s *Store) RebuildCoarseRollupsFromMinutes(ctx context.Context) (int, int, 
 		if curTenMin < 0 {
 			return nil
 		}
-		if err := tenMinAcc.insertDirect(tx, "snapshot_10m", "bucket", curTenMin); err != nil {
+		if err := tenMinAcc.insertDirectContext(ctx, tx, "snapshot_10m", "bucket", curTenMin); err != nil {
 			return err
 		}
 		tenCount++
@@ -339,64 +345,121 @@ func (s *Store) RebuildCoarseRollupsFromMinutes(ctx context.Context) (int, int, 
 // EnsureRollupsBackfilled repairs derived state for history that predates it.
 // Synchronous checks stay O(1)/O(log N) via EXISTS(... LIMIT 1) and B-tree
 // endpoint seeks so startup is never stalled by full-table scans on a large
-// database; any needed repair runs in a background goroutine while reads
-// remain exact via transparent fallback.
+// database; any needed repair runs in a tracked, cancellable background
+// goroutine that Store.Close() cancels and awaits before closing SQLite.
 func (s *Store) EnsureRollupsBackfilled(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.queueMu.RLock()
+	if s.closed {
+		s.queueMu.RUnlock()
+		return
+	}
+	s.backfillWG.Add(1)
+	s.queueMu.RUnlock()
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	var stopBridge func() bool
+	if s.backfillCtx != nil {
+		stopBridge = context.AfterFunc(s.backfillCtx, runCancel)
+	}
+	release := func() {
+		if stopBridge != nil {
+			stopBridge()
+		}
+		runCancel()
+		s.backfillWG.Done()
+	}
+
 	s.mu.Lock()
 	var hasTicks, hasMinutes, hasTenMin, hasHours, hasReqs int
 	var oldestSnap, newestSnap, totalTicks, totalOldest, totalNewest, reqCacheReady int64
-	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshots LIMIT 1)`).Scan(&hasTicks)
-	if hasTicks > 0 {
-		_ = s.db.QueryRow(`SELECT
-			COALESCE((SELECT ts FROM snapshots ORDER BY ts ASC LIMIT 1), 0),
-			COALESCE((SELECT ts FROM snapshots ORDER BY ts DESC LIMIT 1), 0)`).Scan(&oldestSnap, &newestSnap)
+	if runCtx.Err() == nil {
+		_ = s.db.QueryRowContext(runCtx, `SELECT EXISTS(SELECT 1 FROM snapshots LIMIT 1)`).Scan(&hasTicks)
+		if hasTicks > 0 {
+			_ = s.db.QueryRowContext(runCtx, `SELECT
+				COALESCE((SELECT ts FROM snapshots ORDER BY ts ASC LIMIT 1), 0),
+				COALESCE((SELECT ts FROM snapshots ORDER BY ts DESC LIMIT 1), 0)`).Scan(&oldestSnap, &newestSnap)
+		}
+		_ = s.db.QueryRowContext(runCtx, `SELECT EXISTS(SELECT 1 FROM snapshot_minute LIMIT 1)`).Scan(&hasMinutes)
+		_ = s.db.QueryRowContext(runCtx, `SELECT EXISTS(SELECT 1 FROM snapshot_10m LIMIT 1)`).Scan(&hasTenMin)
+		_ = s.db.QueryRowContext(runCtx, `SELECT EXISTS(SELECT 1 FROM snapshot_hour LIMIT 1)`).Scan(&hasHours)
+		_ = s.db.QueryRowContext(runCtx, `SELECT ticks, oldest_ts, newest_ts FROM analytics_totals WHERE id=1`).Scan(&totalTicks, &totalOldest, &totalNewest)
+		_ = s.db.QueryRowContext(runCtx, `SELECT EXISTS(SELECT 1 FROM requests LIMIT 1)`).Scan(&hasReqs)
+		_ = s.db.QueryRowContext(runCtx, `SELECT COALESCE((SELECT value FROM analytics_meta WHERE name='request_hour_cache_ready'), 0)`).Scan(&reqCacheReady)
 	}
-	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshot_minute LIMIT 1)`).Scan(&hasMinutes)
-	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshot_10m LIMIT 1)`).Scan(&hasTenMin)
-	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM snapshot_hour LIMIT 1)`).Scan(&hasHours)
-	_ = s.db.QueryRow(`SELECT ticks, oldest_ts, newest_ts FROM analytics_totals WHERE id=1`).Scan(&totalTicks, &totalOldest, &totalNewest)
-	_ = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests LIMIT 1)`).Scan(&hasReqs)
-	_ = s.db.QueryRow(`SELECT COALESCE((SELECT value FROM analytics_meta WHERE name='request_hour_cache_ready'), 0)`).Scan(&reqCacheReady)
 	s.mu.Unlock()
 
 	needsFullRollups := hasTicks > 0 && hasMinutes == 0
 	needsCoarseRollups := hasTicks > 0 && hasMinutes > 0 && (hasTenMin == 0 || hasHours == 0)
 	needsTotalsQuick := hasTicks > 0 && (totalTicks == 0 || totalOldest != oldestSnap || totalNewest != newestSnap)
 	needsReqCache := hasReqs > 0 && reqCacheReady == 0
-	if !needsFullRollups && !needsCoarseRollups && !needsTotalsQuick && !needsReqCache {
+	if runCtx.Err() != nil || (!needsFullRollups && !needsCoarseRollups && !needsTotalsQuick && !needsReqCache) {
+		release()
 		return
 	}
 	go func() {
+		defer release()
 		if needsTotalsQuick {
-			if err := s.RebuildTotals(); err != nil {
-				log.Printf("[analytics] totals backfill failed: %v", err)
+			if runCtx.Err() != nil {
+				return
+			}
+			if err := s.RebuildTotalsContext(runCtx); err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("[analytics] totals backfill failed: %v", err)
+				}
+				if runCtx.Err() != nil {
+					return
+				}
 			} else {
 				_, _, cnt := s.Range()
 				log.Printf("[analytics] totals backfill complete: %d ticks", cnt)
 			}
 		}
 		if needsFullRollups {
+			if runCtx.Err() != nil {
+				return
+			}
 			start := time.Now()
-			n, err := s.RebuildRollups(ctx)
+			n, err := s.RebuildRollups(runCtx)
 			if err != nil {
-				log.Printf("[analytics] rollup backfill failed: %v", err)
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("[analytics] rollup backfill failed: %v", err)
+				}
+				if runCtx.Err() != nil {
+					return
+				}
 			} else {
 				log.Printf("[analytics] rollup backfill complete: %d minutes in %v", n, time.Since(start).Round(time.Millisecond))
 			}
 		} else if needsCoarseRollups {
+			if runCtx.Err() != nil {
+				return
+			}
 			start := time.Now()
-			tenN, hrN, err := s.RebuildCoarseRollupsFromMinutes(ctx)
+			tenN, hrN, err := s.RebuildCoarseRollupsFromMinutes(runCtx)
 			if err != nil {
-				log.Printf("[analytics] coarse rollup backfill failed: %v", err)
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("[analytics] coarse rollup backfill failed: %v", err)
+				}
+				if runCtx.Err() != nil {
+					return
+				}
 			} else {
 				log.Printf("[analytics] coarse rollup backfill complete: %d 10m + %d hours in %v", tenN, hrN, time.Since(start).Round(time.Millisecond))
 			}
 		}
 		if needsReqCache {
+			if runCtx.Err() != nil {
+				return
+			}
 			start := time.Now()
-			n, err := s.RebuildRequestHourCache(ctx)
+			n, err := s.RebuildRequestHourCache(runCtx)
 			if err != nil {
-				log.Printf("[analytics] request hour cache backfill failed: %v", err)
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("[analytics] request hour cache backfill failed: %v", err)
+				}
 			} else {
 				log.Printf("[analytics] request hour cache backfill complete: %d hours in %v", n, time.Since(start).Round(time.Millisecond))
 			}
@@ -491,11 +554,11 @@ func (a *minuteAcc) addDelta(d *Delta) {
 	}
 }
 
-func (a *minuteAcc) insertDirect(tx *sql.Tx, table, keyCol string, keyVal int64) error {
+func (a *minuteAcc) insertDirectContext(ctx context.Context, tx *sql.Tx, table, keyCol string, keyVal int64) error {
 	blob := encodeMinutes(&a.blobBuf, a.models, a.backends, a.hist[:], a.ttftHist[:])
 	hj, _ := json.Marshal(a.hist[:])
 	thj, _ := json.Marshal(a.ttftHist[:])
-	_, err := tx.Exec(`INSERT INTO `+table+`
+	_, err := tx.ExecContext(ctx, `INSERT INTO `+table+`
 	   (`+keyCol+`,requests,err,tok_in,tok_out,tok_cache,cost,ms,lat_w,lat_sum,ttft_w,ttft_sum,hist,ttft_hist,models,backends,hist_n,missing_n)
 	   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		keyVal, a.req, a.errN, a.tin, a.tout, a.tcache, a.cost, a.ms,
@@ -582,9 +645,18 @@ func (s *Store) Range() (oldest, newest int64, count int) {
 // so this is a repair/verification path — not something the request path runs.
 // Use it after a manual import, or in tests asserting the invariant holds.
 func (s *Store) RebuildTotals() error {
+	return s.RebuildTotalsContext(context.Background())
+}
+
+// RebuildTotalsContext is the context-aware variant of RebuildTotals used by
+// background backfill so Store.Close can cancel an in-flight rebuild cleanly.
+func (s *Store) RebuildTotalsContext(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE analytics_totals SET
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE analytics_totals SET
 	   cost=(SELECT COALESCE(SUM(d_cost),0) FROM snapshots),
 	   requests=(SELECT COALESCE(SUM(d_requests),0) FROM snapshots),
 	   tok_in=(SELECT COALESCE(SUM(d_tok_in),0) FROM snapshots),

@@ -193,7 +193,7 @@ func TestProxyReasoningIsolationForAppKeysModelsAndHistories(t *testing.T) {
 			cfg := runtimeConfig(upstream.URL)
 			noStrip := false
 			cfg.Providers["primary"].StripReasoningContent = &noStrip
-			cfg.Providers["fallback"] = &ProviderConfig{BaseURL: upstream.URL, Keys: []KeyEntry{{ID: "fallback-key", Key: "fallback-secret"}}, StripReasoningContent: &noStrip}
+			cfg.Providers["fallback"] = &ProviderConfig{BaseURL: upstream.URL, AllowPrivateUpstreams: true, Keys: []KeyEntry{{ID: "fallback-key", Key: "fallback-secret"}}, StripReasoningContent: &noStrip}
 			cfg.ModelMap["model-b"] = "primary:upstream-test"
 			cfg.ModelMap["model-route"] = "fallback:other-upstream"
 			s := runtimeTestServer(t, cfg)

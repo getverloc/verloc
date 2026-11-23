@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -42,6 +43,123 @@ var balanceRe = regexp.MustCompile(`(?i)(insufficient|quota|balance|credit|rate.
 // Matches genuine client-side request errors that will fail identically on
 // every key, so we must NOT fail over (doing so exhausts the whole pool).
 var nonRetryableRe = regexp.MustCompile(`(?i)(context_length_exceeded|maximum context|reduce the length|invalid_request_error|context length|too long)`)
+
+// Patterns scrubbed from upstream 4xx messages before returning to callers.
+var (
+	upstreamAuthPairRe  = regexp.MustCompile(`(?i)\b(bearer|basic|authorization|api[_-]?key|access[_-]?token|secret|password)\s*[:=]?\s*[A-Za-z0-9._~+/=-]{6,}`)
+	upstreamKeyPrefixRe = regexp.MustCompile(`\b(sk-[A-Za-z0-9_-]{8,}|sk-ant-[A-Za-z0-9_-]{8,}|sk-proj-[A-Za-z0-9_-]{8,}|sk-or-[A-Za-z0-9_-]{8,}|gsk_[A-Za-z0-9_-]{8,}|xai-[A-Za-z0-9_-]{8,}|nvapi-[A-Za-z0-9_-]{8,}|vlk_[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16})\b`)
+	upstreamURLCredRe   = regexp.MustCompile(`(?i)https?://[^/\s@]+@`)
+)
+
+const defaultUpstreamRejectedMsg = "upstream rejected request"
+
+// safeUpstreamErrorMessage extracts a concise, sanitized error description from
+// a structured JSON upstream 4xx response so inference clients can act on real
+// validation errors (context length, bad parameters, tool schema, etc.) without
+// exposing auth/billing details, raw HTML/stack traces, or upstream credentials.
+// Analytics records NEVER store this string; callers must keep rec.ErrMsg fixed.
+func safeUpstreamErrorMessage(status int, body []byte, secrets ...string) string {
+	// Never forward error text on auth, billing, or 5xx responses.
+	if status < 400 || status >= 500 {
+		return defaultUpstreamRejectedMsg
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusProxyAuthRequired:
+		return defaultUpstreamRejectedMsg
+	}
+	msg := extractStructuredErrorMessage(body)
+	if msg == "" {
+		return defaultUpstreamRejectedMsg
+	}
+	// If the upstream echoed any known credential or account ID, refuse the
+	// entire message rather than returning a partially redacted string.
+	for _, secret := range secrets {
+		if len(secret) < 4 {
+			continue
+		}
+		if strings.Contains(msg, secret) || strings.Contains(msg, url.QueryEscape(secret)) {
+			return defaultUpstreamRejectedMsg
+		}
+	}
+	msg = sanitizeClientErrorText(msg)
+	if msg == "" || msg == "[redacted]" {
+		return defaultUpstreamRejectedMsg
+	}
+	return truncate(msg, 300)
+}
+
+func extractStructuredErrorMessage(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return ""
+	}
+	var env struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Detail  json.RawMessage `json:"detail"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(trimmed, &env); err != nil {
+		return ""
+	}
+	if len(env.Error) > 0 {
+		var errObj struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(env.Error, &errObj) == nil && strings.TrimSpace(errObj.Message) != "" {
+			return errObj.Message
+		}
+		var errStr string
+		if json.Unmarshal(env.Error, &errStr) == nil && strings.TrimSpace(errStr) != "" {
+			return errStr
+		}
+	}
+	if strings.TrimSpace(env.Message) != "" {
+		return env.Message
+	}
+	if len(env.Detail) > 0 {
+		var detailStr string
+		if json.Unmarshal(env.Detail, &detailStr) == nil && strings.TrimSpace(detailStr) != "" {
+			return detailStr
+		}
+	}
+	for _, e := range env.Errors {
+		if strings.TrimSpace(e.Message) != "" {
+			return e.Message
+		}
+	}
+	return ""
+}
+
+func sanitizeClientErrorText(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	prevSpace := false
+	for _, r := range raw {
+		switch {
+		case r == '\r' || r == '\n' || r == '\t' || r == ' ':
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+		case r < 0x20 || r == 0x7f:
+			continue
+		default:
+			b.WriteRune(r)
+			prevSpace = false
+		}
+	}
+	s := strings.TrimSpace(b.String())
+	if s == "" {
+		return ""
+	}
+	s = upstreamURLCredRe.ReplaceAllString(s, "https://[redacted]@")
+	s = upstreamKeyPrefixRe.ReplaceAllString(s, "[redacted]")
+	s = upstreamAuthPairRe.ReplaceAllString(s, "[redacted]")
+	return strings.TrimSpace(s)
+}
 
 // runtimeState is swapped atomically on live config apply so in-flight
 // requests keep a stable cfg + backend map for the duration of the call.
@@ -126,6 +244,7 @@ type Server struct {
 	security       *Security
 	shuttingDown   atomic.Bool
 	routeRR        atomic.Uint64
+	activeHedges   atomic.Int64
 	keepWarmMu     sync.Mutex
 	keepWarmCancel context.CancelFunc
 	admissionOnce  sync.Once
@@ -133,6 +252,31 @@ type Server struct {
 	admissionWake  chan struct{}
 	active         int
 	queued         int
+}
+
+func (s *Server) maxConcurrentHedges(limits GatewayLimits) int64 {
+	limits.applyDefaults()
+	if limits.MaxConcurrentHedges > 0 {
+		return int64(limits.MaxConcurrentHedges)
+	}
+	return max(int64(1), int64(limits.MaxInFlight)/4)
+}
+
+func (s *Server) tryAcquireHedgeSlot(limits GatewayLimits) bool {
+	cap := s.maxConcurrentHedges(limits)
+	for {
+		cur := s.activeHedges.Load()
+		if cur >= cap {
+			return false
+		}
+		if s.activeHedges.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (s *Server) releaseHedgeSlot() {
+	s.activeHedges.Add(-1)
 }
 
 func (s *Server) runtime() *runtimeState {
@@ -612,6 +756,19 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 			}
 		}
 	}
+	failUpstream := func(status int, clientMessage string) {
+		rec.Status, rec.Outcome, rec.ErrMsg = status, "upstream_rejected", defaultUpstreamRejectedMsg
+		if clientMessage == "" {
+			clientMessage = defaultUpstreamRejectedMsg
+		}
+		if r.Context().Err() == nil {
+			if adapter != nil {
+				adapter.errorWriter(w, status, clientMessage)
+			} else {
+				proxyError(w, status, clientMessage)
+			}
+		}
+	}
 	if s.shuttingDown.Load() {
 		fail(503, "unavailable", "gateway shutting down")
 		return
@@ -957,7 +1114,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				return
 			}
 			if ho.nonRetry {
-				fail(ho.nonRetryStatus, "upstream_rejected", "upstream rejected request")
+				failUpstream(ho.nonRetryStatus, ho.nonRetryMsg)
 				return
 			}
 			if ho.winner != nil {
@@ -1095,7 +1252,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, endpoint string
 				finishAttempt(resp.StatusCode, "upstream_rejected")
 				if !retryable {
 					releaseHeld()
-					fail(resp.StatusCode, "upstream_rejected", "upstream rejected request")
+					failUpstream(resp.StatusCode, safeUpstreamErrorMessage(resp.StatusCode, body, ks.Key, ks.AccountID))
 					return
 				}
 				b.route.Observe(time.Since(attemptStart), false)

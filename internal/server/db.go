@@ -28,26 +28,29 @@ import (
 // a failure event per attempt, agents retry in a storm, and every request
 // serialized on SQLite behind the ticker and dashboard reads.
 type Store struct {
-	db           *sql.DB
-	mu           sync.Mutex
-	queueMu      sync.RWMutex
-	requestCh    chan ReqRecord
-	keyEvCh      chan keyEventReq
-	flushCh      chan chan error
-	done         chan struct{}
-	closed       bool
-	closeOnce    sync.Once
-	closeErr     error
-	keyEvDrop    atomic.Uint64
-	requestDrop  atomic.Uint64
-	summaryMu    sync.Mutex
-	summaryCache map[string]summaryCacheEntry
-	seriesRev    atomic.Uint64
-	seriesMu     sync.Mutex
-	seriesCache  map[seriesCacheKey]*seriesCacheEntry
-	writeErrors  atomic.Uint64
-	lastWrite    atomic.Int64
-	queued       atomic.Int64
+	db             *sql.DB
+	mu             sync.Mutex
+	queueMu        sync.RWMutex
+	requestCh      chan ReqRecord
+	keyEvCh        chan keyEventReq
+	flushCh        chan chan error
+	done           chan struct{}
+	closed         bool
+	closeOnce      sync.Once
+	closeErr       error
+	backfillCtx    context.Context
+	backfillCancel context.CancelFunc
+	backfillWG     sync.WaitGroup
+	keyEvDrop      atomic.Uint64
+	requestDrop    atomic.Uint64
+	summaryMu      sync.Mutex
+	summaryCache   map[string]summaryCacheEntry
+	seriesRev      atomic.Uint64
+	seriesMu       sync.Mutex
+	seriesCache    map[seriesCacheKey]*seriesCacheEntry
+	writeErrors    atomic.Uint64
+	lastWrite      atomic.Int64
+	queued         atomic.Int64
 }
 
 func (s *Store) bumpSeriesRev() {
@@ -105,8 +108,18 @@ func OpenStore(path string) (*Store, error) {
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
 	}
-	s := &Store{db: db, requestCh: make(chan ReqRecord, 2048), keyEvCh: make(chan keyEventReq, 1024), flushCh: make(chan chan error), done: make(chan struct{})}
+	backfillCtx, backfillCancel := context.WithCancel(context.Background())
+	s := &Store{
+		db:             db,
+		requestCh:      make(chan ReqRecord, 2048),
+		keyEvCh:        make(chan keyEventReq, 1024),
+		flushCh:        make(chan chan error),
+		done:           make(chan struct{}),
+		backfillCtx:    backfillCtx,
+		backfillCancel: backfillCancel,
+	}
 	if err := s.migrate(); err != nil {
+		backfillCancel()
 		db.Close()
 		return nil, err
 	}
@@ -975,10 +988,14 @@ func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		s.queueMu.Lock()
 		s.closed = true
+		if s.backfillCancel != nil {
+			s.backfillCancel()
+		}
 		close(s.requestCh)
 		close(s.keyEvCh)
 		s.queueMu.Unlock()
 		<-s.done
+		s.backfillWG.Wait()
 		err := s.db.Close()
 		if s.writeErrors.Load() > 0 {
 			s.closeErr = errors.New("analytics persistence reported write errors")

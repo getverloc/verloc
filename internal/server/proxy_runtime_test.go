@@ -34,7 +34,7 @@ func runtimeTestServer(t *testing.T, cfg *Config) *Server {
 
 func runtimeConfig(url string) *Config {
 	return &Config{DefaultProvider: "primary", ModelMap: map[string]string{"test": "primary:upstream-test"},
-		Providers: map[string]*ProviderConfig{"primary": {BaseURL: url, Keys: []KeyEntry{{ID: "credential-1", Key: "secret-credential-1"}}}}}
+		Providers: map[string]*ProviderConfig{"primary": {BaseURL: url, AllowPrivateUpstreams: true, Keys: []KeyEntry{{ID: "credential-1", Key: "secret-credential-1"}}}}}
 }
 
 func runtimeCall(s *Server, body string) *httptest.ResponseRecorder {
@@ -123,7 +123,7 @@ func TestGatewayExplicitFallbackAndProviderScopedTransforms(t *testing.T) {
 	}))
 	defer fallback.Close()
 	cfg := runtimeConfig(primary.URL)
-	cfg.Providers["freeinference"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true}
+	cfg.Providers["freeinference"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true, AllowPrivateUpstreams: true}
 	cfg.ModelRoutes = map[string][]RouteTarget{"test": {{Backend: "freeinference", Upstream: "fallback-model"}}}
 	s := runtimeTestServer(t, cfg)
 	w := httptest.NewRecorder()
@@ -216,7 +216,7 @@ func TestGatewayTruncatedStreamCannotFallbackAfterFlush(t *testing.T) {
 	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fallbackCalls.Add(1) }))
 	defer fallback.Close()
 	cfg := runtimeConfig(primary.URL)
-	cfg.Providers["fallback"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true}
+	cfg.Providers["fallback"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true, AllowPrivateUpstreams: true}
 	cfg.ModelRoutes = map[string][]RouteTarget{"test": {{Backend: "fallback", Upstream: "fallback"}}}
 	s := runtimeTestServer(t, cfg)
 	w := runtimeCall(s, `{"model":"test","stream":true}`)
@@ -245,7 +245,7 @@ func TestGatewayEmptyStreamCanFallbackBeforeFlush(t *testing.T) {
 	}))
 	defer fallback.Close()
 	cfg := runtimeConfig(primary.URL)
-	cfg.Providers["fallback"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true}
+	cfg.Providers["fallback"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true, AllowPrivateUpstreams: true}
 	cfg.ModelRoutes = map[string][]RouteTarget{"test": {{Backend: "fallback", Upstream: "fallback"}}}
 	s := runtimeTestServer(t, cfg)
 	w := runtimeCall(s, `{"model":"test","stream":true}`)
@@ -437,7 +437,7 @@ func TestGatewayNonstreamInterruptionFallbackBeforeHeaders(t *testing.T) {
 	}))
 	defer fallback.Close()
 	cfg := runtimeConfig(primary.URL)
-	cfg.Providers["fallback"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true}
+	cfg.Providers["fallback"] = &ProviderConfig{BaseURL: fallback.URL, NoAuth: true, AllowPrivateUpstreams: true}
 	cfg.ModelRoutes = map[string][]RouteTarget{"test": {{Backend: "fallback", Upstream: "fallback"}}}
 	s := runtimeTestServer(t, cfg)
 	w := runtimeCall(s, `{"model":"test"}`)

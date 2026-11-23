@@ -737,6 +737,13 @@ func decodeModelRows(rows []json.RawMessage, source string) []catalogEntry {
 	return out
 }
 
+// hintHTTPClient builds the HTTP client for external catalog hint fetches.
+// Defaults to the SSRF-guarded newClient; tests using local httptest fixtures
+// may override it.
+var hintHTTPClient = func(timeout time.Duration, allowPrivate bool) *http.Client {
+	return newClient(int(timeout.Seconds())+5, allowPrivate)
+}
+
 func getJSON(ctx context.Context, url string, limit int64, timeout time.Duration) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -747,7 +754,7 @@ func getJSON(ctx context.Context, url string, limit int64, timeout time.Duration
 	req.Header.Set("Accept", "application/json")
 	// A fresh client per fetch: close its idle connections on the way out
 	// or every catalog refresh abandons sockets to the 90s IdleConnTimeout.
-	client := newClient(int(timeout.Seconds()) + 5)
+	client := hintHTTPClient(timeout, false)
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -771,14 +778,15 @@ func getJSON(ctx context.Context, url string, limit int64, timeout time.Duration
 
 // Catalog pagination stays on the original origin, including credentialed
 // Vercel connections. Bounds cover the whole source, not each page.
-func fetchModelPages(ctx context.Context, endpoint, source string, headers http.Header, timeout time.Duration) ([]catalogEntry, error) {
+func fetchModelPages(ctx context.Context, endpoint, source string, headers http.Header, timeout time.Duration, allowPrivate ...bool) ([]catalogEntry, error) {
 	origin, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := newClient(int(timeout.Seconds()) + 5)
+	allow := len(allowPrivate) > 0 && allowPrivate[0]
+	client := hintHTTPClient(timeout, allow)
 	defer client.CloseIdleConnections()
 	remaining := int64(8 << 20)
 	seen := make(map[string]bool)
@@ -852,7 +860,7 @@ func fetchModelPages(ctx context.Context, endpoint, source string, headers http.
 }
 
 // Vercel's catalog is public; configured credentials are optional.
-func fetchVercelModels(ctx context.Context, baseURL, key, authHeader, authFormat string) ([]catalogEntry, error) {
+func fetchVercelModels(ctx context.Context, baseURL, key, authHeader, authFormat string, allowPrivate ...bool) ([]catalogEntry, error) {
 	headers := make(http.Header)
 	if authHeader == "" {
 		authHeader = "Authorization"
@@ -863,7 +871,7 @@ func fetchVercelModels(ctx context.Context, baseURL, key, authHeader, authFormat
 	if key != "" {
 		headers.Set(authHeader, fmt.Sprintf(authFormat, key))
 	}
-	return fetchModelPages(ctx, strings.TrimRight(baseURL, "/")+"/models", "vercel", headers, 15*time.Second)
+	return fetchModelPages(ctx, strings.TrimRight(baseURL, "/")+"/models", "vercel", headers, 15*time.Second, allowPrivate...)
 }
 
 func fetchOpenRouter(ctx context.Context, endpoint string) ([]catalogEntry, error) {
@@ -1073,10 +1081,11 @@ func mergeHint(upstream string, idxs []catalogIndex) *modelHint {
 // ---- caching resolver ----
 
 type vercelConn struct {
-	baseURL    string
-	key        string
-	authHeader string
-	authFormat string
+	baseURL      string
+	key          string
+	authHeader   string
+	authFormat   string
+	allowPrivate bool
 }
 
 type cachedIndex struct {
@@ -1125,6 +1134,7 @@ func (h *hintResolver) vercelConnFrom(cfg *Config) *vercelConn {
 	if p.BaseURL != "" {
 		vc.baseURL = p.BaseURL
 	}
+	vc.allowPrivate = p.AllowPrivateUpstreams
 	if len(p.Keys) > 0 {
 		vc.key = p.Keys[0].Key
 	}
@@ -1194,7 +1204,7 @@ func (h *hintResolver) hintsFor(ctx context.Context, cfg *Config, upstreams []st
 			h.vercel = c
 			h.mu.Unlock()
 		}, func(ctx context.Context) ([]catalogEntry, error) {
-			return fetchVercelModels(ctx, vc.baseURL, vc.key, vc.authHeader, vc.authFormat)
+			return fetchVercelModels(ctx, vc.baseURL, vc.key, vc.authHeader, vc.authFormat, vc.allowPrivate)
 		}, "vercel")
 	}
 	refresh(or, catalogHintTTL, func(c cachedIndex) {

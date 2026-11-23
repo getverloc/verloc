@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -38,8 +40,9 @@ type ProviderConfig struct {
 	MaxTokens int `json:"max_tokens"`
 	// AllowPrivateUpstreams permits this provider to target a loopback,
 	// link-local or private address. Needed for a legitimately local upstream
-	// (Ollama, llama.cpp, vLLM); without it the wizard probe refuses such a
-	// host so the gateway cannot be used as a blind SSRF relay.
+	// (Ollama, llama.cpp, vLLM); without it both wizard probes and runtime
+	// upstream connections refuse private addresses at dial time so the
+	// gateway cannot be used as an SSRF relay or defeated by DNS rebinding.
 	AllowPrivateUpstreams bool `json:"allow_private_upstreams"`
 	// MaxInFlight enforces a per-provider concurrency bulkhead. When a
 	// provider reaches MaxInFlight concurrent upstream requests, new traffic
@@ -105,17 +108,18 @@ type Config struct {
 	// TrustedProxies lists proxy addresses/CIDRs whose X-Forwarded-For /
 	// X-Forwarded-Proto headers may be believed (login throttling keys and
 	// cookie Secure decisions). Empty means forwarded headers are ignored.
-	TrustedProxies   []string                 `json:"trusted_proxies,omitempty"`
-	DisabledModels   map[string]bool          `json:"disabled_models,omitempty"`
-	ModelRoutes      map[string][]RouteTarget `json:"model_routes,omitempty"`
-	Limits           GatewayLimits            `json:"limits,omitempty"`
-	Listen           string                   `json:"listen"`
-	UpstreamBase     string                   `json:"upstream_base"`
-	AuthHeader       string                   `json:"auth_header"`
-	AuthHeaderFormat string                   `json:"auth_header_format"`
-	Keys             []string                 `json:"keys"`
-	DefaultProvider  string                   `json:"default_provider"`
-	ModelMap         map[string]string        `json:"model_map"`
+	TrustedProxies        []string                 `json:"trusted_proxies,omitempty"`
+	DisabledModels        map[string]bool          `json:"disabled_models,omitempty"`
+	ModelRoutes           map[string][]RouteTarget `json:"model_routes,omitempty"`
+	Limits                GatewayLimits            `json:"limits,omitempty"`
+	Listen                string                   `json:"listen"`
+	UpstreamBase          string                   `json:"upstream_base"`
+	AllowPrivateUpstreams bool                     `json:"allow_private_upstreams,omitempty"`
+	AuthHeader            string                   `json:"auth_header"`
+	AuthHeaderFormat      string                   `json:"auth_header_format"`
+	Keys                  []string                 `json:"keys"`
+	DefaultProvider       string                   `json:"default_provider"`
+	ModelMap              map[string]string        `json:"model_map"`
 	// ModelMeta holds runtime catalog overlays (pricing + limits) for models
 	// added/edited via the dashboard. Merged over the embedded models.json.
 	ModelMeta       map[string]*ModelMeta      `json:"model_meta,omitempty"`
@@ -148,6 +152,9 @@ type GatewayLimits struct {
 	MaxInFlight              int   `json:"max_in_flight"`
 	MaxQueued                int   `json:"max_queued"`
 	StreamIdleTimeoutSeconds int   `json:"stream_idle_timeout_seconds"`
+	// MaxConcurrentHedges caps the total number of in-flight speculative hedge
+	// attempts across the gateway. 0 (default) auto-derives max(1, MaxInFlight/4).
+	MaxConcurrentHedges int `json:"max_concurrent_hedges,omitempty"`
 }
 
 func (l *GatewayLimits) applyDefaults() {
@@ -192,6 +199,9 @@ func (l GatewayLimits) Validate() error {
 		if bound.n < 1 || bound.n > bound.max {
 			return fmt.Errorf("%s must be between 1 and %d", bound.name, bound.max)
 		}
+	}
+	if l.MaxConcurrentHedges < 0 || l.MaxConcurrentHedges > 4096 {
+		return fmt.Errorf("max_concurrent_hedges must be between 0 and 4096")
 	}
 	return nil
 }
@@ -414,7 +424,7 @@ func (c *Config) resolveBackends() (map[string]*backend, error) {
 				keys = []KeyEntry{{Key: ""}}
 			}
 			b.pool = NewKeyPool(keys, time.Duration(cd)*time.Second)
-			b.client = newClient(p.RequestTimeout)
+			b.client = newClient(p.RequestTimeout, p.AllowPrivateUpstreams)
 			out[name] = b
 		}
 	} else {
@@ -438,7 +448,7 @@ func (c *Config) resolveBackends() (map[string]*backend, error) {
 			authHeader: c.AuthHeader,
 			authFormat: c.AuthHeaderFormat,
 			pool:       NewKeyPool(entries, time.Duration(c.CooldownSeconds)*time.Second),
-			client:     newClient(c.RequestTimeout),
+			client:     newClient(c.RequestTimeout, c.AllowPrivateUpstreams),
 			route:      newRouteMetrics(0),
 			// Same default as the multi-provider path (strip=true unless a
 			// provider explicitly opts out); the legacy branch used to
@@ -477,13 +487,75 @@ func primaryTarget(c *Config, mapped string) RouteTarget {
 	return RouteTarget{Backend: c.DefaultProvider, Upstream: mapped}
 }
 
-func newClient(timeoutSeconds int) *http.Client {
+var (
+	cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+	// lookupNetIP is overridden in tests to exercise DNS-rebinding scenarios
+	// deterministically without depending on external DNS infrastructure.
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return net.DefaultResolver.LookupNetIP(ctx, network, host)
+	}
+)
+
+func isPrivateIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() || cgnatPrefix.Contains(ip)
+}
+
+// safeDialContext wraps dialer.DialContext so that unless allowPrivate is true,
+// every target IP is checked at dial time and pinned for the TCP connect. This
+// closes DNS-rebinding TOCTOU gaps on both wizard probes and runtime inference
+// requests while preserving IPv6/IPv4 multi-address fallback across verified IPs.
+func safeDialContext(dialer *net.Dialer, allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if allowPrivate {
+		return dialer.DialContext
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if ip, err := netip.ParseAddr(host); err == nil {
+			if isPrivateIP(ip) {
+				return nil, fmt.Errorf("upstream resolves to a private or local address (%s); set allow_private_upstreams to permit it", ip.Unmap())
+			}
+			return dialer.DialContext(ctx, network, addr)
+		}
+		ips, err := lookupNetIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("upstream host %q resolved to no addresses", host)
+		}
+		for _, ip := range ips {
+			if isPrivateIP(ip) {
+				return nil, fmt.Errorf("upstream resolves to a private or local address (%s); set allow_private_upstreams to permit it", ip.Unmap())
+			}
+		}
+		var lastErr error
+		for _, ip := range ips {
+			conn, derr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+			if derr == nil {
+				return conn, nil
+			}
+			lastErr = derr
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		return nil, lastErr
+	}
+}
+
+func newClient(timeoutSeconds int, allowPrivate ...bool) *http.Client {
+	allow := len(allowPrivate) > 0 && allowPrivate[0]
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 	transport := &http.Transport{
-		DialContext:           dialer.DialContext,
+		DialContext:           safeDialContext(dialer, allow),
 		MaxIdleConns:          1000,
 		MaxIdleConnsPerHost:   1000,
 		IdleConnTimeout:       90 * time.Second,

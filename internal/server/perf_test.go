@@ -101,7 +101,7 @@ func perfServer(tb testing.TB, url string, strip bool) *Server {
 		DefaultProvider: "primary",
 		ModelMap:        map[string]string{"test": "primary:up"},
 		Providers: map[string]*ProviderConfig{"primary": {
-			BaseURL: url, Keys: []KeyEntry{{ID: "c1", Key: "k1"}},
+			BaseURL: url, AllowPrivateUpstreams: true, Keys: []KeyEntry{{ID: "c1", Key: "k1"}},
 		}},
 	}
 	if !strip {

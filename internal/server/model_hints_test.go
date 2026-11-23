@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+func allowPrivateHintFetches(t *testing.T) {
+	t.Helper()
+	prev := hintHTTPClient
+	hintHTTPClient = func(timeout time.Duration, _ bool) *http.Client {
+		return newClient(int(timeout.Seconds())+5, true)
+	}
+	t.Cleanup(func() { hintHTTPClient = prev })
+}
+
 func catalogFixture(t *testing.T, body, source string) catalogIndex {
 	t.Helper()
 	entries, err := decodeModelList([]byte(body), source)
@@ -160,6 +169,7 @@ func TestHintJSONPreservesPricePresence(t *testing.T) {
 }
 
 func TestFetchVercelPublicAndAuthenticated(t *testing.T) {
+	allowPrivateHintFetches(t)
 	for _, key := range []string{"", "test-key"} {
 		t.Run(key, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +210,7 @@ func TestFetchVercelPublicAndAuthenticated(t *testing.T) {
 }
 
 func TestFetchOpenRouterPreservesOutputAndUnknown(t *testing.T) {
+	allowPrivateHintFetches(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"data":[
 			{"id":"owner/widget:free","name":"Free Widget","context_length":128000,"pricing":{"prompt":"0","completion":"0"},"top_provider":{"context_length":64000,"max_completion_tokens":8192}},
@@ -287,6 +298,7 @@ func TestNativeDiscoveredHintMergesEachField(t *testing.T) {
 }
 
 func TestFetchLiteLLMLimitDistinction(t *testing.T) {
+	allowPrivateHintFetches(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{
 			"owner/widget":{"max_tokens":128000,"max_output_tokens":16384,"max_input_tokens":262144,"input_cost_per_token":0.0000005,"output_cost_per_token":0.000002,"input_cost_per_token_cache_hit":0},
@@ -305,6 +317,7 @@ func TestFetchLiteLLMLimitDistinction(t *testing.T) {
 }
 
 func TestHintResolverPublicCatalogAndFailureIsolation(t *testing.T) {
+	allowPrivateHintFetches(t)
 	var vercelCalls atomic.Int32
 	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -348,6 +361,7 @@ func TestHintResolverPublicCatalogAndFailureIsolation(t *testing.T) {
 }
 
 func TestCatalogPagination(t *testing.T) {
+	allowPrivateHintFetches(t)
 	for _, source := range []string{"openrouter", "vercel"} {
 		t.Run(source, func(t *testing.T) {
 			var calls atomic.Int32
@@ -382,6 +396,7 @@ func TestCatalogPagination(t *testing.T) {
 }
 
 func TestCatalogPaginationRejectsIncompleteOrUnsafePages(t *testing.T) {
+	allowPrivateHintFetches(t)
 	for _, tc := range []struct{ name, body string }{
 		{"missing", `{"data":[{"id":"owner/one"}],"total_count":2,"links":{"next":null}}`},
 		{"foreign", `{"data":[],"links":{"next":"https://foreign.invalid/models"}}`},
@@ -405,6 +420,7 @@ func TestCatalogPaginationRejectsIncompleteOrUnsafePages(t *testing.T) {
 }
 
 func TestAdminDiscoverAttachesHints(t *testing.T) {
+	allowPrivateHintFetches(t)
 	vercelFixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"vv/widget-v1","name":"Widget V1","context_window":64000,"max_tokens":4096,"pricing":{"input":"0.00000100","output":"0.00000200"}}]}`))
 	}))

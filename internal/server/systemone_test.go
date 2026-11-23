@@ -85,7 +85,7 @@ func TestSystemOneNativeContractsAndAccounting(t *testing.T) {
 			noStrip := false
 			known := true
 			cfg := &Config{DefaultProvider: "mistral", Providers: map[string]*ProviderConfig{"mistral": {
-				BaseURL: upstream.URL + tc.basePath, APIFormat: tc.apiFormat, StripReasoningContent: &noStrip, MaxTokens: 1,
+				BaseURL: upstream.URL + tc.basePath, APIFormat: tc.apiFormat, AllowPrivateUpstreams: true, StripReasoningContent: &noStrip, MaxTokens: 1,
 				Keys: []KeyEntry{{Key: "upstream-secret", AccountID: "account-one"}},
 			}}, ModelMap: map[string]string{"typed": "mistral:" + tc.upstream}, ModelMeta: map[string]*ModelMeta{"typed": {
 				ContextWindow: 65536, PricingInput: tc.inputPrice, PricingOutput: 0, PricingKnown: &known,
@@ -238,10 +238,13 @@ func TestSystemOneFailoverBeforeFlushAndPerKeyAccounts(t *testing.T) {
 			if w.Code != tc.wantStatus || int(calls.Load()) != tc.wantCalls {
 				t.Fatalf("native retry status=%d calls=%d", w.Code, calls.Load())
 			}
-			if w.Header().Get("X-Rejected-Upstream") != "" || strings.Contains(w.Body.String(), "private-") {
+			if w.Header().Get("X-Rejected-Upstream") != "" || (tc.wantStatus == 200 && strings.Contains(w.Body.String(), "private-")) {
 				t.Fatal("failed native response flushed before failover")
 			}
 			rec := runtimeRecord(t, s)
+			if encoded, _ := json.Marshal(rec); bytes.Contains(encoded, []byte("private-")) {
+				t.Fatalf("upstream error text leaked into analytics record: %s", encoded)
+			}
 			if len(rec.AttemptLog) != tc.wantCalls || rec.Failover != tc.wantCalls-1 {
 				t.Fatalf("native attempts=%+v", rec.AttemptLog)
 			}
@@ -274,7 +277,7 @@ func TestSystemOneFallbackCompatibilityAndAttemptLimit(t *testing.T) {
 		cfg := runtimeConfig(native.URL)
 		cfg.Providers["primary"].APIFormat = "systemone"
 		cfg.Providers["primary"].Keys = []KeyEntry{{Key: "a"}, {Key: "b"}, {Key: "c"}}
-		cfg.Providers["chat"] = &ProviderConfig{BaseURL: chat.URL, NoAuth: true}
+		cfg.Providers["chat"] = &ProviderConfig{BaseURL: chat.URL, NoAuth: true, AllowPrivateUpstreams: true}
 		cfg.ModelMap["test"] = "primary:jev-latest"
 		cfg.ModelRoutes = map[string][]RouteTarget{"test": {{Backend: "chat", Upstream: "chat-model"}}}
 		cfg.Limits.MaxAttempts = limit
@@ -383,8 +386,8 @@ func TestSystemOneCrossProviderFallbackUsesNativeContractAndPrice(t *testing.T) 
 	defer chat.Close()
 	cfg := runtimeConfig(primary.URL + "/v1")
 	cfg.Providers["primary"].APIFormat = "systemone"
-	cfg.Providers["chat"] = &ProviderConfig{BaseURL: chat.URL, NoAuth: true}
-	cfg.Providers["cf"] = &ProviderConfig{BaseURL: fallback.URL + "/accounts/%ACCOUNT%/ai/v1", Keys: []KeyEntry{{Key: "cf-key", AccountID: "fallback-account"}}}
+	cfg.Providers["chat"] = &ProviderConfig{BaseURL: chat.URL, NoAuth: true, AllowPrivateUpstreams: true}
+	cfg.Providers["cf"] = &ProviderConfig{BaseURL: fallback.URL + "/accounts/%ACCOUNT%/ai/v1", AllowPrivateUpstreams: true, Keys: []KeyEntry{{Key: "cf-key", AccountID: "fallback-account"}}}
 	cfg.ModelMap = map[string]string{"typed": "primary:jev-latest", "clef-price": "cf:@cf/cloudflare/clef"}
 	cfg.ModelMeta = map[string]*ModelMeta{"typed": {PricingInput: 0.042}, "clef-price": {PricingInput: 0.24}}
 	cfg.ModelRoutes = map[string][]RouteTarget{"typed": {{Backend: "chat", Upstream: "chat-only"}, {Backend: "cf", Upstream: "@cf/cloudflare/clef"}}}

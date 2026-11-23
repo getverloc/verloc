@@ -67,7 +67,8 @@ func newResponsesStreamState(model string) *responsesStreamState {
 
 // writeResponsesEvent marshals one typed event. Responses SSE carries the type
 // inside the payload as well as in the event: line, so clients can branch on
-// either.
+// either. Client write errors are wrapped in *streamClientError so forward()
+// classifies client disconnects as 499 canceled rather than 502 interrupted.
 func writeResponsesEvent(w http.ResponseWriter, payload map[string]any) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -75,10 +76,12 @@ func writeResponsesEvent(w http.ResponseWriter, payload map[string]any) error {
 	}
 	kind, _ := payload["type"].(string)
 	if _, err := w.Write([]byte("event: " + kind + "\n")); err != nil {
-		return err
+		return &streamClientError{err}
 	}
-	_, err = w.Write([]byte("data: " + string(b) + "\n\n"))
-	return err
+	if _, err := w.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
+		return &streamClientError{err}
+	}
+	return nil
 }
 
 // seqNext stamps an event with an increasing sequence_number, which the

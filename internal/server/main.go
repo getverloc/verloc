@@ -420,11 +420,12 @@ func (s *Server) Handler() http.Handler {
 	}))
 }
 
-// gzipSkipPaths are never compressed: streaming chat/responses bodies and
-// the dashboard SSE feed must flush incrementally, and buffering them
-// through a gzip writer would break commit/idle semantics.
+// gzipSkipPaths are never compressed: streaming chat/messages/responses bodies
+// and the dashboard SSE feed must flush incrementally, and buffering them
+// through a gzip writer would break commit/idle semantics and FlushError.
 var gzipSkipPaths = map[string]bool{
 	"/v1/chat/completions": true, "/chat/completions": true,
+	"/v1/messages": true, "/messages": true,
 	"/v1/responses": true, "/responses": true,
 	"/dash/api/live": true,
 	// Base64 image payloads are already dense; compressing them burns CPU

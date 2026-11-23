@@ -11,19 +11,28 @@ import (
 )
 
 type hedgedAttempt struct {
-	b            *backend
-	ks           *KeyState
-	target       RouteTarget
-	isPrimary    bool
-	replay       reasoningContext
-	attemptStart time.Time
-	ctx          context.Context
-	cancel       context.CancelFunc
-	budgetTimer  *time.Timer
-	resp         *http.Response
-	err          error
-	slotHeld     bool
-	probeHeld    bool
+	srv           *Server
+	b             *backend
+	ks            *KeyState
+	target        RouteTarget
+	isPrimary     bool
+	replay        reasoningContext
+	attemptStart  time.Time
+	ctx           context.Context
+	cancel        context.CancelFunc
+	budgetTimer   *time.Timer
+	resp          *http.Response
+	err           error
+	slotHeld      bool
+	probeHeld     bool
+	hedgeSlotHeld bool
+}
+
+func (a *hedgedAttempt) releaseHedgeSlot() {
+	if a != nil && a.hedgeSlotHeld {
+		a.srv.releaseHedgeSlot()
+		a.hedgeSlotHeld = false
+	}
 }
 
 func (a *hedgedAttempt) cleanupCanceled() {
@@ -48,6 +57,7 @@ func (a *hedgedAttempt) cleanupCanceled() {
 		a.b.pool.ReleaseProbe(a.ks)
 		a.probeHeld = false
 	}
+	a.releaseHedgeSlot()
 }
 
 type hedgeOutcome struct {
@@ -55,6 +65,7 @@ type hedgeOutcome struct {
 	attempts        int
 	lastStatus      int
 	nonRetryStatus  int
+	nonRetryMsg     string
 	nonRetry        bool
 	clientCanceled  bool
 	previousBackend *backend
@@ -62,10 +73,12 @@ type hedgeOutcome struct {
 	failedRoutes    map[int]bool
 }
 
-// runHedgedChat executes speculative hedging across the top two eligible
-// routes when policy.HedgeDelayMs > 0. Route 1 is only launched if route 0 has
-// not produced response headers within HedgeDelayMs; whichever attempt returns
-// HTTP 200 first wins and immediately cancels the loser.
+// runHedgedChat executes speculative hedging across up to 1 + policy.MaxHedges
+// eligible routes (up to 3 total: primary + up to 2 staggered backups) when
+// policy.HedgeDelayMs > 0. Each speculative backup is gated by the gateway's
+// global active-hedge concurrency cap so latency spikes cannot amplify load
+// without bound; whichever attempt returns HTTP 200 first wins and cancels and
+// reaps all remaining attempts.
 func (s *Server) runHedgedChat(
 	r *http.Request,
 	rt *runtimeState,
@@ -81,6 +94,24 @@ func (s *Server) runHedgedChat(
 	var out hedgeOutcome
 	out.lastStatus = http.StatusServiceUnavailable
 
+	limits := rt.cfg.Limits
+	limits.applyDefaults()
+
+	maxHedges := policy.MaxHedges
+	if maxHedges <= 0 {
+		maxHedges = 1
+	}
+	if maxHedges > 2 {
+		maxHedges = 2
+	}
+	maxPicks := 1 + maxHedges
+	if limits.MaxAttempts > 0 && maxPicks > limits.MaxAttempts {
+		maxPicks = limits.MaxAttempts
+	}
+	if maxPicks < 2 {
+		return out, false
+	}
+
 	type eligible struct {
 		idx         int
 		cand        candidateRoute
@@ -88,8 +119,7 @@ func (s *Server) runHedgedChat(
 		upstreamURL string
 		upModel     string
 	}
-	var picks [2]eligible
-	pickCount := 0
+	picks := make([]eligible, 0, maxPicks)
 	for i, cand := range candidates {
 		if !cand.isPrimary && !targetSupportsOperation(rt.cfg, cand.target, "chat") {
 			continue
@@ -105,13 +135,12 @@ func (s *Server) runHedgedChat(
 		if routeErr != nil {
 			continue
 		}
-		picks[pickCount] = eligible{idx: i, cand: cand, b: b, upstreamURL: upURL, upModel: upModel}
-		pickCount++
-		if pickCount == 2 {
+		picks = append(picks, eligible{idx: i, cand: cand, b: b, upstreamURL: upURL, upModel: upModel})
+		if len(picks) == maxPicks {
 			break
 		}
 	}
-	if pickCount < 2 {
+	if len(picks) < 2 {
 		return out, false
 	}
 
@@ -119,16 +148,27 @@ func (s *Server) runHedgedChat(
 		slot int
 		att  *hedgedAttempt
 	}
-	results := make(chan resultMsg, 2)
+	results := make(chan resultMsg, len(picks))
+	launched := make([]*hedgedAttempt, len(picks))
 
-	launchInto := func(slot int, e eligible) (*hedgedAttempt, bool) {
+	launchInto := func(slot int, e eligible) (*hedgedAttempt, bool, bool) {
+		isHedge := slot > 0
+		if isHedge && !s.tryAcquireHedgeSlot(limits) {
+			return nil, false, true
+		}
 		if !e.b.route.tryAcquireSlot() {
-			return nil, false
+			if isHedge {
+				s.releaseHedgeSlot()
+			}
+			return nil, false, false
 		}
 		ks := e.b.pool.NextUntried(nil)
 		if ks == nil {
 			e.b.route.releaseSlot()
-			return nil, false
+			if isHedge {
+				s.releaseHedgeSlot()
+			}
+			return nil, false, false
 		}
 		modified, replay := prepareChatBody(raw, bodyScan, e.upModel, e.b.name == "mistral", e.b.name, e.b.stripReasoning, e.b.maxTokens, s.reasonCache, reasoningScope{
 			clientID: rec.ClientKeyID, model: rec.Model, provider: e.b.name,
@@ -143,7 +183,10 @@ func (s *Server) runHedgedChat(
 			cancel()
 			e.b.pool.ReleaseProbe(ks)
 			e.b.route.releaseSlot()
-			return nil, false
+			if isHedge {
+				s.releaseHedgeSlot()
+			}
+			return nil, false, false
 		}
 		copyRequestHeaders(req, r)
 		req.Header.Set("X-Request-ID", id)
@@ -159,38 +202,42 @@ func (s *Server) runHedgedChat(
 			req.Header.Set("x-opencode-session", randomUUID())
 		}
 		att := &hedgedAttempt{
-			b:            e.b,
-			ks:           ks,
-			target:       e.cand.target,
-			isPrimary:    e.cand.isPrimary,
-			replay:       replay,
-			attemptStart: time.Now(),
-			ctx:          ctx,
-			cancel:       cancel,
-			budgetTimer:  budgetTimer,
-			slotHeld:     true,
-			probeHeld:    true,
+			srv:           s,
+			b:             e.b,
+			ks:            ks,
+			target:        e.cand.target,
+			isPrimary:     e.cand.isPrimary,
+			replay:        replay,
+			attemptStart:  time.Now(),
+			ctx:           ctx,
+			cancel:        cancel,
+			budgetTimer:   budgetTimer,
+			slotHeld:      true,
+			probeHeld:     true,
+			hedgeSlotHeld: isHedge,
 		}
+		launched[slot] = att
 		go func(a *hedgedAttempt, rq *http.Request) {
 			a.resp, a.err = a.b.client.Do(rq)
 			results <- resultMsg{slot: slot, att: a}
 		}(att, req)
-		return att, true
+		return att, true, false
 	}
 
-	a0, ok0 := launchInto(0, picks[0])
+	a0, ok0, _ := launchInto(0, picks[0])
 	if !ok0 {
 		return out, false
 	}
-	out.failedRoutes = make(map[int]bool, 2)
+	out.failedRoutes = make(map[int]bool, len(picks))
 	out.attempts = 1
 	out.previousBackend, out.previousKey = a0.b, a0.ks
 
-	recordFailure := func(slot int, a *hedgedAttempt) (nonRetry bool, status int) {
+	recordFailure := func(slot int, a *hedgedAttempt) (nonRetry bool, status int, clientMsg string) {
 		a.budgetTimer.Stop()
 		a.cancel()
 		a.b.route.releaseSlot()
 		a.slotHeld = false
+		a.releaseHedgeSlot()
 		out.failedRoutes[picks[slot].idx] = true
 		lat := time.Since(a.attemptStart)
 		if a.err != nil {
@@ -203,7 +250,7 @@ func (s *Server) runHedgedChat(
 					LatMs: float64(lat.Nanoseconds()) / 1e6,
 				})
 				out.clientCanceled = true
-				return true, 499
+				return true, 499, ""
 			}
 			a.b.route.Observe(lat, false)
 			a.b.pool.MarkFailureStatus(a.ks, 0, 0)
@@ -213,7 +260,7 @@ func (s *Server) runHedgedChat(
 				LatMs: float64(lat.Nanoseconds()) / 1e6,
 			})
 			out.lastStatus = 502
-			return false, 502
+			return false, 502, ""
 		}
 		out.lastStatus = a.resp.StatusCode
 		a.b.pool.ObserveHeaders(a.ks, a.resp.Header)
@@ -229,52 +276,49 @@ func (s *Server) runHedgedChat(
 		if !retryable {
 			a.b.pool.ReleaseProbe(a.ks)
 			a.probeHeld = false
-			return true, a.resp.StatusCode
+			return true, a.resp.StatusCode, safeUpstreamErrorMessage(a.resp.StatusCode, body, a.ks.Key, a.ks.AccountID)
 		}
 		a.b.route.Observe(lat, false)
 		a.b.pool.MarkFailureStatus(a.ks, a.resp.StatusCode, retryAfterDuration(a.resp))
 		a.probeHeld = false
-		return false, a.resp.StatusCode
+		return false, a.resp.StatusCode, ""
 	}
 
 	hedgeDelay := time.Duration(policy.HedgeDelayMs) * time.Millisecond
-	hedgeTimer := time.NewTimer(hedgeDelay)
-	defer hedgeTimer.Stop()
-
-	var a1 *hedgedAttempt
-	inFlight := 1
-
-	select {
-	case msg := <-results:
-		inFlight--
-		if msg.att.err == nil && msg.att.resp.StatusCode == http.StatusOK {
-			msg.att.b.pool.ObserveHeaders(msg.att.ks, msg.att.resp.Header)
-			out.winner = msg.att
-			return out, true
-		}
-		if nonRetry, st := recordFailure(msg.slot, msg.att); nonRetry {
-			out.nonRetry = true
-			out.nonRetryStatus = st
-		}
-		return out, true
-	case <-hedgeTimer.C:
-		if time.Now().Before(deadline) && r.Context().Err() == nil {
-			var ok1 bool
-			a1, ok1 = launchInto(1, picks[1])
-			if ok1 {
-				inFlight++
-				out.attempts++
+	var hedgeTimer *time.Timer
+	var hedgeCh <-chan time.Time
+	armHedgeTimer := func(d time.Duration) {
+		if hedgeTimer == nil {
+			hedgeTimer = time.NewTimer(d)
+		} else {
+			if !hedgeTimer.Stop() {
+				select {
+				case <-hedgeTimer.C:
+				default:
+				}
 			}
+			hedgeTimer.Reset(d)
 		}
+		hedgeCh = hedgeTimer.C
 	}
-
-	cancelOtherAndReap := func(winnerSlot int) {
-		other := a1
-		if winnerSlot == 1 {
-			other = a0
+	stopHedgeTimer := func() {
+		if hedgeTimer != nil {
+			hedgeTimer.Stop()
 		}
-		if other != nil {
-			other.cancel()
+		hedgeCh = nil
+	}
+	defer stopHedgeTimer()
+
+	inFlight := 1
+	nextSlot := 1
+	hedgeCapHit := false
+
+	cancelOthersAndReap := func(winnerSlot int) {
+		stopHedgeTimer()
+		for i, att := range launched {
+			if i != winnerSlot && att != nil {
+				att.cancel()
+			}
 		}
 		if inFlight > 0 {
 			go func(rem int) {
@@ -286,21 +330,72 @@ func (s *Server) runHedgedChat(
 		}
 	}
 
-	for inFlight > 0 {
-		msg := <-results
-		inFlight--
-		if msg.att.err == nil && msg.att.resp.StatusCode == http.StatusOK {
-			msg.att.b.pool.ObserveHeaders(msg.att.ks, msg.att.resp.Header)
-			cancelOtherAndReap(msg.slot)
-			out.winner = msg.att
-			return out, true
+	launchNextHedge := func() bool {
+		for nextSlot < len(picks) {
+			slot := nextSlot
+			nextSlot++
+			att, ok, capped := launchInto(slot, picks[slot])
+			if capped {
+				hedgeCapHit = true
+				return false
+			}
+			if ok {
+				inFlight++
+				out.attempts++
+				out.previousBackend, out.previousKey = att.b, att.ks
+				return true
+			}
 		}
-		nonRetry, st := recordFailure(msg.slot, msg.att)
-		if nonRetry {
-			cancelOtherAndReap(msg.slot)
-			out.nonRetry = true
-			out.nonRetryStatus = st
-			return out, true
+		return false
+	}
+
+	armHedgeTimer(hedgeDelay)
+
+	for inFlight > 0 {
+		select {
+		case msg := <-results:
+			inFlight--
+			// Once an attempt finishes its race it is no longer a speculative
+			// duplicate, so release the global hedge slot before delivering.
+			msg.att.releaseHedgeSlot()
+			if msg.att.err == nil && msg.att.resp.StatusCode == http.StatusOK {
+				msg.att.b.pool.ObserveHeaders(msg.att.ks, msg.att.resp.Header)
+				cancelOthersAndReap(msg.slot)
+				out.winner = msg.att
+				return out, true
+			}
+			nonRetry, st, clientMsg := recordFailure(msg.slot, msg.att)
+			if nonRetry {
+				cancelOthersAndReap(msg.slot)
+				out.nonRetry = true
+				out.nonRetryStatus = st
+				out.nonRetryMsg = clientMsg
+				return out, true
+			}
+			// If no other hedged attempt is currently in flight, return so
+			// forward()'s sequential failover loop immediately tries the next
+			// untried route with full multi-key rotation (without waiting for
+			// hedgeDelay).
+			if inFlight == 0 {
+				return out, true
+			}
+			// Another attempt is still slow and we just lost a speculative
+			// contender: if another hedge candidate remains under the cap,
+			// launch it immediately rather than waiting another full delay.
+			if nextSlot < len(picks) && !hedgeCapHit && time.Now().Before(deadline) && r.Context().Err() == nil {
+				if launchNextHedge() && nextSlot < len(picks) && !hedgeCapHit {
+					armHedgeTimer(hedgeDelay)
+				} else {
+					stopHedgeTimer()
+				}
+			}
+		case <-hedgeCh:
+			hedgeCh = nil
+			if !hedgeCapHit && nextSlot < len(picks) && time.Now().Before(deadline) && r.Context().Err() == nil {
+				if launchNextHedge() && nextSlot < len(picks) && !hedgeCapHit {
+					armHedgeTimer(hedgeDelay)
+				}
+			}
 		}
 	}
 

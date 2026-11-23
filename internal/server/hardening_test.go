@@ -20,7 +20,7 @@ func budgetServer(tb testing.TB, url string, budgetSec int, strip bool) *Server 
 		DefaultProvider: "primary",
 		ModelMap:        map[string]string{"test": "primary:up"},
 		Providers: map[string]*ProviderConfig{"primary": {
-			BaseURL: url, Keys: []KeyEntry{{ID: "c1", Key: "k1"}},
+			BaseURL: url, AllowPrivateUpstreams: true, Keys: []KeyEntry{{ID: "c1", Key: "k1"}},
 		}},
 	}
 	if !strip {

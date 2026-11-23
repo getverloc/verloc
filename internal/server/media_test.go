@@ -340,7 +340,7 @@ func TestMediaRouteThroughHandler(t *testing.T) {
 	cfg := &Config{
 		DefaultProvider: "mock",
 		ModelMap:        map[string]string{"mock/embed": "mock:upstream-embed"},
-		Providers:       map[string]*ProviderConfig{"mock": {BaseURL: upstream.URL, Keys: []KeyEntry{{Key: "sk-test-key"}}}},
+		Providers:       map[string]*ProviderConfig{"mock": {BaseURL: upstream.URL, AllowPrivateUpstreams: true, Keys: []KeyEntry{{Key: "sk-test-key"}}}},
 	}
 	cfg.applyDefaults()
 	cfg, err := e.store.LoadOrImportConfig(cfg)

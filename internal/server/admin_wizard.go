@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -31,51 +30,13 @@ type probeConn struct {
 	allowPrivate bool
 }
 
-// probeClient returns the HTTP client for wizard probes. Unless private
-// upstreams are explicitly allowed, the dialer re-validates every resolved
-// IP at connect time and pins the checked address — closing the
-// DNS-rebinding gap between guardProbeHost's lookup and the real dial,
-// where a low-TTL name could return a public IP first and a metadata IP
-// second.
+// probeClient returns the HTTP client for wizard probes. It reuses newClient's
+// dial-time IP validation and pinning (closing DNS-rebinding gaps unless
+// allowPrivate is explicitly set) and applies a total request timeout.
 func probeClient(timeoutSec int, allowPrivate bool) *http.Client {
-	c := newClient(timeoutSec)
+	c := newClient(timeoutSec, allowPrivate)
 	c.Timeout = time.Duration(timeoutSec) * time.Second
-	if allowPrivate {
-		return c
-	}
-	if tr, ok := c.Transport.(*http.Transport); ok {
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			if ip, err := netip.ParseAddr(host); err == nil {
-				if isPrivateIP(ip.Unmap()) {
-					return nil, fmt.Errorf("upstream resolves to a private or local address (%s)", ip)
-				}
-				return dialer.DialContext(ctx, network, addr)
-			}
-			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-			if err != nil || len(ips) == 0 {
-				// Same rule as the guard: only a positive private match
-				// blocks; resolution failure surfaces as a dial error.
-				return dialer.DialContext(ctx, network, addr)
-			}
-			for _, ip := range ips {
-				if isPrivateIP(ip.Unmap()) {
-					return nil, fmt.Errorf("upstream resolves to a private or local address (%s)", ip)
-				}
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
-		}
-	}
 	return c
-}
-
-func isPrivateIP(ip netip.Addr) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast()
 }
 
 type probeReq struct {
@@ -126,7 +87,7 @@ func guardProbeHost(ctx context.Context, baseURL string, allowPrivate bool) erro
 	if addr, err := netip.ParseAddr(host); err == nil {
 		return check(addr.Unmap())
 	}
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	ips, err := lookupNetIP(ctx, "ip", host)
 	if err := ctx.Err(); err != nil {
 		return err
 	}

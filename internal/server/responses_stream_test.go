@@ -376,7 +376,7 @@ func TestResponsesRoutesThroughHandler(t *testing.T) {
 	cfg := &Config{
 		DefaultProvider: "mock",
 		ModelMap:        map[string]string{"mock/text": "mock:upstream-text"},
-		Providers:       map[string]*ProviderConfig{"mock": {BaseURL: upstream.URL, Keys: []KeyEntry{{Key: "sk-test-key"}}}},
+		Providers:       map[string]*ProviderConfig{"mock": {BaseURL: upstream.URL, AllowPrivateUpstreams: true, Keys: []KeyEntry{{Key: "sk-test-key"}}}},
 	}
 	cfg.applyDefaults()
 	cfg, err := e.store.LoadOrImportConfig(cfg)
