@@ -21,6 +21,7 @@ import { Switch } from '../components/ui/switch';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { Textarea } from '../components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
+import { UpdateSection } from '../components/UpdateSection';
 
 const limitLabels: Record<keyof GatewayLimits, string> = {
   max_body_bytes: 'Maximum request body (bytes)',
@@ -316,9 +317,10 @@ export default function Settings({ state }: TabProps) {
           ['02', 'Gateway limits', 'gateway-limits'],
           ['03', 'Response cache', 'response-cache'],
           ['04', 'Alert rules', 'alert-rules'],
-          ['05', 'Backups', 'backups'],
-          ['06', 'Connection', 'connection'],
-          ['07', 'Audit', 'audit'],
+          ['05', 'Software updates', 'updates'],
+          ['06', 'Backups', 'backups'],
+          ['07', 'Connection', 'connection'],
+          ['08', 'Audit', 'audit'],
         ].map(([index, label, id]) => (
           <a key={id} href={`#${id}`} className="flex items-center gap-2 border-r border-edge-700 px-4 py-3 text-[10px] transition-colors hover:bg-edge-800 hover:text-primary">
             <span className="text-primary">{index}</span><span className="text-muted-foreground">{label}</span>
@@ -616,10 +618,12 @@ export default function Settings({ state }: TabProps) {
             </CardContent>
           </Card>
 
+          <UpdateSection onAuditRefresh={() => void refreshAudit()} />
+
           <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-2">
             <Card id="backups" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900">
               <CardHeader className="border-b border-edge-700 pb-5">
-                <span className="text-[10px] tracking-[0.16em] text-chart-3 uppercase">05 / Recovery</span>
+                <span className="text-[10px] tracking-[0.16em] text-chart-3 uppercase">06 / Recovery</span>
                 <CardTitle className="flex items-center gap-2"><Database className="size-4 text-chart-3" />Private backups</CardTitle>
                 <CardDescription>
                   Consistent server-side snapshot of management and analytics data. Backups contain
@@ -644,7 +648,7 @@ export default function Settings({ state }: TabProps) {
 
             <Card id="connection" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900">
               <CardHeader className="border-b border-edge-700 pb-5">
-                <span className="text-[10px] tracking-[0.16em] text-chart-2 uppercase">06 / Infrastructure</span>
+                <span className="text-[10px] tracking-[0.16em] text-chart-2 uppercase">07 / Infrastructure</span>
                 <CardTitle>Connection & storage</CardTitle>
                 <CardDescription>How applications reach this gateway and where its data lives.</CardDescription>
               </CardHeader>
@@ -673,7 +677,7 @@ export default function Settings({ state }: TabProps) {
 
       <Card id="audit" className="scroll-mt-6 gap-0 overflow-hidden border-edge-700 bg-edge-900 py-0 lg:grid lg:grid-cols-[240px_minmax(0,1fr)]">
         <CardHeader className="flex flex-col items-start gap-3 border-b border-edge-700 bg-edge-950/40 p-6 lg:border-r lg:border-b-0">
-          <span className="text-[10px] tracking-[0.16em] text-primary uppercase">07 / Accountability</span>
+          <span className="text-[10px] tracking-[0.16em] text-primary uppercase">08 / Accountability</span>
           <CardTitle className="flex items-center gap-2"><History className="size-4" />Audit history</CardTitle>
           <CardDescription>Recorded management actions and their subjects.</CardDescription>
           <CardAction className="mt-2 self-start">

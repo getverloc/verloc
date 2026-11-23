@@ -19,10 +19,11 @@ import (
 	"time"
 )
 
-// Version and Commit are set by cmd/verloc from ldflags.
+// Version, Commit, and BuildTime are set by cmd/verloc from ldflags.
 var (
-	Version = "dev"
-	Commit  = "none"
+	Version   = "dev"
+	Commit    = "none"
+	BuildTime = "unknown"
 )
 
 func NewServer(cfg *Config) (*Server, error) {
@@ -35,8 +36,9 @@ func NewServer(cfg *Config) (*Server, error) {
 	if cfg.Dashboard != nil && cfg.Dashboard.DBPath != "" && cfg.Dashboard.DBPath != ":memory:" {
 		setSpillTempDir(filepath.Dir(cfg.Dashboard.DBPath))
 	}
-	s := &Server{metrics: NewMetrics(), reasonCache: newReasoningCache(maxReasoningEntries), hints: newHintResolver()}
+	s := &Server{metrics: NewMetrics(), reasonCache: newReasoningCache(maxReasoningEntries), hints: newHintResolver(), restartCh: make(chan string, 1)}
 	s.rt.Store(newRuntimeState(cfg, backends))
+	s.updater = NewUpdater(s)
 	s.initGateway()
 	s.syncKeepWarm()
 	return s, nil
@@ -193,13 +195,7 @@ func Run() {
 	rt := srv.runtime()
 	log.Printf("verloc %s (%s) listening on %s | providers=%d models=%d | dashboard=/dash/",
 		Version, Commit, rt.cfg.Listen, len(rt.backends), len(rt.cfg.ModelMap))
-	select {
-	case err := <-exited:
-		if err != nil && err != http.ErrServerClosed {
-			_ = srv.Close()
-			log.Fatalf("server: %v", err)
-		}
-	case <-stop.Done():
+	drainHTTP := func() {
 		srv.shuttingDown.Store(true)
 		srv.gatewayConfigChanged()
 		if srv.hub != nil {
@@ -213,8 +209,28 @@ func Run() {
 		}
 		done()
 	}
+	var restartExe string
+	select {
+	case err := <-exited:
+		if err != nil && err != http.ErrServerClosed {
+			_ = srv.Close()
+			log.Fatalf("server: %v", err)
+		}
+	case exe := <-srv.restartCh:
+		restartExe = exe
+		log.Printf("[update] gracefully draining requests before restarting into %s", exe)
+		drainHTTP()
+	case <-stop.Done():
+		drainHTTP()
+	}
 	if err := srv.Close(); err != nil {
 		log.Printf("[shutdown] persistence: %v", err)
+	}
+	if restartExe != "" {
+		log.Printf("[update] replacing process via exec: %s", restartExe)
+		if err := execSelf(restartExe, os.Args, os.Environ()); err != nil {
+			log.Fatalf("[update] exec restart failed: %v", err)
+		}
 	}
 }
 
@@ -298,6 +314,9 @@ func openGateway(seed *Config) (*Server, error) {
 	// it in the background once so the 30-day chart stops re-reading every tick
 	// (measured 3.4s / 892MB per poll at 1M ticks). No-op once populated.
 	store.EnsureRollupsBackfilled(context.Background())
+	if srv.updater != nil {
+		srv.updater.Start(context.Background())
+	}
 	log.Printf("[security] local first-run setup token: %s (never share or commit this file)", seed.SetupTokenFile)
 	return srv, nil
 }
@@ -358,6 +377,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /dash/api/admin/settings", s.handleAdminSettings)
 	mux.HandleFunc("GET /dash/api/admin/audit", s.handleAdminAudit)
 	mux.HandleFunc("POST /dash/api/admin/backup", s.handleAdminBackup)
+	mux.HandleFunc("GET /dash/api/admin/update", s.handleAdminUpdateStatus)
+	mux.HandleFunc("POST /dash/api/admin/update/check", s.handleAdminUpdateCheck)
+	mux.HandleFunc("POST /dash/api/admin/update/apply", s.handleAdminUpdateApply)
 	if s.security != nil {
 		s.security.RegisterRoutes(mux)
 	}

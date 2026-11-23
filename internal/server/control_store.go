@@ -51,6 +51,7 @@ type controlSettings struct {
 	Alerts           []AlertRule          `json:"alerts"`
 	Limits           GatewayLimits        `json:"limits"`
 	Cache            *ResponseCacheConfig `json:"cache,omitempty"`
+	Update           *UpdateConfig        `json:"update,omitempty"`
 }
 
 func controlDSN(path string, readOnly bool) string {
@@ -372,6 +373,11 @@ func prepareControlConfig(cfg *Config, importCatalog bool) (*Config, error) {
 		return nil, err
 	}
 	out.Cache = cacheCfg
+	updateCfg, err := validateUpdateConfig(out.Update)
+	if err != nil {
+		return nil, err
+	}
+	out.Update = updateCfg
 	out.ProxyKey = ""
 	if len(out.Providers) == 0 && (len(out.Keys) > 0 || out.UpstreamBase != "") {
 		p := &ProviderConfig{BaseURL: out.UpstreamBase, AuthHeader: out.AuthHeader, AuthHeaderFormat: out.AuthHeaderFormat, CooldownSeconds: out.CooldownSeconds, RequestTimeout: out.RequestTimeout}
@@ -663,7 +669,7 @@ func (s *ControlStore) writeConfig(tx *sql.Tx, cfg *Config, action string) error
 			}
 		}
 	}
-	settings := controlSettings{DefaultProvider: cfg.DefaultProvider, AuthHeader: cfg.AuthHeader, AuthHeaderFormat: cfg.AuthHeaderFormat, CooldownSeconds: cfg.CooldownSeconds, RequestTimeout: cfg.RequestTimeout, RecentRequests: cfg.Dashboard.RecentRequests, Alerts: cfg.Dashboard.Alerts, Limits: cfg.Limits, Cache: cfg.Cache}
+	settings := controlSettings{DefaultProvider: cfg.DefaultProvider, AuthHeader: cfg.AuthHeader, AuthHeaderFormat: cfg.AuthHeaderFormat, CooldownSeconds: cfg.CooldownSeconds, RequestTimeout: cfg.RequestTimeout, RecentRequests: cfg.Dashboard.RecentRequests, Alerts: cfg.Dashboard.Alerts, Limits: cfg.Limits, Cache: cfg.Cache, Update: cfg.Update}
 	data, err := json.Marshal(settings)
 	if err != nil {
 		return err
@@ -697,7 +703,7 @@ func (s *ControlStore) loadConfig(tx *sql.Tx, seed *Config) (*Config, error) {
 		return nil, err
 	}
 	out.DefaultProvider, out.AuthHeader, out.AuthHeaderFormat = settings.DefaultProvider, settings.AuthHeader, settings.AuthHeaderFormat
-	out.CooldownSeconds, out.RequestTimeout, out.Limits, out.Cache = settings.CooldownSeconds, settings.RequestTimeout, settings.Limits, settings.Cache
+	out.CooldownSeconds, out.RequestTimeout, out.Limits, out.Cache, out.Update = settings.CooldownSeconds, settings.RequestTimeout, settings.Limits, settings.Cache, settings.Update
 	out.Dashboard.RecentRequests, out.Dashboard.Alerts = settings.RecentRequests, settings.Alerts
 	rows, err := tx.Query(`SELECT id,options FROM providers ORDER BY id`)
 	if err != nil {

@@ -5,7 +5,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OUT="${1:-verloc}"
-VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+if [ -z "${VERSION:-}" ]; then
+  if EXACT_TAG="$(git describe --tags --exact-match 2>/dev/null)"; then
+    VERSION="$EXACT_TAG"
+  elif [ -f VERSION ]; then
+    VERSION="v$(tr -d ' \t\r\n' < VERSION)-dev"
+  else
+    VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+  fi
+fi
 COMMIT="${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo none)}"
 BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
@@ -24,4 +32,3 @@ CGO_ENABLED=0 go build -trimpath -ldflags="$LDFLAGS" -o "$OUT" ./cmd/verloc
 case "$OUT" in */*) BIN="$OUT";; *) BIN="./$OUT";; esac
 echo "==> done: $OUT ($(du -h "$OUT" | cut -f1))"
 "$BIN" -version || true
-

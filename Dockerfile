@@ -8,18 +8,21 @@ COPY dashboard/ ./
 RUN npm run build
 
 FROM golang:1.25-alpine AS go-builder
-ARG VERSION=docker
+ARG VERSION=""
 ARG COMMIT=none
 ARG BUILD_TIME=unknown
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY VERSION go.mod go.sum ./
 RUN go mod download
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY --from=dash-builder /src/internal/server/static ./internal/server/static
-RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}" \
-    -o /out/verloc ./cmd/verloc
+RUN VER="${VERSION:-v$(tr -d ' \t\r\n' < VERSION)}" \
+    && BT="${BUILD_TIME}" \
+    && [ "$BT" != "unknown" ] || BT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    && CGO_ENABLED=0 go build -trimpath \
+      -ldflags="-s -w -X main.version=${VER} -X main.commit=${COMMIT} -X main.buildTime=${BT}" \
+      -o /out/verloc ./cmd/verloc
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata \

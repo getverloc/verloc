@@ -242,6 +242,9 @@ type Server struct {
 	reasonCache    *reasoningCache
 	control        *ControlStore
 	security       *Security
+	updater        *Updater
+	restartCh      chan string
+	restartOnce    sync.Once
 	shuttingDown   atomic.Bool
 	routeRR        atomic.Uint64
 	activeHedges   atomic.Int64
@@ -281,6 +284,18 @@ func (s *Server) releaseHedgeSlot() {
 
 func (s *Server) runtime() *runtimeState {
 	return s.rt.Load()
+}
+
+func (s *Server) requestRestart(exePath string) {
+	if s.restartCh == nil {
+		return
+	}
+	s.restartOnce.Do(func() {
+		select {
+		case s.restartCh <- exePath:
+		default:
+		}
+	})
 }
 
 // SetTelemetry wires the analytics subsystems (store, live hub, alerts,

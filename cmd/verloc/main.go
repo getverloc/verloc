@@ -9,7 +9,7 @@ import (
 
 // Set via -ldflags at build time, e.g.:
 //
-//	-X main.version=1.2.3 -X main.commit=abc1234 -X main.buildTime=2026-08-25T12:00:00Z
+//	-X main.version=v1.0.0 -X main.commit=abc1234 -X main.buildTime=2026-08-25T12:00:00Z
 var (
 	version   = "dev"
 	commit    = "none"
@@ -25,5 +25,6 @@ func main() {
 	}
 	server.Version = version
 	server.Commit = commit
+	server.BuildTime = buildTime
 	server.Run()
 }

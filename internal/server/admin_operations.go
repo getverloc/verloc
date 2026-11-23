@@ -416,6 +416,7 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			Limits *GatewayLimits       `json:"limits"`
 			Alerts *[]AlertRule         `json:"alerts"`
 			Cache  *ResponseCacheConfig `json:"cache"`
+			Update *UpdateConfig        `json:"update"`
 		}
 		if !decodeAdminJSON(w, r, &req) {
 			return
@@ -445,9 +446,20 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			cfg.Cache = normalized
 		}
+		if req.Update != nil {
+			normalized, err := validateUpdateConfig(req.Update)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			cfg.Update = normalized
+		}
 		if err := s.applyLive(cfg); err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
+		}
+		if req.Update != nil && s.updater != nil {
+			s.updater.ConfigChanged()
 		}
 	}
 	rt := s.runtime()
@@ -456,6 +468,8 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		"limits":         cfg.Limits,
 		"cache":          effectiveResponseCacheConfig(cfg.Cache),
 		"cache_stats":    rt.cache.Stats(),
+		"update":         effectiveUpdateConfig(cfg.Update),
+		"build":          CurrentBuildInfo(),
 		"secure_cookies": cfg.SecureCookies,
 		"management_db":  cfg.ManagementDB,
 		"analytics_db":   cfg.Dashboard.DBPath,

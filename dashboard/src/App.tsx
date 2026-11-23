@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  ArrowUpCircle,
   Bell,
   BookOpen,
   CalendarRange,
@@ -17,9 +18,10 @@ import {
   Server,
   Settings as SettingsIcon,
   TriangleAlert,
+  X,
   type LucideIcon,
 } from 'lucide-react';
-import { getState, getSeriesRange, getAlerts, getKeyEvents, connectLive, logout, fmtMs, fmtMoney, fmtInt, fmtTokens, type State, type SeriesPoint, type RangePreset, type AlertEvent, type KeyEvent, type TabProps } from './api';
+import { getState, getSeriesRange, getAlerts, getKeyEvents, connectLive, logout, fmtMs, fmtMoney, fmtInt, fmtTokens, fmtVersion, type State, type SeriesPoint, type RangePreset, type AlertEvent, type KeyEvent, type TabProps } from './api';
 import { rollupSeries, fmtSpan } from './window';
 import { readRange, writeRange } from './time-range';
 import { DateRangePicker } from './components/DateRangePicker';
@@ -54,7 +56,7 @@ const TABS = [
   { key: 'api-keys', label: 'API Keys', description: 'Manage application access, model scopes, and usage limits.' },
   { key: 'analytics', label: 'Analytics', description: 'Usage, known cost, and response times by client, model, and provider.' },
   { key: 'alerts', label: 'Alerts', description: 'Review configured thresholds and recent operational events.' },
-  { key: 'settings', label: 'Settings', description: 'Manage owner access, gateway limits, alert rules, and backups.' },
+  { key: 'settings', label: 'Settings', description: 'Manage owner access, gateway limits, software updates, alert rules, and backups.' },
   { key: 'docs', label: 'Docs', description: 'Gateway API reference: endpoints, schemas, errors, routing, and configuration.' },
 ] as const;
 export type TabKey = (typeof TABS)[number]['key'];
@@ -100,12 +102,23 @@ function Gateway() {
   const [liveKeyEvents, setLiveKeyEvents] = useState<KeyEvent[]>([]);
   const [liveOn, setLiveOn] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+  const [dismissedUpdate, setDismissedUpdate] = useState('');
   useEffect(() => {
     const pop = () => { setTab(locationTab()); setRange(locationRange()); setRangeAnchor(Date.now()); };
     window.addEventListener('popstate', pop);
     return () => window.removeEventListener('popstate', pop);
   }, []);
-  const navigate = (next: TabKey) => { const url = new URL(location.href); url.searchParams.set('tab', next); history.pushState(null, '', url); setTab(next); setNavOpen(false); };
+  const navigate = (next: TabKey, hash?: string) => {
+    const url = new URL(location.href);
+    url.searchParams.set('tab', next);
+    url.hash = hash || '';
+    history.pushState(null, '', url);
+    setTab(next);
+    setNavOpen(false);
+    if (hash) {
+      setTimeout(() => document.getElementById(hash.replace(/^#/, ''))?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+    }
+  };
   const changeRange = (next: RangePreset, anchor = Date.now()) => { const url = new URL(location.href); writeRange(url, next); history.pushState(null, '', url); setRange(next); setRangeAnchor(anchor); };
   useEffect(() => {
     let stopped = false;
@@ -150,6 +163,14 @@ function Gateway() {
   const telemetry = state?.telemetry;
   const telemetryWarning = !!telemetry && (telemetry.dropped_requests > 0 || telemetry.dropped_key_events > 0 || telemetry.write_errors > 0 || telemetry.queued > 1000);
   const cooldownKeys = state ? Object.values(state.keys).flat().filter((k) => !k.healthy).length : 0;
+  const build = state?.build;
+  const versionLabel = fmtVersion(build?.version || state?.version);
+  const updateSummary = state?.update;
+  const updateActive = !!updateSummary && ['downloading', 'verifying', 'installing', 'restarting'].includes(updateSummary.state);
+  const showUpdateBanner = !!updateSummary?.update_available && !!updateSummary.latest_version && dismissedUpdate !== updateSummary.latest_version && !updateActive;
+  const buildTooltip = build
+    ? `${versionLabel} (${build.channel}) · commit ${build.commit}${build.build_time && build.build_time !== 'unknown' ? ` · built ${new Date(build.build_time).toLocaleString()}` : ''} · ${build.os}/${build.arch}`
+    : versionLabel;
   const signOut = async () => {
     setSigningOut(true);
     try { await logout(); window.dispatchEvent(new Event('verloc:logout')); }
@@ -171,7 +192,9 @@ function Gateway() {
         <span>{item.label}</span>
         {item.key === 'alerts' && liveAlerts.length > 0
           ? <span className="ml-auto text-[10px] text-amber-300">{liveAlerts.length}</span>
-          : <span className="nav-index">{String(TABS.findIndex((t) => t.key === item.key) + 1).padStart(2, '0')}</span>}
+          : item.key === 'settings' && updateSummary?.update_available
+            ? <span className="ml-auto flex items-center gap-1 text-[9px] uppercase tracking-wider text-primary"><span className="size-1.5 rounded-full bg-primary" aria-hidden="true" />new</span>
+            : <span className="nav-index">{String(TABS.findIndex((t) => t.key === item.key) + 1).padStart(2, '0')}</span>}
       </a>
     );
   };
@@ -210,9 +233,25 @@ function Gateway() {
             <span>Keys in cooldown</span><span className={cooldownKeys ? 'text-amber-300' : 'text-edge-300'}>{cooldownKeys}</span>
           </div>
         </div>
+        <button
+          type="button"
+          onClick={() => navigate('settings', '#updates')}
+          className="mb-2 flex w-full items-center justify-between gap-2 border border-edge-700 bg-edge-950/60 px-3 py-2 text-left text-[10px] transition-colors hover:border-edge-500 hover:bg-edge-900"
+          title={buildTooltip}
+        >
+          <span className="truncate font-mono text-edge-300">{versionLabel}</span>
+          {updateActive ? (
+            <span className="shrink-0 text-[9px] uppercase tracking-wider text-primary">Updating…</span>
+          ) : updateSummary?.update_available && updateSummary.latest_version ? (
+            <span className="inline-flex shrink-0 items-center gap-1 font-mono text-[9px] text-primary">
+              <ArrowUpCircle className="size-3" aria-hidden="true" />{fmtVersion(updateSummary.latest_version)}
+            </span>
+          ) : (
+            <span className="shrink-0 text-[9px] uppercase tracking-wider text-edge-500">{build?.channel || 'build'}</span>
+          )}
+        </button>
         <Button variant="ghost" size="sm" disabled={signingOut} className="w-full justify-start gap-3 text-edge-400" onClick={() => void signOut()}>
           <LogOut className="size-3.5" aria-hidden="true" />{signingOut ? 'Signing out…' : 'Sign out'}
-          <span className="ml-auto max-w-24 truncate text-[9px] text-edge-500">v{state?.version || '—'}</span>
         </Button>
       </div>
     </div>
@@ -232,6 +271,15 @@ function Gateway() {
           <span className="truncate text-edge-200">{selectedTab.label}</span>
         </div>
         <div className="flex shrink-0 items-center gap-4">
+          {state && (
+            <Tooltip>
+              <TooltipTrigger render={<button type="button" onClick={() => navigate('settings', '#updates')} className="hidden items-center gap-1.5 border border-edge-700 bg-edge-900/70 px-2 py-0.5 font-mono text-[10px] text-edge-300 transition-colors hover:border-edge-500 hover:text-primary sm:inline-flex" />}>
+                <span>{versionLabel}</span>
+                {updateSummary?.update_available && <span className="size-1.5 rounded-full bg-primary" aria-label="Update available" />}
+              </TooltipTrigger>
+              <TooltipContent>{buildTooltip}</TooltipContent>
+            </Tooltip>
+          )}
           {state && <span className="hidden items-center gap-1.5 text-[10px] text-edge-500 lg:inline-flex"><Clock3 className="size-3" aria-hidden="true" />{fmtMs(state.uptime_sec * 1000)} uptime</span>}
           <Tooltip>
             <TooltipTrigger render={<span className={`flex cursor-default items-center gap-2 text-[9px] uppercase tracking-widest ${liveOn ? 'text-primary' : 'text-edge-400'}`} />}>
@@ -280,6 +328,37 @@ function Gateway() {
               </CardContent>
             </Card>
           )}
+          {updateActive && updateSummary && (
+            <Card role="status" className="border-primary/40 bg-primary/5">
+              <CardContent className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-primary">
+                <span className="inline-flex items-center gap-2">
+                  <RotateCw className="size-3.5 animate-spin shrink-0" aria-hidden="true" />
+                  Updating verloc ({updateSummary.state}{updateSummary.progress_pct ? ` · ${updateSummary.progress_pct}%` : ''})…
+                </span>
+                {tab !== 'settings' && (
+                  <Button variant="outline" size="sm" onClick={() => navigate('settings', '#updates')}>View progress</Button>
+                )}
+              </CardContent>
+            </Card>
+          )}
+          {showUpdateBanner && updateSummary?.latest_version && (
+            <Card role="status" className="border-primary/35 bg-primary/5">
+              <CardContent className="flex flex-wrap items-center justify-between gap-3 text-[11px]">
+                <span className="inline-flex items-center gap-2 text-edge-100">
+                  <ArrowUpCircle className="size-4 shrink-0 text-primary" aria-hidden="true" />
+                  <span>
+                    <strong className="font-mono text-primary">{fmtVersion(updateSummary.latest_version)}</strong> is available (running <span className="font-mono">{versionLabel}</span>). Smooth in-place update preserves all user data.
+                  </span>
+                </span>
+                <div className="flex items-center gap-2">
+                  <Button size="sm" onClick={() => navigate('settings', '#updates')}>Review &amp; update</Button>
+                  <Button variant="ghost" size="icon-sm" aria-label="Dismiss update notification" onClick={() => setDismissedUpdate(updateSummary.latest_version || '')}>
+                    <X className="size-3.5" aria-hidden="true" />
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          )}
           {telemetryWarning && (
             <Card role="alert" className="border-amber-500/40 bg-amber-500/5">
               <CardContent className="flex gap-2.5 text-[11px] leading-relaxed text-amber-400">
@@ -312,7 +391,7 @@ function Gateway() {
           {tab === 'settings' && <Settings {...props} />}
           {tab === 'docs' && <Suspense fallback={<Skeleton className="h-64 w-full" />}><Docs /></Suspense>}
           </div>
-          <footer className="console-footer"><span>verloc / gateway control plane</span><span>Request metadata only. No stored prompts or completions.</span></footer>
+          <footer className="console-footer"><span>verloc <span className="font-mono text-edge-300">{versionLabel}</span> / gateway control plane</span><span>Request metadata only. No stored prompts or completions.</span></footer>
         </div>
       </main>
     </MicroSlats>

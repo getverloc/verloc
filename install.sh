@@ -259,9 +259,19 @@ build_from_dir() {
 
   ver="source"
   commit="none"
+  if [ -f "$src_dir/VERSION" ]; then
+    base_ver="$(tr -d ' \t\r\n' < "$src_dir/VERSION")"
+    [ -n "$base_ver" ] && ver="v${base_ver}-dev"
+  fi
   if command -v git >/dev/null 2>&1 && [ -e "$src_dir/.git" ]; then
-    ver="$(git -C "$src_dir" describe --tags --always --dirty 2>/dev/null || printf 'source')"
+    if exact_tag="$(git -C "$src_dir" describe --tags --exact-match 2>/dev/null)"; then
+      ver="$exact_tag"
+    elif [ "$ver" = "source" ]; then
+      ver="$(git -C "$src_dir" describe --tags --always --dirty 2>/dev/null || printf 'source')"
+    fi
     commit="$(git -C "$src_dir" rev-parse --short HEAD 2>/dev/null || printf 'none')"
+  elif [ "$VERSION" != "latest" ]; then
+    ver="$VERSION"
   fi
   build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   ldflags="-s -w -X main.version=${ver} -X main.commit=${commit} -X main.buildTime=${build_time}"

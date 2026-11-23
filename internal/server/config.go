@@ -130,6 +130,8 @@ type Config struct {
 	Dashboard       *DashboardConfig           `json:"dashboard"`
 	// Cache configures the opt-in deterministic response cache (disabled by default).
 	Cache *ResponseCacheConfig `json:"cache,omitempty"`
+	// Update configures release checking and automatic self-updates.
+	Update *UpdateConfig `json:"update,omitempty"`
 }
 
 type RouteTarget struct {

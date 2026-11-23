@@ -139,6 +139,65 @@ export interface State {
   pricing: Record<string, { input: number; output: number; cache_read: number }>;
   subscribers: number;
   version: string;
+  build?: BuildInfo;
+  update?: UpdateSummary;
+}
+
+export interface BuildInfo {
+  version: string;
+  commit: string;
+  build_time: string;
+  channel: 'stable' | 'prerelease' | 'dev' | string;
+  go_version: string;
+  os: string;
+  arch: string;
+}
+
+export interface UpdateSummary {
+  update_available: boolean;
+  latest_version?: string;
+  state: 'idle' | 'checking' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'error' | string;
+  progress_pct?: number;
+  auto_update: boolean;
+  can_self_update: boolean;
+  last_checked_at?: number;
+}
+
+export interface UpdateConfig {
+  auto_check?: boolean;
+  auto_update?: boolean;
+  check_interval_hours?: number;
+  include_prereleases?: boolean;
+  repo?: string;
+}
+
+export interface ReleaseInfo {
+  version: string;
+  name?: string;
+  notes?: string;
+  url?: string;
+  published_at?: string;
+  prerelease?: boolean;
+  asset_name?: string;
+  asset_size?: number;
+  asset_ready: boolean;
+}
+
+export interface UpdateStatus {
+  current: BuildInfo;
+  policy: UpdateConfig;
+  state: 'idle' | 'checking' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'error' | string;
+  progress_pct?: number;
+  message?: string;
+  last_error?: string;
+  last_checked_at?: number;
+  update_available: boolean;
+  latest?: ReleaseInfo;
+  can_self_update: boolean;
+  cannot_update_reason?: string;
+  update_command?: string;
+  executable_path?: string;
+  backup_path?: string;
 }
 
 export interface SeriesPoint {
@@ -451,14 +510,18 @@ export interface ResponseCacheStats {
 }
 export interface Settings {
   limits: GatewayLimits; cache?: ResponseCacheConfig; cache_stats?: ResponseCacheStats;
+  update?: UpdateConfig; build?: BuildInfo;
   secure_cookies: boolean; management_db: string;
   analytics_db: string; model_count: number; provider_count: number;
 }
 export interface AuditEvent { id: number; ts: number; action: string; subject: string }
 export const getSettings = () => adminJSON<Settings>('/dash/api/admin/settings');
-export const saveSettings = (body: { limits?: GatewayLimits; alerts?: AlertRule[]; cache?: ResponseCacheConfig }) => adminJSON<{ ok: boolean }>('/dash/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) });
+export const saveSettings = (body: { limits?: GatewayLimits; alerts?: AlertRule[]; cache?: ResponseCacheConfig; update?: UpdateConfig }) => adminJSON<{ ok: boolean }>('/dash/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) });
 export const getAudit = () => adminJSON<{ events: AuditEvent[] }>('/dash/api/admin/audit');
 export const createBackup = () => adminJSON<{ ok: boolean; backup: string }>('/dash/api/admin/backup', { method: 'POST' }, 120000);
+export const getUpdateStatus = () => adminJSON<UpdateStatus>('/dash/api/admin/update');
+export const checkForUpdates = () => adminJSON<UpdateStatus>('/dash/api/admin/update/check', { method: 'POST' }, 30000);
+export const applyUpdate = () => adminJSON<UpdateStatus>('/dash/api/admin/update/apply', { method: 'POST' }, 30000);
 
 // ---- SSE live stream ----
 export function connectLive(handlers: {
@@ -524,6 +587,12 @@ export const fmtMs = (n?: number) => {
 export const ratePerSec = (v: number, ms: number) => (ms > 0 ? ((v || 0) / ms) * 1000 : 0);
 export const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString();
 export const fmtDateTime = (ts: number) => new Date(ts).toLocaleString();
+export const fmtVersion = (v?: string): string => {
+  const s = (v || '').trim();
+  if (!s) return '—';
+  if (/^v?\d+\.\d+\.\d+/.test(s)) return s.startsWith('v') ? s : `v${s}`;
+  return s;
+};
 export const pctOf = (part: number, total: number) => (total > 0 ? ((part || 0) / total) * 100 : 0);
 
 // Histogram bucket labels (ms), matching the Go side.

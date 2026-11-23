@@ -287,7 +287,7 @@ The same binary serves all nine screens; there is no separate analytics service.
 | **Providers** | Connection management, discovery/testing, credentials, provider health, cooldowns, per-provider concurrency bulkheads, TLS keep-warm intervals, and live diagnostics |
 | **Models** | Model metadata and capabilities, upstream mappings, pricing, routing strategies (`ordered` / `latency` / `weighted`), speculative hedging, weighted fallbacks, and bulk actions |
 | **API Keys** | Application key lifecycle, model access, expiry, sliding-window RPM/TPM limits, and concurrency limits |
-| **Settings** | Owner password, global admission/retry/body/stream limits, deterministic response cache policy & live stats, alert rules, server-side backups, connection details, and audit events |
+| **Settings** | Owner password, global admission/retry/body/stream limits, deterministic response cache policy & live stats, alert rules, version & automatic software updates, server-side backups, connection details, and audit events |
 | **Docs** | In-app gateway API reference: endpoints, schemas, errors, routing, and configuration |
 
 **Allow private / LAN upstream** is an explicit provider-editor and guided-add
@@ -528,7 +528,22 @@ Stop any process using the target paths. Choose new, unused database paths and p
 
 Restore validates checksums and credential decryption before publishing the new databases. It refuses existing destination databases or their WAL/SHM files. Reapply the appropriate HTTPS/bootstrap options for the destination host. A restored management backup includes the owner account and application keys; it does not initiate owner setup again.
 
-### Upgrade
+### Versioning and automatic updates
+
+verloc follows **Semantic Versioning 2.0.0** (`vMAJOR.MINOR.PATCH`, tracked in [`VERSION`](VERSION) and injected at build time alongside commit SHA and UTC build timestamp). The dashboard displays the running version and channel (`stable`, `prerelease`, or `dev`) in the header, sidebar, and **Settings → Software updates**.
+
+#### Built-in update checker & smooth self-update
+
+- **Automatic release detection:** verloc periodically checks GitHub Releases using ETag caching and shows a notification banner whenever a newer release is published.
+- **One-click & automatic updates:** In **Settings → Software updates**, click **Update to vX.Y.Z** or toggle **Automatically install new releases** (configurable check cadence and optional pre-release opt-in).
+- **Zero data loss & cryptographic verification:**
+  1. Downloads `checksums.txt` and `verloc_<os>_<arch>.tar.gz` exclusively over HTTPS from GitHub release hosts and verifies the SHA-256 digest in constant time.
+  2. Extracts the binary into the same directory and validates it with a `-version` smoke test before touching the live executable.
+  3. Saves a rollback copy of the previous binary (`verloc.bak.<prev>-<timestamp>`), atomically swaps the executable via `rename`, records a `system.updated` audit event, drains active HTTP requests, closes SQLite cleanly, and restarts in place (`exec`) while preserving the PID.
+  4. **Never modifies or deletes** `verloc.db`, `verloc-data/control.db`, `master.key`, `setup.token`, or `config.json`.
+- **Containers & read-only installs:** When running in Docker or a locked-down system unit where the binary directory is read-only (or when `VERLOC_DISABLE_SELF_UPDATE=1` is set), the dashboard still checks for new releases and displays the exact upgrade command (`docker compose pull && docker compose up -d` or `install.sh --system`).
+
+#### Manual upgrade
 
 1. Back up the databases and separately secure the master key.
 2. Build and test the new binary, including its embedded dashboard (or re-run `install.sh` to atomically replace the binary and restart the service).
@@ -575,6 +590,7 @@ the CGO-free binary with the freshly generated assets. Pushing a `v*` tag trigge
 publish cross-platform release tarballs with SHA-256 checksums for `install.sh`.
 
 ```text
+VERSION                  Canonical SemVer version (MAJOR.MINOR.PATCH)
 install.sh               One-command installer, updater, and service manager (Linux/macOS)
 Dockerfile               Multi-stage container image (non-root, CGO-free)
 docker-compose.yml       One-command loopback-safe Compose stack

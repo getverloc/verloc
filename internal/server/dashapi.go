@@ -30,6 +30,8 @@ type dashState struct {
 	Pricing     map[string]pricingPer1M `json:"pricing"`
 	Subscribers int                     `json:"subscribers"`
 	Version     string                  `json:"version"`
+	Build       BuildInfo               `json:"build"`
+	Update      *UpdateSummary          `json:"update,omitempty"`
 	Telemetry   TelemetryStatus         `json:"telemetry"`
 }
 
@@ -222,6 +224,11 @@ func (s *Server) handleDashState(w http.ResponseWriter, r *http.Request) {
 		Latency:   snap["latency_ms"].(map[string]float64),
 		Pricing:   catalog.PricingMap(),
 		Version:   Version,
+		Build:     CurrentBuildInfo(),
+	}
+	if s.updater != nil {
+		sum := s.updater.Summary()
+		st.Update = &sum
 	}
 	if st.Keys == nil {
 		st.Keys = map[string][]KeyStat{}
